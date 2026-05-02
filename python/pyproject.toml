@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tidewall-otel"
+version = "0.1.0"
+description = "Zero-code-change AI security instrumentation for OpenAI and Anthropic SDKs"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+requires-python = ">=3.12"
+authors = [
+    { name = "Tidewall Security" },
+]
+keywords = [
+    "ai-security",
+    "llm-security",
+    "prompt-injection",
+    "opentelemetry",
+    "instrumentation",
+    "guardrails",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: Security",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+    "wrapt>=1.14.0",
+]
+
+[project.urls]
+Homepage = "https://tidewall.ai"
+Repository = "https://github.com/tidewall-security/tidewall-otel"
+Issues = "https://github.com/tidewall-security/tidewall-otel/issues"
+
+[project.optional-dependencies]
+otel = [
+    "opentelemetry-api>=1.20.0",
+    "opentelemetry-sdk>=1.20.0",
+]
+openai = ["openai>=1.0.0"]
+anthropic = ["anthropic>=0.20.0"]
+dev = [
+    "tidewall-otel[otel,openai,anthropic]",
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "respx>=0.20",
+]
+all = ["tidewall-otel[otel,openai,anthropic]"]
+
+[project.scripts]
+tidewall-instrument = "tidewall_otel._bootstrap.cli:main"
+
+# Register as an OpenTelemetry instrumentor for auto-discovery.
+# When the user runs `opentelemetry-instrument python app.py`, OTel reads
+# this entry point and activates TidewallInstrumentor automatically.
+[project.entry-points."opentelemetry_instrumentor"]
+tidewall = "tidewall_otel._instrumentor:TidewallInstrumentor"
+
+[tool.setuptools.packages.find]
+where = ["src"]
