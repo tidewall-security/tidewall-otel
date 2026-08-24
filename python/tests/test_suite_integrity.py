@@ -78,3 +78,70 @@ def test_no_test_function_has_an_EMPTY_body():
         if not statements:
             empty.append(f"{path.name}:{node.lineno} {node.name}")
     assert not empty, "test functions with no body:\n" + "\n".join(empty)
+
+
+def _always_true_assertions(tree):
+    """Assertions no input can fail.
+
+    Three shapes, each of which has shipped somewhere in this programme:
+
+    ``assert <anything> or True``   the `or True` makes the left side dead
+    ``assert <truthy literal>``     `assert 1`, `assert "x"`, `assert (a, b)`
+                                    -- a non-empty tuple is the classic typo
+                                    for a two-argument assert
+    ``assert not <x> or True``      the same as the first, seen in the wild
+
+    Deliberately syntactic. Deciding whether an arbitrary expression can be
+    false is undecidable; these are the shapes that actually get written.
+    """
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assert):
+            continue
+        test = node.test
+        if (isinstance(test, ast.BoolOp) and isinstance(test.op, ast.Or)
+                and any(isinstance(v, ast.Constant) and v.value is True
+                        for v in test.values)):
+            yield node.lineno, "`or True` makes the assertion unfailable"
+        elif isinstance(test, ast.Constant) and test.value:
+            yield node.lineno, f"constant {test.value!r} is always truthy"
+        elif isinstance(test, ast.Tuple) and test.elts:
+            yield node.lineno, "a non-empty tuple is always truthy (missing comma?)"
+
+
+def test_no_test_function_has_an_ALWAYS_TRUE_assertion():
+    """The vacuity check the empty-body detector could not see.
+
+    `assert not isinstance(stored, type(Descriptored.create)) or True` shipped
+    in test_manager.py and passed every review until an adversarial reviewer
+    read the line. The empty-body detector cannot catch it: the body is not
+    empty, it is merely inert. A test that cannot fail is the same defect as a
+    test with no body, wearing an assertion.
+    """
+    offenders = []
+    for path in sorted(Path(__file__).parent.glob("test_*.py")):
+        tree = ast.parse(path.read_text())
+        for lineno, why in _always_true_assertions(tree):
+            offenders.append(f"{path.name}:{lineno} -- {why}")
+    assert not offenders, "assertions that cannot fail:\n" + "\n".join(offenders)
+
+
+def test_the_always_true_detector_CATCHES_the_shapes_it_claims_to():
+    """The known-positive. A detector's green result is a claim like any other,
+    and 'the scan found nothing' is not the same statement as 'there is
+    nothing to find'. Plants the real defect that motivated it, first.
+    """
+    planted = ast.parse(
+        "def test_a():\n"
+        "    assert not isinstance(x, y) or True\n"      # the real one
+        "def test_b():\n"
+        "    assert 1\n"
+        "def test_c():\n"
+        "    assert ('a', 'b')\n"
+    )
+    found = list(_always_true_assertions(planted))
+    assert len(found) == 3, found
+
+    clean = ast.parse("def test_d():\n    assert x == y\n"
+                      "def test_e():\n    assert not x, 'message'\n"
+                      "def test_f():\n    assert x or y\n")
+    assert list(_always_true_assertions(clean)) == []

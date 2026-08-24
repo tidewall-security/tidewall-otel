@@ -2,11 +2,16 @@
 
 Four separate facts, deliberately not collapsed into one boolean:
 
-``lifecycle``   uninstalled / installing / installed / removed
+``lifecycle``   uninstalled / installing / installed / removed / residual
 ``mode``        enforce / monitor / dry-run
 ``surfaces``    per-surface disposition: covered / unverified / uncovered /
                 refusing
 ``guard_health`` unknown / ok / unreachable
+
+``residual`` is deactivation that could not fully undo itself: another agent
+wrapped a boundary after us, so removal correctly declined to write and a
+Tidewall wrapper is still live underneath theirs. Reporting that as ``removed``
+would tell an operator the SDK is pristine while our code runs on every call.
 
 Collapsing them is how an agent ends up reporting ``active`` while a boundary
 is unguarded: a single flag has to pick one fact to represent, and every choice

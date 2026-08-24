@@ -10,6 +10,7 @@ filed as an internal invariant violation.
 These tests go through `tidewall_otel.activate()` and a real provider client.
 """
 
+import inspect
 import json
 
 import httpx
@@ -269,3 +270,82 @@ def test_a_failure_MID_ACTIVATION_leaves_no_live_partial_patch(monkeypatch):
     )
     assert tidewall_otel.state().lifecycle != "installed"
     assert tidewall_otel.is_active() is False
+
+
+def test_an_escape_is_recorded_even_AFTER_an_unrelated_event(guard_says, provider):
+    """Finding 2 of round 2. The escape bridge must not be suppressible.
+
+    `and not state.events` added to the downgrade condition in `_prepare`
+    survived the entire behavioural suite: every existing escape test recorded
+    the escape as the FIRST event, so a guard reading "only downgrade while
+    nothing has happened yet" was indistinguishable from a correct one. A prior
+    skip -- a dry-run call, a lossy refusal, anything -- would then suppress
+    every later downgrade while the surface stayed `covered`.
+    """
+    guard_says(CLEAN)
+    client, _reached = provider
+
+    tidewall_otel.activate()
+    state = tidewall_otel.state()
+
+    # An unrelated event FIRST, recorded through the public seam.
+    state.record_skip("Messages.create", reason="unrelated", detail=None)
+    assert state.events, "the precondition did not take"
+
+    client.chat.completions.create(
+        model="gpt-4o", messages=[{"role": "user", "content": "hi"}])
+
+    assert state.surfaces["Completions.create"] == "unverified", (
+        "a prior event suppressed the escape downgrade"
+    )
+    assert any(e.reason == "client_escapes" for e in state.events)
+
+
+def test_deactivation_that_could_NOT_remove_reports_residual_not_removed(monkeypatch):
+    """Finding 1 of round 2. `removed` must mean removed.
+
+    When another agent wraps a boundary after us, `PatchManager.remove()`
+    correctly declines to write -- deleting their wrapper to reinstate ours
+    would corrupt the stack. That leaves a Tidewall wrapper live on the SDK
+    underneath theirs, and the instrumentor records it as a residual.
+
+    Publishing an unconditional `lifecycle="removed"` threw that evidence away
+    and told an operator the SDK was pristine while our code still ran on every
+    call. This is the reporting-layer twin of claiming enforcement while
+    unguarded, and the round-1 fixes did not touch it.
+    """
+    import wrapt
+    from openai.resources.chat.completions.completions import Completions
+
+    # This test deliberately creates a wrapper that removal REFUSES to touch --
+    # that is the whole point -- so it must put the class back itself. Leaving
+    # it means every later test in the session runs against a doubly-wrapped
+    # SDK, which is exactly how three unrelated manifest tests failed the first
+    # time this was written.
+    pristine = inspect.getattr_static(Completions, "create")
+    try:
+        tidewall_otel.activate()
+
+        # SOMEONE ELSE wraps the method after us; the last writer wins.
+        wrapt.wrap_function_wrapper(
+            "openai.resources.chat.completions.completions", "Completions.create",
+            lambda wrapped, instance, args, kwargs: wrapped(*args, **kwargs))
+        foreign = inspect.getattr_static(Completions, "create")
+
+        tidewall_otel.deactivate()
+
+        state = tidewall_otel.state()
+        assert state.lifecycle == "residual", (
+            f"deactivation reported {state.lifecycle!r} while a wrapper stayed installed"
+        )
+        assert any(e.reason == "not_removed" for e in state.events), state.events
+        assert inspect.getattr_static(Completions, "create") is foreign
+    finally:
+        Completions.create = pristine
+
+    assert inspect.getattr_static(Completions, "create") is pristine
+
+    # And the honest case still reports removed.
+    tidewall_otel.activate()
+    tidewall_otel.deactivate()
+    assert tidewall_otel.state().lifecycle == "removed"

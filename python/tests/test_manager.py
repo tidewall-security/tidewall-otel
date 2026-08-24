@@ -376,7 +376,11 @@ def test_identity_capture_is_DESCRIPTOR_SAFE(module):
 
     module.Descriptored = Descriptored
     stored = inspect.getattr_static(Descriptored, "create")
-    assert not isinstance(stored, type(Descriptored.create)) or True
+    # `getattr` runs the descriptor protocol and hands back a plain function;
+    # `getattr_static` returns the staticmethod OBJECT that is actually stored.
+    # Restoring the former would put a bare function where a staticmethod was.
+    assert isinstance(stored, staticmethod)
+    assert not isinstance(Descriptored.create, staticmethod)
 
     manager = PatchManager()
     manager.install("fake_sdk", "Descriptored.create", wrapper_factory("tw"))

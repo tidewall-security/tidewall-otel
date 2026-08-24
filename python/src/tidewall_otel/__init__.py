@@ -188,13 +188,36 @@ def state() -> State:
 
 
 def deactivate() -> None:
-    """Deactivate Tidewall instrumentation and restore original SDK methods."""
+    """Deactivate Tidewall instrumentation, restoring what can be restored.
+
+    NOT unconditionally ``removed``. `PatchManager.remove()` refuses to write
+    when the current attribute is no longer the object it installed -- another
+    agent wrapped us afterwards, and deleting their wrapper to reinstate ours
+    would corrupt the stack. That refusal is correct, and it leaves a Tidewall
+    wrapper live on the SDK underneath theirs.
+
+    Reporting ``removed`` in that case is a fail-open in the reporting layer:
+    the instrumentor knows the wrapper survived, and discarding it to publish
+    an unconditional ``removed`` state throws the evidence away. An operator
+    reading ``removed`` would believe the SDK is pristine while Tidewall code
+    still runs on every call for the rest of the process.
+
+    So the lifecycle becomes ``residual`` when anything could not be removed,
+    and the reasons are carried on the state as events.
+    """
     global _instrumentor_instance, _state
 
+    residuals: list[str] = []
     if _instrumentor_instance:
         _instrumentor_instance.uninstrument()
+        residuals = list(getattr(_instrumentor_instance, "residuals", ()) or ())
         _instrumentor_instance = None
-    _state = State(lifecycle="removed", mode=_state.mode)
+
+    _state = State(lifecycle="residual" if residuals else "removed",
+                   mode=_state.mode)
+    for residual in residuals:
+        surface, _, reason = residual.partition(": ")
+        _state.record_unverified(surface, reason="not_removed", detail=reason)
 
 
 def is_active() -> bool:
