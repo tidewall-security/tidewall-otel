@@ -20,6 +20,10 @@ an unrelated app.
 
 from __future__ import annotations
 
+import inspect
+
+import wrapt
+
 import logging
 from typing import Any, Collection
 
@@ -107,6 +111,35 @@ class TidewallInstrumentor(BaseInstrumentor):
         # as a dependency, which would force unnecessary installs.
         return []
 
+    def instrument_refusers(self, *, reason: str) -> None:
+        """Install a refuser at every manifest boundary.
+
+        Used when activation cannot establish coverage and the operator chose
+        `block`: calls fail loudly rather than passing through unchecked while
+        the application believes it is protected.
+        """
+        from tidewall_otel._manager import PatchManager
+        from tidewall_otel._manifest import SURFACES
+        from tidewall_otel._refuser import make_refuser
+
+        self._manager = PatchManager()
+        # _uninstrument iterates this; the refuser path does not go
+        # through _instrument, which is where it is normally created.
+        self._patched = []
+        for surface in SURFACES:
+            if not _sdk_available(surface.module):
+                continue
+            refuser = make_refuser(surface, reason=reason)
+            self._manager.install(surface.module, surface.attribute,
+                                  lambda w, i, a, k, _r=refuser: _r(w, i, a, k))
+
+        # MARK INSTRUMENTED. uninstrument() is gated on this flag, so
+        # bypassing instrument() means deactivate() silently does nothing and
+        # the refusers stay installed on the SDK for the rest of the process.
+        self._is_instrumented = True
+        self._is_instrumented_by_opentelemetry = True
+
+
     def _instrument(self, **kwargs: Any) -> None:
         config = kwargs.get("config") or TidewallConfig()
         self._config = config
@@ -181,6 +214,20 @@ class TidewallInstrumentor(BaseInstrumentor):
 
     def _uninstrument(self, **kwargs: Any) -> None:
         """Remove all applied patches and restore the original SDK methods."""
+        # Patches installed through the PatchManager are ITS to remove: it
+        # compares before writing and reports not-ours rather than deleting
+        # another agent's wrapper. Without this, refusers installed at
+        # activation survive deactivation entirely.
+        manager = getattr(self, "_manager", None)
+        if manager is not None:
+            manager.remove()
+            self._manager = None
+
+        executor = getattr(self, "_executor", None)
+        if executor is not None:
+            executor.shutdown()
+            self._executor = None
+
         for module_path, class_method in self._patched:
             try:
                 import importlib
@@ -191,15 +238,30 @@ class TidewallInstrumentor(BaseInstrumentor):
                 for part in parts[:-1]:
                     parent = getattr(parent, part)
                 attr_name = parts[-1]
-                original = getattr(parent, attr_name)
-                # wrapt stores the original callable on __wrapped__; if it
-                # isn't there we assume the patch was already removed.
+                # getattr_static: `getattr` on a class triggers the
+                # descriptor protocol and returns a BOUND wrapper, so an
+                # identity or type check against it tests the wrong object.
+                original = inspect.getattr_static(parent, attr_name, None)
+
+                # ONLY unwrap OUR wrapper. `__wrapped__` is not proof of
+                # ownership: the SDKs decorate their own methods, so a
+                # pristine `Completions.create` carries one too. Unwrapping on
+                # its presence alone strips a layer the SDK put there --
+                # leaving a callable with a DIFFERENT SIGNATURE that still
+                # looks plausible, which surfaced as unrelated manifest tests
+                # failing several files later rather than as a failure here.
+                if not isinstance(original, wrapt.FunctionWrapper):
+                    continue
                 if hasattr(original, "__wrapped__"):
                     setattr(parent, attr_name, original.__wrapped__)
                     logger.debug("Unpatched %s.%s", module_path, class_method)
             except Exception:
-                logger.debug(
-                    "Could not unpatch %s.%s",
+                # WARNING, not debug. Failing to remove instrumentation leaves
+                # a wrapper installed on someone else's SDK; that is not a
+                # detail, and swallowing it at debug level is how a NameError
+                # here surfaced as unrelated tests failing in another file.
+                logger.warning(
+                    "Could not unpatch %s.%s -- the wrapper is STILL INSTALLED",
                     module_path, class_method, exc_info=True,
                 )
 

@@ -34,6 +34,9 @@ from __future__ import annotations
 import logging
 
 from tidewall_otel._config import TidewallConfig
+from tidewall_otel._exceptions import TidewallConfigError
+from tidewall_otel._manifest import SURFACES
+from tidewall_otel._state import State
 
 __version__ = "0.1.0"
 __all__ = ["activate", "deactivate", "is_active", "TidewallConfig"]
@@ -41,7 +44,7 @@ __all__ = ["activate", "deactivate", "is_active", "TidewallConfig"]
 logger = logging.getLogger("tidewall.otel")
 
 _instrumentor_instance = None
-_is_active = False
+_state = State()
 
 
 def activate(config: TidewallConfig | None = None) -> None:
@@ -62,51 +65,117 @@ def activate(config: TidewallConfig | None = None) -> None:
         Configuration errors are logged and instrumentation is silently
         skipped (fail-open) so the host application continues to function.
     """
-    global _instrumentor_instance, _is_active
+    global _instrumentor_instance, _state
 
-    if _is_active:
+    if _state.lifecycle == "installed":
         logger.warning("Tidewall instrumentation is already active")
         return
 
+    # Policy errors raise from TidewallConfig itself; this catches the
+    # connection settings, which the activation-failure policy governs.
     config = config or TidewallConfig()
-
     errors = config.validate()
+
     if errors and config.mode != "dry-run":
-        for err in errors:
-            logger.error("Tidewall config error: %s", err)
-        logger.error("Tidewall instrumentation NOT activated")
+        _handle_activation_failure(config, errors)
         return
 
-    log_level = getattr(logging, config.log_level.upper(), logging.INFO)
-    root_logger = logging.getLogger("tidewall.otel")
-    root_logger.setLevel(log_level)
-    if not root_logger.handlers:
-        handler = logging.StreamHandler()
-        handler.setFormatter(
-            logging.Formatter(
-                "[%(asctime)s] %(name)s %(levelname)s: %(message)s",
-                datefmt="%H:%M:%S",
-            )
-        )
-        root_logger.addHandler(handler)
+    _configure_logging(config)
 
     from tidewall_otel._instrumentor import TidewallInstrumentor
 
     _instrumentor_instance = TidewallInstrumentor()
     _instrumentor_instance.instrument(config=config)
-    _is_active = True
+    _state = State(
+        lifecycle="installed",
+        mode=config.mode,
+        surfaces=dict(getattr(_instrumentor_instance, "dispositions", {}) or
+                      {s.attribute: "covered" for s in SURFACES}),
+    )
+
+
+def _handle_activation_failure(config: TidewallConfig, errors: list[str]) -> None:
+    """Apply ON_ACTIVATION_FAILURE.
+
+    Logging an error and continuing unguarded, while the application believes
+    it is protected, is the fail-open this programme exists to remove. Each
+    policy is explicit about what the caller gets:
+
+    ``exit``     raise; the process does not continue believing it is guarded
+    ``disable``  run on UNGUARDED, with the state saying so
+    ``block``    install refusers, so calls fail rather than pass unchecked
+    """
+    global _state
+
+    detail = "; ".join(errors)
+    for error in errors:
+        logger.error("Tidewall config error: %s", error)
+
+    if config.on_activation_failure == "exit":
+        raise TidewallConfigError(
+            f"Tidewall could not activate: {detail}. "
+            f"Set TIDEWALL_ON_ACTIVATION_FAILURE=disable to run unguarded, "
+            f"or =block to refuse calls instead."
+        )
+
+    if config.on_activation_failure == "block":
+        _install_refusers(config, reason=detail)
+        return
+
+    logger.error("Tidewall NOT active: %s (on_activation_failure=disable)", detail)
+    _state = State(lifecycle="uninstalled", mode=config.mode, surfaces={})
+
+
+def _install_refusers(config: TidewallConfig, reason: str) -> None:
+    """Refuse at every boundary rather than pass calls through unchecked."""
+    global _instrumentor_instance, _state
+
+    from tidewall_otel._instrumentor import TidewallInstrumentor
+
+    _instrumentor_instance = TidewallInstrumentor()
+    _instrumentor_instance.instrument_refusers(reason=reason)
+    _state = State(
+        lifecycle="installed", mode=config.mode,
+        surfaces={surface.attribute: "refusing" for surface in SURFACES},
+    )
+
+
+def _configure_logging(config: TidewallConfig) -> None:
+    log_level = getattr(logging, config.log_level.upper(), logging.INFO)
+    root_logger = logging.getLogger("tidewall.otel")
+    root_logger.setLevel(log_level)
+    if not root_logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter(
+            "[%(asctime)s] %(name)s %(levelname)s: %(message)s",
+            datefmt="%H:%M:%S",
+        ))
+        root_logger.addHandler(handler)
+
+
+def state() -> State:
+    """The agent's own account of itself.
+
+    Always answerable: an operator asking "is it on?" before activation must
+    get an answer rather than an exception or None.
+    """
+    return _state
 
 
 def deactivate() -> None:
     """Deactivate Tidewall instrumentation and restore original SDK methods."""
-    global _instrumentor_instance, _is_active
+    global _instrumentor_instance, _state
 
     if _instrumentor_instance:
         _instrumentor_instance.uninstrument()
         _instrumentor_instance = None
-    _is_active = False
+    _state = State(lifecycle="removed", mode=_state.mode)
 
 
 def is_active() -> bool:
-    """Return whether Tidewall instrumentation is currently active."""
-    return _is_active
+    """Whether the agent is enforcing across every boundary present.
+
+    Delegates to the state's universal claim rather than a separate flag: a
+    boolean maintained beside the dimensions can disagree with them, and did.
+    """
+    return _state.is_active()
