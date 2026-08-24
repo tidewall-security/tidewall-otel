@@ -132,6 +132,15 @@ def bound_nodes(
         if name == "self":
             continue
         parameter = signature.parameters[name]
+        if parameter.kind is inspect.Parameter.VAR_POSITIONAL:
+            # Expanded elementwise, exactly as **kwargs is. Yielding the
+            # catch-all itself would produce a node named after the PARAMETER
+            # ("args"), which is not a provider field and is therefore
+            # unmapped -- so every call through a callable with *args would be
+            # classified lossy and refused.
+            for index, item in enumerate(value):
+                _walk(item, f"args[{index}]", stop, nodes)
+            continue
         if parameter.kind is inspect.Parameter.VAR_KEYWORD:
             # **kwargs arrives as a dict of the extra names; each is a node in
             # its own right, not a node called "kwargs".

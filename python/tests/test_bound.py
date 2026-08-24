@@ -156,3 +156,22 @@ def test_a_minimal_REAL_call_keeps_only_what_was_supplied():
     assert "self" not in kept
     assert kept["messages[0].content"] == "hi"
     assert set(kept) >= {"messages", "messages[0]", "messages[0].role", "model"}
+
+
+def test_a_VAR_POSITIONAL_catchall_is_expanded_not_yielded_as_itself():
+    """`*args` binds to `()` under apply_defaults, and yielding it as a node
+    named "args" makes it an unmapped provider field -- so every call through
+    a callable that has one would be classified lossy and refused.
+
+    Neither real SDK method has *args, which is why this only appeared when a
+    test double did.
+    """
+    def catchall(*args, **kwargs): ...
+
+    nodes = bound_nodes(catchall, (), {"messages": [], "model": "m"})
+    assert "args" not in nodes
+    assert set(nodes) == {"messages", "model"}
+
+    nodes = bound_nodes(catchall, ("a", "b"), {})
+    assert nodes["args[0]"] == "a" and nodes["args[1]"] == "b"
+    assert "args" not in nodes

@@ -93,6 +93,25 @@ class TidewallGuard:
             },
         }
 
+    def check_raw(self, *, guard_input: dict, event_type: str = "input",
+                  model: str = "", llm_provider: str = "") -> dict:
+        """Perform the request and return the DECODED BODY.
+
+        Raises GuardUnreachable / GuardTimeout / GuardSchemaInvalid rather
+        than swallowing them into None the way :meth:`check` does. Anything
+        else propagates and dispatch files it as invariant_violated.
+
+        The transport raises those types directly (they subclass
+        GuardAPIError), so there is no seam here to sniff causes at.
+        """
+        return post_guard(
+            base_url=self._config.base_url,
+            token=self._config.token,
+            payload=self._payload_for(guard_input, event_type=event_type,
+                                      model=model, llm_provider=llm_provider),
+            socket_timeout=self._config.socket_timeout,
+        )
+
     def check(
         self,
         *,
