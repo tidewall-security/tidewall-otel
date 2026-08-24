@@ -233,3 +233,52 @@ def test_the_plaintext_url_detector_CATCHES_the_real_line():
     # and an http:// beyond the window is not attributed to this variable
     assert list(_plaintext_guard_urls(
         "TIDEWALL_BASE_URL - the guard URL\n\nSee http://example.org too\n")) == []
+
+
+def _env_var_sets():
+    """(documented, accepted, removed) — read from the two sources of truth.
+
+    `accepted` is every ``TIDEWALL_*`` literal in `_config.py` minus the
+    removed set, which deliberately over-collects rather than under-collects:
+    a variable this misses is a variable the drift test cannot police.
+    """
+    import re
+
+    from tidewall_otel._config import _REMOVED_VARIABLES
+
+    config = Path(__file__).resolve().parents[1] / "src" / "tidewall_otel" / "_config.py"
+    readme = Path(__file__).resolve().parents[1] / "README.md"
+
+    removed = set(_REMOVED_VARIABLES)
+    accepted = set(re.findall(r'["\'](TIDEWALL_[A-Z_]+)["\']', config.read_text())) - removed
+    documented = set(re.findall(r"\|\s*`(TIDEWALL_[A-Z_]+)`", readme.read_text()))
+    return documented, accepted, removed
+
+
+def test_no_documented_env_var_has_been_REMOVED():
+    """Following the README must not raise.
+
+    `TIDEWALL_TIMEOUT` was split into `TIDEWALL_SOCKET_TIMEOUT` and
+    `TIDEWALL_GUARD_DEADLINE` and is now REFUSED rather than ignored -- quietly
+    dropping a variable an operator set would pick a bound they did not choose.
+    The README kept documenting it, so a user who followed the configuration
+    table got a hard `ValueError` at activation. Refusing loudly is right; the
+    documentation telling them to set it is not.
+    """
+    documented, _accepted, removed = _env_var_sets()
+    offenders = sorted(documented & removed)
+    assert not offenders, (
+        "README documents variables the agent refuses: " + ", ".join(offenders))
+
+
+def test_every_ACCEPTED_env_var_is_documented():
+    """The other direction, and the one that hides security-relevant options.
+
+    `TIDEWALL_ON_ACTIVATION_FAILURE` chooses between raising, running
+    unguarded, and installing refusers when activation fails. It was
+    undocumented, so the operator could not choose it -- they got the default
+    without knowing there was a decision to make.
+    """
+    documented, accepted, _removed = _env_var_sets()
+    missing = sorted(accepted - documented)
+    assert not missing, "accepted but undocumented: " + ", ".join(missing)

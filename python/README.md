@@ -47,9 +47,11 @@ Configure via environment variables (recommended) or by passing a
 | `TIDEWALL_MODE` | `enforce` | `enforce`, `monitor`, or `dry-run` |
 | `TIDEWALL_APP_ID` | `tidewall-otel` | App identifier recorded with each guard event |
 | `TIDEWALL_APP_NAME` | `Tidewall OTel Instrumentation` | Display name |
-| `TIDEWALL_USER_ID` | `$USER` | User identifier |
+| `TIDEWALL_USER_ID` | (none) | User identifier sent with each guard event. **No default** — the OS account name is not collected unless you set this explicitly. |
 | `TIDEWALL_LOG_LEVEL` | `info` | Log verbosity |
-| `TIDEWALL_TIMEOUT` | `10` | Per-request timeout (seconds) |
+| `TIDEWALL_SOCKET_TIMEOUT` | `10` | Per-connection read bound, seconds. Must not exceed the guard deadline. |
+| `TIDEWALL_GUARD_DEADLINE` | `10` | Caller-latency bound, seconds — how long a caller waits for the guard before the mode contract applies. |
+| `TIDEWALL_ON_ACTIVATION_FAILURE` | `exit` | What happens when activation fails: `exit` (raise, so the process does not continue believing it is guarded), `disable` (run unguarded, with the state saying so), or `block` (install refusers, so calls fail rather than pass unchecked). |
 
 ## Activation
 
