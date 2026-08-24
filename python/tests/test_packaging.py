@@ -138,8 +138,9 @@ def test_the_DOCUMENTED_otel_command_guards_and_reports_itself(tmp_path):
         "                          messages=[{'role': 'user', 'content': 'hi'}])\n"
         "patched = getattr(inspect.getattr_static(Completions, 'create'),\n"
         "                  '__tidewall_wrapper__', False)\n"
-        "print(f'patched={patched} asked={len(asked)} "
-        "lifecycle={tidewall_otel.state().lifecycle}')\n"
+        "st = tidewall_otel.state()\n"
+        "print(f'patched={patched} asked={len(asked)} lifecycle={st.lifecycle} '\n"
+        "      f'surface={st.surfaces.get(\"Completions.create\")}')\n"
     )
 
     result = subprocess.run(
@@ -149,5 +150,13 @@ def test_the_DOCUMENTED_otel_command_guards_and_reports_itself(tmp_path):
              "TIDEWALL_BASE_URL": "https://guard.example", "TIDEWALL_TOKEN": "t"},
     )
     line = next((l for l in result.stdout.splitlines() if l.startswith("patched=")), "")
-    assert line == "patched=True asked=1 lifecycle=installed", (
+
+    # `surface=unverified` is not incidental. The app builds its client on
+    # httpx.MockTransport, which IS a construction-time escape, so the wrapper
+    # downgrades that surface AT CALL TIME. Seeing it here proves `state()`
+    # returns the SAME object the wrappers write into rather than a snapshot
+    # taken at publish -- a copy would still read `covered`, which is exactly
+    # how a rewritten wire body once coexisted with a full-coverage report.
+    assert line == ("patched=True asked=1 lifecycle=installed "
+                    "surface=unverified"), (
         f"stdout={result.stdout!r} stderr={result.stderr[-800:]!r}")
