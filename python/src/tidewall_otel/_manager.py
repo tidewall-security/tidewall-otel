@@ -30,7 +30,7 @@ import importlib.abc
 import importlib.machinery
 import inspect
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable, Iterable
 
 
@@ -100,6 +100,20 @@ class PatchManager:
         original = getattr(owner, name)
 
         def installed(*args, **kwargs):
+            """Adapt the descriptor call to wrapt's wrapper convention.
+
+            wrapt hands a wrapper ``(wrapped, instance, args, kwargs)`` where
+            `wrapped` is BOUND and `args` EXCLUDES the receiver. Passing the
+            unbound function and args-still-containing-self instead makes
+            `signature().bind()` see one positional too many -- which is how
+            two components of this codebase disagreed while every unit test
+            passed, because the tests called the wrapper directly with
+            already-correct arguments.
+            """
+            if args and hasattr(original, "__get__") and not isinstance(owner, type(None)):
+                receiver, rest = args[0], args[1:]
+                bound = original.__get__(receiver, type(receiver))
+                return wrapper(bound, receiver, rest, kwargs)
             return wrapper(original, owner, args, kwargs)
 
         installed.__tidewall_wrapper__ = True

@@ -17,7 +17,7 @@ have to reconstruct arguments they never saw.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable, Protocol
 
 from ._bound import bound_nodes

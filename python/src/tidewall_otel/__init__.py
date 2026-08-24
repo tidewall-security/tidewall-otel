@@ -50,10 +50,30 @@ _state = State()
 def activate(config: TidewallConfig | None = None) -> None:
     """Activate Tidewall instrumentation for all supported AI SDKs.
 
-    Patches OpenAI and Anthropic SDK chat-completion methods so that every
-    call routes through the configured Tidewall guard server before reaching
-    the underlying provider. Safe to call multiple times — subsequent calls
-    are ignored if instrumentation is already active.
+    Patches OpenAI and Anthropic SDK chat-completion methods at the
+    boundaries named in the manifest. Safe to call multiple times —
+    subsequent calls are ignored if instrumentation is already active.
+
+    What is guaranteed is narrower than "every call is checked", and the
+    difference is deliberate:
+
+    * ``enforce`` and ``monitor`` consult the guard before the provider;
+      ``dry-run`` never calls the guard at all.
+    * A call whose arguments cannot be represented losslessly for the guard
+      (``extra_body``, an unmapped shape) is REFUSED in ``enforce`` before
+      any guard or provider I/O, rather than checked. The guard is not asked
+      about a body it was not shown.
+    * A client constructed with its own transport, mounts, middleware or
+      request event hooks can rewrite the wire body after inspection. That
+      is out of the threat model — anyone able to pass those can equally
+      decline to install this agent — but it is DETECTED: the surface is
+      downgraded to ``unverified``, :func:`state` records the reason, and
+      :func:`is_active` becomes False.
+
+    So the contract is: at the manifest boundaries, in an enforcing mode,
+    for representable calls, on a client with no construction-time escape,
+    the guard sees the prompt before the provider does. :func:`state` is the
+    authority on which of those held; it is not decoration.
 
     Args:
         config: Optional explicit configuration. If omitted, configuration
@@ -86,12 +106,17 @@ def activate(config: TidewallConfig | None = None) -> None:
 
     _instrumentor_instance = TidewallInstrumentor()
     _instrumentor_instance.instrument(config=config)
-    _state = State(
-        lifecycle="installed",
-        mode=config.mode,
-        surfaces=dict(getattr(_instrumentor_instance, "dispositions", {}) or
-                      {s.attribute: "covered" for s in SURFACES}),
-    )
+
+    # ADOPT the instrumentor's state; do NOT build a second one. The wrappers
+    # were handed that object, so downgrades they record (`record_unverified`
+    # on a construction-time escape) are only visible to `state()` if it is
+    # the SAME object. Two State instances is how a rewritten wire body
+    # coexisted with `surfaces={...: "covered"}` and `is_active() is True`.
+    #
+    # No `or {attribute: "covered"}` fallback: if the instrumentor installed
+    # nothing, that is a wiring failure, and fabricating full coverage would
+    # be precisely the unevidenced claim this state object exists to prevent.
+    _state = _instrumentor_instance.state
 
 
 def _handle_activation_failure(config: TidewallConfig, errors: list[str]) -> None:

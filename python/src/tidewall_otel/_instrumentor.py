@@ -20,12 +20,13 @@ an unrelated app.
 
 from __future__ import annotations
 
-import inspect
 
-import wrapt
 
 import logging
-from typing import Any, Collection
+from typing import TYPE_CHECKING, Any, Collection
+
+if TYPE_CHECKING:
+    from tidewall_otel._state import State
 
 from tidewall_otel._config import TidewallConfig
 from tidewall_otel._guard import TidewallGuard
@@ -78,6 +79,21 @@ except ImportError:
             raise NotImplementedError
 
 
+def _installed_version(provider: str) -> str:
+    """The installed SDK version, for the manifest's disposition check.
+
+    A surface whose SDK falls outside the tested range is `unverified`, not
+    `covered`: the manifest describes what has been verified, and claiming
+    coverage for an untested version is a claim with nothing behind it.
+    """
+    try:
+        import importlib.metadata as metadata
+
+        return metadata.version(provider)
+    except Exception:
+        return "0"
+
+
 def _sdk_available(module_path: str) -> bool:
     """Return True if a module can be imported without errors."""
     try:
@@ -90,18 +106,44 @@ def _sdk_available(module_path: str) -> bool:
 class TidewallInstrumentor(BaseInstrumentor):
     """OpenTelemetry instrumentor that adds Tidewall security enforcement.
 
-    Wraps OpenAI and Anthropic SDK chat-completion methods so that:
+    Wraps the OpenAI and Anthropic chat-completion methods named in the
+    manifest so that:
 
-    1. Every prompt is sent to the Tidewall guard for policy evaluation
-       before reaching the AI provider.
+    1. In an ENFORCING mode (``enforce``/``monitor``), a REPRESENTABLE prompt
+       is sent to the guard before reaching the provider. ``dry-run`` skips
+       the guard entirely, and a call that cannot be represented losslessly
+       is refused in ``enforce`` rather than sent -- the guard is never asked
+       about a body it was not shown.
     2. Blocking and transformation decisions are applied inline in
        ``enforce`` mode (see :class:`TidewallConfig`).
     3. ``gen_ai.*`` OpenTelemetry spans are emitted regardless of mode,
        so observability works even when the guard is in monitor mode.
+
+    The unqualified form of (1) -- "every prompt is sent to the guard" -- was
+    false in three separate ways while it was written here, and the state
+    object exists precisely so the qualifications are reported rather than
+    assumed. :attr:`state` is the authority on which surfaces are ``covered``.
     """
 
     _guard: TidewallGuard | None = None
     _config: TidewallConfig | None = None
+    _state: "State | None" = None
+    _executor: Any = None
+    _manager: Any = None
+
+    @property
+    def state(self) -> "State | None":
+        """The single State object the installed wrappers write into.
+
+        `activate()` returns THIS object from `state()` rather than building
+        its own. A wrapper that downgrades a surface at call time -- say
+        `record_unverified` on a construction-time transport escape -- is
+        only observable to the caller if both sides hold the same instance.
+        Two State objects is how a rewritten provider-bound body coexisted
+        with `surfaces={"Completions.create": "covered"}` and `is_active()`
+        returning True.
+        """
+        return self._state
 
     def instrumentation_dependencies(self) -> Collection[str]:
         """The SDKs this adapter instruments.
@@ -124,9 +166,6 @@ class TidewallInstrumentor(BaseInstrumentor):
         from tidewall_otel._refuser import make_refuser
 
         self._manager = PatchManager()
-        # _uninstrument iterates this; the refuser path does not go
-        # through _instrument, which is where it is normally created.
-        self._patched = []
         for surface in SURFACES:
             if not _sdk_available(surface.module):
                 continue
@@ -142,76 +181,68 @@ class TidewallInstrumentor(BaseInstrumentor):
 
 
     def _instrument(self, **kwargs: Any) -> None:
+        """Install the guard wrappers, transactionally and fully wired.
+
+        EVERY collaborator dispatch needs is constructed here and passed to
+        the factories. An earlier version built the components correctly and
+        then handed the factories only (guard, config): dispatch dereferenced
+        a None executor, the broad handler filed the AttributeError as
+        `invariant_violated`, and every enforce call was refused without the
+        guard ever being contacted -- while the state reported active. In
+        monitor the same fault proceeded UNGUARDED. Nothing caught it because
+        every dispatch test called dispatch_sync directly, so they proved the
+        component worked and never that activation wires it.
+
+        Installation goes through the PatchManager so a failure part-way
+        rolls back: patching four boundaries one at a time can otherwise leave
+        some guarded and some not while the agent reports success.
+        """
+        from tidewall_otel._anthropic_wrapper import (
+            make_anthropic_async_wrapper,
+            make_anthropic_sync_wrapper,
+        )
+        from tidewall_otel._execution import BoundedExecutor
+        from tidewall_otel._manager import PatchManager
+        from tidewall_otel._manifest import SURFACES, disposition_for
+        from tidewall_otel._openai_wrapper import (
+            make_openai_async_wrapper,
+            make_openai_sync_wrapper,
+        )
+        from tidewall_otel._state import State
+
         config = kwargs.get("config") or TidewallConfig()
         self._config = config
         self._guard = TidewallGuard(config)
-        self._patched: list[tuple[str, str]] = []
+        self._executor = BoundedExecutor()
+        self._state = State(lifecycle="installing", mode=config.mode)
+        self._manager = PatchManager()
 
-        try:
-            from wrapt import wrap_function_wrapper
-        except ImportError:
-            logger.error(
-                "wrapt package not installed. Install with: pip install wrapt"
-            )
-            return
+        factories = {
+            ("openai", "sync"): make_openai_sync_wrapper,
+            ("openai", "async"): make_openai_async_wrapper,
+            ("anthropic", "sync"): make_anthropic_sync_wrapper,
+            ("anthropic", "async"): make_anthropic_async_wrapper,
+        }
 
-        if _sdk_available(_OPENAI_MODULE):
-            from tidewall_otel._openai_wrapper import (
-                make_openai_async_wrapper,
-                make_openai_sync_wrapper,
-            )
-
-            sync_wrapper = make_openai_sync_wrapper(self._guard, config)
-            async_wrapper = make_openai_async_wrapper(self._guard, config)
-
-            wrap_function_wrapper(
-                _OPENAI_MODULE, "Completions.create", sync_wrapper
-            )
-            self._patched.append((_OPENAI_MODULE, "Completions.create"))
-
-            wrap_function_wrapper(
-                _OPENAI_MODULE, "AsyncCompletions.create", async_wrapper
-            )
-            self._patched.append((_OPENAI_MODULE, "AsyncCompletions.create"))
-
-            logger.info("OpenAI SDK instrumented with Tidewall guard")
-        else:
-            logger.debug("OpenAI SDK not available, skipping")
-
-        if _sdk_available(_ANTHROPIC_MODULE):
-            from tidewall_otel._anthropic_wrapper import (
-                make_anthropic_async_wrapper,
-                make_anthropic_sync_wrapper,
+        specs = []
+        for surface in SURFACES:
+            if not _sdk_available(surface.module):
+                continue
+            factory = factories[(surface.provider, surface.kind)]
+            wrapper = factory(self._guard, config, self._executor, self._state)
+            specs.append((surface.module, surface.attribute, wrapper))
+            self._state.surfaces[surface.attribute] = disposition_for(
+                surface, _installed_version(surface.provider)
             )
 
-            sync_wrapper = make_anthropic_sync_wrapper(self._guard, config)
-            async_wrapper = make_anthropic_async_wrapper(self._guard, config)
+        # Transactional: any failure rolls back every earlier patch.
+        self._manager.install_all(specs)
 
-            wrap_function_wrapper(
-                _ANTHROPIC_MODULE, "Messages.create", sync_wrapper
-            )
-            self._patched.append((_ANTHROPIC_MODULE, "Messages.create"))
-
-            wrap_function_wrapper(
-                _ANTHROPIC_MODULE, "AsyncMessages.create", async_wrapper
-            )
-            self._patched.append((_ANTHROPIC_MODULE, "AsyncMessages.create"))
-
-            logger.info("Anthropic SDK instrumented with Tidewall guard")
-        else:
-            logger.debug("Anthropic SDK not available, skipping")
-
-        if not self._patched:
-            logger.warning(
-                "No supported AI SDKs found (openai, anthropic). "
-                "Nothing to instrument."
-            )
-        else:
-            logger.info(
-                "Tidewall instrumentation active (mode=%s, targets=%s)",
-                config.mode,
-                [f"{m}.{c}" for m, c in self._patched],
-            )
+        self._state.lifecycle = "installed"
+        logger.info(
+            "Tidewall instrumentation active (mode=%s, surfaces=%s)",
+            config.mode, sorted(self._state.surfaces),
+        )
 
     def _uninstrument(self, **kwargs: Any) -> None:
         """Remove all applied patches and restore the original SDK methods."""
@@ -241,42 +272,17 @@ class TidewallInstrumentor(BaseInstrumentor):
             executor.shutdown()
             self._executor = None
 
-        for module_path, class_method in self._patched:
-            try:
-                import importlib
-
-                mod = importlib.import_module(module_path)
-                parts = class_method.split(".")
-                parent = mod
-                for part in parts[:-1]:
-                    parent = getattr(parent, part)
-                attr_name = parts[-1]
-                # getattr_static: `getattr` on a class triggers the
-                # descriptor protocol and returns a BOUND wrapper, so an
-                # identity or type check against it tests the wrong object.
-                original = inspect.getattr_static(parent, attr_name, None)
-
-                # ONLY unwrap OUR wrapper. `__wrapped__` is not proof of
-                # ownership: the SDKs decorate their own methods, so a
-                # pristine `Completions.create` carries one too. Unwrapping on
-                # its presence alone strips a layer the SDK put there --
-                # leaving a callable with a DIFFERENT SIGNATURE that still
-                # looks plausible, which surfaced as unrelated manifest tests
-                # failing several files later rather than as a failure here.
-                if not isinstance(original, wrapt.FunctionWrapper):
-                    continue
-                if hasattr(original, "__wrapped__"):
-                    setattr(parent, attr_name, original.__wrapped__)
-                    logger.debug("Unpatched %s.%s", module_path, class_method)
-            except Exception:
-                # WARNING, not debug. Failing to remove instrumentation leaves
-                # a wrapper installed on someone else's SDK; that is not a
-                # detail, and swallowing it at debug level is how a NameError
-                # here surfaced as unrelated tests failing in another file.
-                logger.warning(
-                    "Could not unpatch %s.%s -- the wrapper is STILL INSTALLED",
-                    module_path, class_method, exc_info=True,
-                )
-
-        self._patched.clear()
+        # NO second removal loop here. There used to be one that walked a
+        # parallel `self._patched` list and unwrapped anything that was a
+        # `wrapt.FunctionWrapper` with `__wrapped__`. That is a TYPE test, not
+        # an ownership test: a wrapper another agent installed AFTER us
+        # satisfies it exactly as well as ours does, so deactivation deleted
+        # the foreign wrapper and restored the Tidewall layer underneath --
+        # the precise inverse of the intent, while the adjacent comment
+        # claimed "ONLY unwrap OUR wrapper".
+        #
+        # PatchManager.remove() compares the CURRENT attribute against the
+        # exact object it installed and reports `not_ours` instead of writing.
+        # Keeping a second path that cannot make that comparison would mean
+        # the guarantee held only when the fallback never ran.
         logger.info("Tidewall instrumentation deactivated")

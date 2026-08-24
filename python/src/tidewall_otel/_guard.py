@@ -14,12 +14,11 @@ behaviours expected by the wrappers:
 from __future__ import annotations
 
 import logging
-import time
 from dataclasses import dataclass, field
 from typing import Any
 
 from tidewall_otel._config import TidewallConfig
-from tidewall_otel._http import GuardAPIError, post_guard
+from tidewall_otel._http import post_guard
 
 logger = logging.getLogger("tidewall.otel.guard")
 

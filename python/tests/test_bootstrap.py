@@ -162,10 +162,19 @@ def test_the_pth_runs_ALONGSIDE_a_winning_sitecustomize(tmp_path):
     assert "yes" in out, f"the rival sitecustomize did not run: {out!r}"
 
 
-@pytest.mark.parametrize("enabled,expected", [("1", "True"), ("", "False")])
+@pytest.mark.parametrize("enabled,expected", [("1", "installed"), ("", "uninstalled")])
 def test_the_env_var_GATES_activation(tmp_path, enabled, expected):
     """An inert .pth and a correctly gated one look identical unless BOTH
-    directions are checked."""
+    directions are checked.
+
+    Reads `lifecycle`, NOT `is_active()`. This venv has the wheel and nothing
+    else -- no `openai`, no `anthropic` -- so there are zero boundaries to
+    guard and `is_active()` is correctly False in BOTH arms. It only read True
+    while `activate()` fabricated `{surface: "covered"}` for every manifest
+    entry without checking whether that SDK was even importable, which made
+    this assertion pass for the wrong reason. Lifecycle is what the gate
+    actually controls.
+    """
     wheel = build_wheel_for("wheel", tmp_path)
     python, _site = _venv(tmp_path)
     subprocess.run([str(python), "-m", "pip", "install", "-q", str(wheel)], check=True)
@@ -176,7 +185,8 @@ def test_the_env_var_GATES_activation(tmp_path, enabled, expected):
         env["TIDEWALL_OTEL_ENABLED"] = enabled
 
     out = subprocess.run(
-        [str(python), "-c", "import tidewall_otel; print(tidewall_otel.is_active())"],
+        [str(python), "-c",
+         "import tidewall_otel; print(tidewall_otel.state().lifecycle)"],
         capture_output=True, text=True, env=env).stdout.strip()
     assert out == expected, out
 
