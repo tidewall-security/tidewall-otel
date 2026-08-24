@@ -66,18 +66,46 @@ class TidewallGuard:
     def __init__(self, config: TidewallConfig) -> None:
         self._config = config
 
-    def check(
+    def _payload_for(
         self,
+        guard_input: dict,
         *,
-        messages: list[dict[str, str]],
         event_type: str = "input",
         model: str = "",
         llm_provider: str = "",
-    ) -> GuardResult | None:
+    ) -> dict:
+        """Wrap a guard input in the request envelope.
+
+        Task 3 owns ``post_guard`` and its ``payload``; this builds that
+        payload, so the envelope has one definition rather than being
+        assembled inline wherever a request is sent.
+        """
+        return {
+            "guard_input": guard_input,
+            "event_type": event_type,
+            "app_id": self._config.app_id,
+            "user_id": self._config.user_id,
+            "llm_provider": llm_provider,
+            "model": model,
+            "extra_info": {
+                "app_name": self._config.app_name,
+                "user_name": self._config.user_id,
+            },
+        }
+
+    def check(
+        self,
+        *,
+        guard_input: dict,
+        event_type: str = "input",
+        model: str = "",
+        llm_provider: str = "",
+    ) -> "GuardResult | None":
         """Send messages to the Tidewall guard for evaluation.
 
         Args:
-            messages: Conversation messages in OpenAI Chat Completions format.
+            guard_input: The complete guard input -- messages and tools --
+                as produced by the normalizer. The server reads both.
             event_type: ``input`` (default), ``output``, ``tool_input``,
                 ``tool_output``, or ``tool_listing`` — controls which policy
                 rules the server applies.
@@ -92,22 +120,14 @@ class TidewallGuard:
         if self._config.mode == "dry-run":
             logger.debug(
                 "[dry-run] Would guard %s (%d messages, model=%s, provider=%s)",
-                event_type, len(messages), model, llm_provider,
+                event_type, len(guard_input.get("messages", [])), model, llm_provider,
             )
             return None
 
-        payload: dict[str, Any] = {
-            "guard_input": {"messages": messages},
-            "event_type": event_type,
-            "app_id": self._config.app_id,
-            "user_id": self._config.user_id,
-            "llm_provider": llm_provider,
-            "model": model,
-            "extra_info": {
-                "app_name": self._config.app_name,
-                "user_name": self._config.user_id,
-            },
-        }
+        payload: dict[str, Any] = self._payload_for(
+            guard_input, event_type=event_type, model=model,
+            llm_provider=llm_provider,
+        )
 
         t0 = time.monotonic()
         try:

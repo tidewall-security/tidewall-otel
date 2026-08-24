@@ -57,15 +57,16 @@ def gen_ai_span(
     *,
     provider: str,
     model: str,
-    messages: list[dict[str, str]] | None = None,
+    guard_input: dict | None = None,
 ) -> Generator[Any, None, None]:
     """Open a ``gen_ai.chat`` span with the standard request attributes.
 
     Args:
         provider: ``gen_ai.system`` value — ``"openai"``, ``"anthropic"``, etc.
         model: Model identifier, recorded as ``gen_ai.request.model``.
-        messages: Input messages in canonical (OpenAI) shape; serialized
-            into ``gen_ai.input.messages`` if supplied.
+        guard_input: The complete guard input; its ``messages`` are
+            serialized into ``gen_ai.input.messages`` if span content is
+            enabled.
 
     Yields:
         The active span, or ``None`` if OTel isn't installed.
@@ -86,6 +87,7 @@ def gen_ai_span(
         span.set_attribute(_ATTR_SYSTEM, provider)
         span.set_attribute(_ATTR_MODEL, model)
 
+        messages = (guard_input or {}).get("messages")
         if messages:
             try:
                 span.set_attribute(

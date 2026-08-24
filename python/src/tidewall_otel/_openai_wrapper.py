@@ -23,7 +23,8 @@ from typing import Any
 from tidewall_otel._config import TidewallConfig
 from tidewall_otel._exceptions import TidewallBlockedError
 from tidewall_otel._guard import TidewallGuard
-from tidewall_otel._normalizer import normalize_openai_messages
+from tidewall_otel._manifest import OPENAI_CHAT_ASYNC, OPENAI_CHAT_SYNC
+from tidewall_otel._normalizer import normalize
 from tidewall_otel._span_helper import gen_ai_span, record_response_in_span
 
 logger = logging.getLogger("tidewall.otel.openai")
@@ -45,9 +46,9 @@ def make_openai_sync_wrapper(
         is_stream = bool(kwargs.get("stream", False))
 
         # --- INPUT GUARD ---
-        normalized = normalize_openai_messages(messages)
+        normalized = normalize(OPENAI_CHAT_SYNC, kwargs)
         input_result = guard.check(
-            messages=normalized,
+            guard_input=normalized,
             event_type="input",
             model=model,
             llm_provider="openai",
@@ -65,7 +66,7 @@ def make_openai_sync_wrapper(
                 )
 
         # --- OTel SPAN + ORIGINAL CALL ---
-        with gen_ai_span(provider="openai", model=model, messages=normalized) as span:
+        with gen_ai_span(provider="openai", model=model, guard_input=normalized) as span:
             response = wrapped(*args, **kwargs)
 
             if not is_stream:
@@ -100,9 +101,9 @@ def make_openai_async_wrapper(
         model = str(kwargs.get("model", "unknown"))
         is_stream = bool(kwargs.get("stream", False))
 
-        normalized = normalize_openai_messages(messages)
+        normalized = normalize(OPENAI_CHAT_ASYNC, kwargs)
         input_result = guard.check(
-            messages=normalized,
+            guard_input=normalized,
             event_type="input",
             model=model,
             llm_provider="openai",
@@ -116,7 +117,7 @@ def make_openai_async_wrapper(
             if input_result.transformed and input_result.guard_output:
                 kwargs["messages"] = input_result.guard_output["messages"]
 
-        with gen_ai_span(provider="openai", model=model, messages=normalized) as span:
+        with gen_ai_span(provider="openai", model=model, guard_input=normalized) as span:
             response = await wrapped(*args, **kwargs)
 
             if not is_stream:

@@ -20,9 +20,13 @@ from typing import Any
 from tidewall_otel._config import TidewallConfig
 from tidewall_otel._exceptions import TidewallBlockedError
 from tidewall_otel._guard import TidewallGuard
+from tidewall_otel._manifest import (
+    ANTHROPIC_MESSAGES_ASYNC,
+    ANTHROPIC_MESSAGES_SYNC,
+)
 from tidewall_otel._normalizer import (
     extract_anthropic_response_text,
-    normalize_anthropic_messages,
+    normalize,
 )
 from tidewall_otel._span_helper import gen_ai_span, record_response_in_span
 
@@ -40,9 +44,9 @@ def make_anthropic_sync_wrapper(
 
         # --- INPUT GUARD ---
         # Normalize: pull the system kwarg + messages into OpenAI format.
-        normalized = normalize_anthropic_messages(kwargs)
+        normalized = normalize(ANTHROPIC_MESSAGES_SYNC, kwargs)
         input_result = guard.check(
-            messages=normalized,
+            guard_input=normalized,
             event_type="input",
             model=model,
             llm_provider="anthropic",
@@ -89,9 +93,9 @@ def make_anthropic_async_wrapper(
         model = str(kwargs.get("model", "unknown"))
         is_stream = bool(kwargs.get("stream", False))
 
-        normalized = normalize_anthropic_messages(kwargs)
+        normalized = normalize(ANTHROPIC_MESSAGES_ASYNC, kwargs)
         input_result = guard.check(
-            messages=normalized,
+            guard_input=normalized,
             event_type="input",
             model=model,
             llm_provider="anthropic",
