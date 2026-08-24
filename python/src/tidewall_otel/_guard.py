@@ -115,7 +115,7 @@ class TidewallGuard:
                 base_url=self._config.base_url,
                 token=self._config.token,
                 payload=payload,
-                socket_timeout=self._config.timeout,
+                socket_timeout=self._config.socket_timeout,
             )
             latency = (time.monotonic() - t0) * 1000
 

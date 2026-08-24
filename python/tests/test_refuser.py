@@ -1,6 +1,7 @@
 """The refuser state machine. Task 5 of the P0 remediation plan."""
 
 import asyncio
+import inspect
 
 import pytest
 
@@ -51,7 +52,7 @@ def test_a_refuser_is_installable_for_every_manifest_kind(surface):
     """The manifest declares `sync` and `async`; each needs its own shape."""
     refuser = make_refuser(surface, reason="x")
     assert is_refuser(refuser)
-    assert asyncio.iscoroutinefunction(refuser) is (surface.kind == "async")
+    assert inspect.iscoroutinefunction(refuser) is (surface.kind == "async")
 
 
 def test_is_refuser_identifies_one_and_rejects_anything_else():
