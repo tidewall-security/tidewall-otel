@@ -81,3 +81,35 @@ def test_instrumentation_dependencies_names_the_sdks():
     """The OTel loader reads this to decide whether to load the adapter."""
     deps = " ".join(TidewallInstrumentor().instrumentation_dependencies())
     assert "openai" in deps or "anthropic" in deps
+
+
+def test_uninstrument_does_NOT_unwrap_a_foreign_callable(monkeypatch):
+    """The ownership check. `__wrapped__` is not proof of ownership -- the SDKs
+    decorate their own methods -- so unwrapping on its presence strips a layer
+    the SDK put there and leaves a callable with a different signature.
+
+    Found unconstrained by a mechanical mutation sweep: removing the check
+    entirely left every test passing.
+    """
+    import sys
+    import types
+
+    module = types.ModuleType("foreign_sdk")
+
+    def inner():
+        return "inner"
+
+    def theirs():
+        return "theirs"
+
+    theirs.__wrapped__ = inner              # decorated by SOMEONE ELSE
+    module.Target = type("Target", (), {"create": theirs})
+    monkeypatch.setitem(sys.modules, "foreign_sdk", module)
+
+    instrumentor = TidewallInstrumentor()
+    instrumentor._patched = [("foreign_sdk", "Target.create")]
+    instrumentor._uninstrument()
+
+    assert inspect.getattr_static(module.Target, "create") is theirs, (
+        "unwrapped a callable we never wrapped"
+    )

@@ -143,3 +143,44 @@ def test_the_socket_timeout_parameter_is_NOT_called_timeout():
     params = inspect.signature(post_guard).parameters
     assert "socket_timeout" in params
     assert "timeout" not in params, "the renamed parameter still exists"
+
+
+# -- failure classification: previously unexercised ------------------------
+# The injected-opener tests never raise, so the typed-exception mapping was
+# unconstrained: every `raise Guard*` in the error paths survived mutation.
+
+@pytest.mark.parametrize("raised,expected", [
+    (urllib.error.URLError(TimeoutError("timed out")), "GuardTimeout"),
+    (urllib.error.URLError(ConnectionRefusedError("refused")), "GuardUnreachable"),
+    (urllib.error.URLError(OSError("dns")), "GuardUnreachable"),
+    (TimeoutError("socket deadline"), "GuardTimeout"),
+])
+def test_each_transport_failure_maps_to_its_TYPED_exception(raised, expected):
+    """Dispatch maps these to outcomes, so collapsing them to a bare
+    GuardAPIError would file a timeout as invariant_violated -- a policy
+    decision reported as a bug."""
+    from tidewall_otel import _http
+
+    opener = RecordingOpener(response=raised)
+    with pytest.raises(getattr(_http, expected)):
+        post_guard(base_url="https://guard.example", token="t",
+                   payload={}, opener=opener)
+
+
+def test_a_non_json_body_is_SCHEMA_INVALID_not_unreachable():
+    """The guard answered; it answered wrongly. Reporting unreachable would
+    send the caller chasing a network problem that does not exist."""
+    from tidewall_otel._http import GuardSchemaInvalid
+
+    opener = RecordingOpener(response=_response(200, body=b"<html>nope</html>"))
+    with pytest.raises(GuardSchemaInvalid):
+        post_guard(base_url="https://guard.example", token="t",
+                   payload={}, opener=opener)
+
+
+def test_an_empty_body_is_an_empty_dict_not_an_error():
+    """A 200 with no body is a degenerate but well-formed answer; the response
+    classifier decides what it means, not the transport."""
+    opener = RecordingOpener(response=_response(200, body=b""))
+    assert post_guard(base_url="https://guard.example", token="t",
+                      payload={}, opener=opener) == {}

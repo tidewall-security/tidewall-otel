@@ -107,3 +107,26 @@ def test_a_nonpositive_or_unparseable_bound_is_refused(monkeypatch, name, bad):
     monkeypatch.setenv(name, bad)
     with pytest.raises(ValueError):
         TidewallConfig()
+
+
+# -- validate(): the connection settings ----------------------------------
+# Policy errors raise from __post_init__; these are collected instead, and
+# nothing exercised them -- every branch survived mutation.
+
+@pytest.mark.parametrize("missing,expected", [
+    ("TIDEWALL_BASE_URL", "TIDEWALL_BASE_URL"),
+    ("TIDEWALL_TOKEN", "TIDEWALL_TOKEN"),
+])
+def test_validate_REPORTS_a_missing_connection_setting(monkeypatch, missing, expected):
+    """Activation reads this list to decide the failure policy, so a validate()
+    that returns nothing means activation proceeds with no guard URL and the
+    agent reports itself enforcing against a server it can never reach."""
+    monkeypatch.delenv(missing, raising=False)
+    errors = TidewallConfig().validate()
+    assert any(expected in error for error in errors), errors
+
+
+def test_validate_is_EMPTY_when_the_configuration_is_complete():
+    """The other direction: a check that always reports errors is as useless
+    as one that never does."""
+    assert TidewallConfig().validate() == []

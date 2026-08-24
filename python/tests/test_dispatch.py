@@ -344,3 +344,53 @@ def test_ONE_except_clause_catches_every_refusal():
 
     for cls in (TidewallBlockedError, TidewallRefusedError, LossyInputError):
         assert issubclass(cls, TidewallError), cls
+
+
+# -- mode branches: correct, but previously unasserted ---------------------
+# A mechanical mutation sweep -- one that generates mutations from the source
+# rather than from the author's awareness -- found these branches unconstrained.
+# The behaviour was right; nothing held it there.
+
+def test_dry_run_makes_NO_guard_call_at_all(monkeypatch, executor):
+    """dry-run's contract is that no request leaves the process. Asserting
+    only that the provider was reached cannot distinguish it from monitor,
+    because both proceed."""
+    monkeypatch.setenv("TIDEWALL_BASE_URL", "https://g.example")
+    monkeypatch.setenv("TIDEWALL_TOKEN", "t")
+    monkeypatch.setenv("TIDEWALL_MODE", "dry-run")
+
+    provider, guard = RecordingProvider(), GuardReturning(clean_body())
+    result = dispatch_sync(OPENAI_CHAT_SYNC, provider, FakeInstance(), (),
+                           minimal(OPENAI_CHAT_SYNC), TidewallConfig(),
+                           guard, executor)
+
+    assert guard.calls == [], "dry-run contacted the guard"
+    assert provider.calls and result == "provider-result"
+
+
+def transformed_body():
+    return {"request_id": "r", "request_time": "t", "summary": "",
+            "result": {"blocked": False, "transformed": True, "policy": "d",
+                       "guard_output": {"messages": [
+                           {"role": "user", "content": "REDACTED"}]}}}
+
+
+@pytest.mark.parametrize("mode", ["monitor", "dry-run"])
+def test_a_transform_is_NOT_APPLIED_outside_enforce(monkeypatch, executor, mode):
+    """monitor observes; it does not rewrite. Applying a transform there would
+    silently change what the application sends while the operator believes the
+    mode is read-only -- and the failure-kind tests cannot see it, because
+    those never produce a transformed verdict."""
+    monkeypatch.setenv("TIDEWALL_BASE_URL", "https://g.example")
+    monkeypatch.setenv("TIDEWALL_TOKEN", "t")
+    monkeypatch.setenv("TIDEWALL_MODE", mode)
+
+    provider = RecordingProvider()
+    dispatch_sync(OPENAI_CHAT_SYNC, provider, FakeInstance(), (),
+                  {"model": "gpt-4o", "messages": [{"role": "user", "content": "ORIGINAL"}]},
+                  TidewallConfig(), GuardReturning(transformed_body()), executor)
+
+    _args, kwargs = provider.calls[0]
+    assert kwargs["messages"][0]["content"] == "ORIGINAL", (
+        f"{mode} rewrote the request it was only meant to observe"
+    )
