@@ -113,18 +113,27 @@ def test_typed_content_is_FLATTENED_to_its_text():
 
 # -- every caller migrated in the same commit -----------------------------
 
-def test_check_takes_GUARD_INPUT_and_still_returns_a_GuardResult():
-    """12a is a PURE INPUT-CONTRACT migration: the four wrapper bodies keep
-    their control flow and dereference GuardResult attributes, so changing the
-    RETURN type here would be an AttributeError in all four."""
+def test_the_guard_port_takes_GUARD_INPUT_and_returns_the_RAW_BODY():
+    """SUPERSEDES an earlier assertion that `check()` took guard_input and
+    still returned a GuardResult.
+
+    That was correct for 12a, whose whole point was migrating what goes IN
+    while the four wrapper bodies kept dereferencing GuardResult attributes.
+    12c replaced those bodies and deleted `check()`, so the intermediate
+    contract is gone by design -- recorded here rather than quietly removed,
+    because a test disappearing and a test being superseded look identical in
+    a diff.
+    """
     from tidewall_otel._guard import TidewallGuard
 
-    parameters = inspect.signature(TidewallGuard.check).parameters
+    assert not hasattr(TidewallGuard, "check"), "the fail-open path survives"
+
+    parameters = inspect.signature(TidewallGuard.check_raw).parameters
     assert "guard_input" in parameters
     assert "messages" not in parameters
 
-    returns = inspect.signature(TidewallGuard.check).return_annotation
-    assert "GuardResult" in str(returns), returns
+    returns = inspect.signature(TidewallGuard.check_raw).return_annotation
+    assert "dict" in str(returns), returns
 
 
 def test_the_span_helper_was_migrated_too():
