@@ -37,4 +37,4 @@ jobs:
           python -c "import tidewall_otel; print(tidewall_otel.__version__)"
 
       - name: Tests
-        run: pytest -q || true  # tests directory may be empty at v0.1.0
+        run: pytest -q
