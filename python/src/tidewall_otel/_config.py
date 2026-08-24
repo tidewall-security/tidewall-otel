@@ -49,8 +49,11 @@ class TidewallConfig:
     """Runtime configuration for the Tidewall instrumentation agent.
 
     Environment variables:
-        TIDEWALL_BASE_URL   - Tidewall guard API base URL
-                              (e.g. ``http://localhost:8080``)
+        TIDEWALL_BASE_URL   - Tidewall guard API base URL; MUST be https
+                              (e.g. ``https://guard.example.com``). Plaintext
+                              is refused before any connection is opened --
+                              this request carries the bearer token and the
+                              prompt -- and there is no loopback exception.
         TIDEWALL_TOKEN      - API token for authenticating with the guard server
         TIDEWALL_APP_ID     - Application identifier recorded in guard events
         TIDEWALL_APP_NAME   - Human-readable application name for dashboards

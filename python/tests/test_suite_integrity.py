@@ -145,3 +145,91 @@ def test_the_always_true_detector_CATCHES_the_shapes_it_claims_to():
                       "def test_e():\n    assert not x, 'message'\n"
                       "def test_f():\n    assert x or y\n")
     assert list(_always_true_assertions(clean)) == []
+
+
+def _plaintext_guard_urls(text):
+    """`http://` offered as a guard base URL.
+
+    Windowed, NOT line-based. The real defect in `_config.py` put the variable
+    name and its example on DIFFERENT lines:
+
+        TIDEWALL_BASE_URL   - Tidewall guard API base URL
+                              (e.g. ``http://localhost:8080``)
+
+    A single-line regex finds the README occurrences and misses that one --
+    which is the shape the known-positive below plants, because a detector
+    tested only against the easy case is how the hard case ships.
+
+    The window stops at a blank line or the next ``TIDEWALL_`` variable, so an
+    unrelated `http://` further down the file is not attributed to this one.
+    Narrow on purpose: a link to an RFC is not a configuration example.
+    """
+    import re
+
+    for match in re.finditer(r"TIDEWALL_BASE_URL", text):
+        rest = text[match.start():]
+        stop = len(rest)
+        blank = re.search(r"\n\s*\n", rest)
+        if blank:
+            stop = min(stop, blank.start())
+        nxt = re.search(r"TIDEWALL_(?!BASE_URL)", rest[1:])
+        if nxt:
+            stop = min(stop, nxt.start() + 1)
+        window = rest[:stop]
+        if "http://" in window:
+            yield " ".join(window.split())
+
+
+def test_no_document_offers_a_PLAINTEXT_guard_url():
+    """The design called this out and the change was missed.
+
+    HTTPS-only was accepted as a deliberate pre-release break: "HTTPS-only
+    breaks every http://localhost:8080 quick start in the server docs.
+    Deliberate pre-release break; the server documentation changes in the same
+    release." The code shipped the enforcement; three documents kept telling a
+    new user to configure exactly the URL that is now refused before a socket
+    is opened -- including the config docstring they would read to fix it.
+
+    Documentation that contradicts an enforced security control is not a
+    cosmetic defect: it is a first-run failure that teaches the user the agent
+    is broken.
+    """
+    repo = Path(__file__).resolve().parents[2]
+    offenders = []
+    for doc in (repo / "README.md", repo / "python" / "README.md",
+                repo / "python" / "src" / "tidewall_otel" / "_config.py"):
+        if not doc.exists():
+            continue
+        for line in _plaintext_guard_urls(doc.read_text()):
+            offenders.append(f"{doc.relative_to(repo)}: {line}")
+    assert not offenders, (
+        "documents offering a plaintext guard URL:\n" + "\n".join(offenders))
+
+
+def test_the_plaintext_url_detector_CATCHES_the_real_line():
+    """Known-positive, planting the exact text that shipped -- including the
+    CONTINUATION-LINE form, which a line-based detector would miss."""
+    shell = "export TIDEWALL_BASE_URL=http://localhost:8080"
+    assert len(list(_plaintext_guard_urls(shell))) == 1
+
+    table = ("| `TIDEWALL_BASE_URL` | (required) | base URL, "
+             "e.g. `http://localhost:8080` |")
+    assert len(list(_plaintext_guard_urls(table))) == 1
+
+    # The one that actually shipped in _config.py: name and example on
+    # different lines.
+    continuation = (
+        "        TIDEWALL_BASE_URL   - Tidewall guard API base URL\n"
+        "                              (e.g. ``http://localhost:8080``)\n"
+        "        TIDEWALL_TOKEN      - API token\n"
+    )
+    found = list(_plaintext_guard_urls(continuation))
+    assert len(found) == 1, found
+
+    assert list(_plaintext_guard_urls(
+        "export TIDEWALL_BASE_URL=https://guard.example.com")) == []
+    # prose mentioning http elsewhere is not a configuration example
+    assert list(_plaintext_guard_urls("see http://example.org for background")) == []
+    # and an http:// beyond the window is not attributed to this variable
+    assert list(_plaintext_guard_urls(
+        "TIDEWALL_BASE_URL - the guard URL\n\nSee http://example.org too\n")) == []

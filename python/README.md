@@ -42,7 +42,7 @@ Configure via environment variables (recommended) or by passing a
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `TIDEWALL_BASE_URL` | (required) | Tidewall guard API base URL, e.g. `http://localhost:8080` |
+| `TIDEWALL_BASE_URL` | (required) | Tidewall guard API base URL. **Must be `https://`** — the bearer token and the prompt travel in this request, so plaintext is refused before a connection is opened, with no loopback exception. |
 | `TIDEWALL_TOKEN` | (required) | API token for the guard server |
 | `TIDEWALL_MODE` | `enforce` | `enforce`, `monitor`, or `dry-run` |
 | `TIDEWALL_APP_ID` | `tidewall-otel` | App identifier recorded with each guard event |
