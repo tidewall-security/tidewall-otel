@@ -227,3 +227,45 @@ def test_an_ORDINARY_client_stays_covered_and_active(guard_says, monkeypatch):
     assert state.surfaces["Completions.create"] == "covered"
     assert state.events == []
     assert state.is_active() is True
+
+
+def test_a_failure_MID_ACTIVATION_leaves_no_live_partial_patch(monkeypatch):
+    """Finding 2, at the activation seam rather than the manager's.
+
+    `PatchManager.install_all` has always rolled back. The defect was that
+    normal activation never called it -- it applied four independent
+    `wrap_function_wrapper` calls, so a failure on the second left the first
+    live on the SDK while the public lifecycle read `uninstalled`. A caller
+    reading that state would believe the SDK was pristine while an orphaned
+    Tidewall wrapper stayed installed for the life of the process.
+
+    Testing the manager's rollback in isolation cannot catch this: the
+    manager was correct and simply disconnected.
+    """
+    import inspect
+
+    from openai.resources.chat.completions.completions import Completions
+
+    from tidewall_otel._manager import PatchManager
+
+    before = inspect.getattr_static(Completions, "create")
+
+    real, calls = PatchManager.install, []
+
+    def flaky(self, module, name, wrapper):
+        calls.append(name)
+        if len(calls) == 2:
+            raise RuntimeError("synthetic second-patch failure")
+        return real(self, module, name, wrapper)
+
+    monkeypatch.setattr(PatchManager, "install", flaky)
+
+    with pytest.raises(RuntimeError, match="synthetic second-patch failure"):
+        tidewall_otel.activate()
+
+    assert len(calls) == 2, "activation did not go through the manager at all"
+    assert inspect.getattr_static(Completions, "create") is before, (
+        "the first patch survived a failed activation"
+    )
+    assert tidewall_otel.state().lifecycle != "installed"
+    assert tidewall_otel.is_active() is False
