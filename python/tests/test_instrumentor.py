@@ -21,19 +21,62 @@ def clean(monkeypatch):
     tidewall_otel.deactivate()
 
 
+def _calls_named(func, name):
+    """Every call to `name` in `func`, by AST rather than by substring.
+
+    The substring version failed the moment a COMMENT in `_instrument`
+    mentioned `activate()` while calling no such thing -- it could not tell a
+    call from prose, so documenting the invariant broke the test guarding it.
+    It would equally have missed `getattr(tidewall_otel, "acti" + "vate")()`,
+    but that is not the failure mode; an honest mention is.
+    """
+    import ast
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(func)))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            callee = node.func
+            if isinstance(callee, ast.Name) and callee.id == name:
+                yield node.lineno
+            elif isinstance(callee, ast.Attribute) and callee.attr == name:
+                yield node.lineno
+
+
 def test_the_adapter_does_NOT_call_activate():
     """Mutual recursion: activate() constructs the instrumentor and calls
     instrument(); if _instrument called activate() back, `opentelemetry-instrument`
     would recurse until the stack died -- and only under the OTel entry point,
     never in the direct-call path most tests exercise."""
-    source = inspect.getsource(TidewallInstrumentor._instrument)
-    assert "activate(" not in source, source
+    found = list(_calls_named(TidewallInstrumentor._instrument, "activate"))
+    assert not found, f"_instrument calls activate() at line(s) {found}"
 
 
 def test_activate_does_NOT_call_the_adapter_hook():
     """The other direction of the same loop."""
-    source = inspect.getsource(tidewall_otel.activate)
-    assert "_instrument(" not in source, source
+    found = list(_calls_named(tidewall_otel.activate, "_instrument"))
+    assert not found, f"activate calls _instrument() at line(s) {found}"
+
+
+def test_the_recursion_detector_CATCHES_a_real_call():
+    """Known-positive. The detector must still see a call it should reject --
+    otherwise switching from substring to AST could have made it vacuous."""
+    def activate():
+        return None
+
+    def calls_it():
+        activate()                      # a REAL call to a real name
+
+    def calls_it_via_attribute():
+        tidewall_otel.activate()
+
+    def only_mentions_it():
+        """Prose about activate() that calls nothing."""
+        return "activate("
+
+    assert list(_calls_named(calls_it, "activate"))
+    assert list(_calls_named(calls_it_via_attribute, "activate"))
+    assert not list(_calls_named(only_mentions_it, "activate"))
 
 
 def test_the_adapter_is_a_thin_shim_over_the_manager():

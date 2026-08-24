@@ -239,6 +239,14 @@ class TidewallInstrumentor(BaseInstrumentor):
         self._manager.install_all(specs)
 
         self._state.lifecycle = "installed"
+
+        # Publish to the package so `tidewall_otel.state()` reflects reality
+        # under the OTel entry point, which never goes through the public
+        # activate(). Import late: the package imports this module.
+        import tidewall_otel
+
+        tidewall_otel._publish(self)
+
         logger.info(
             "Tidewall instrumentation active (mode=%s, surfaces=%s)",
             config.mode, sorted(self._state.surfaces),

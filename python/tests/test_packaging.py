@@ -81,3 +81,73 @@ def test_the_CI_test_step_is_EXACTLY_the_accepted_command():
             f"command. Accepted: {sorted(ACCEPTED)}. If this is a legitimate "
             f"change, widen ACCEPTED deliberately -- do not relax the check."
         )
+
+
+def test_the_DOCUMENTED_otel_command_guards_and_reports_itself(tmp_path):
+    """`opentelemetry-instrument python app.py` -- README activation method 2.
+
+    Both halves matter, and they failed independently:
+
+    * The SDK must actually be patched and a real call must reach the guard.
+    * `tidewall_otel.state()` must SAY so. The entry point never calls the
+      public `activate()`; it constructs the instrumentor and calls its hook.
+      That patched the SDK correctly while the module-level state stayed at
+      its initial `uninstalled`, so an operator wiring `is_active()` into a
+      health check under the documented zero-code workflow read False and
+      would have concluded they were unprotected. The mirror image of
+      reporting `active` while unguarded, and just as wrong.
+
+    Only reproducible from a real wheel in a clean venv: an editable install
+    has no `.pth`, and the dev environment resolves the entry point
+    differently. Reading the source cannot find this at all.
+    """
+    root = PYPROJECT.parent
+    subprocess.run(
+        [sys.executable, "-m", "build", "--wheel", "--outdir", str(tmp_path)],
+        cwd=root, check=True, capture_output=True,
+    )
+    wheel = next(tmp_path.glob("*.whl"))
+
+    venv = tmp_path / "venv"
+    subprocess.run([sys.executable, "-m", "venv", str(venv)], check=True)
+    bindir = venv / ("Scripts" if sys.platform == "win32" else "bin")
+    python = bindir / "python"
+
+    subprocess.run(
+        [str(python), "-m", "pip", "install", "-q", f"{wheel}[otel]",
+         "openai", "httpx"],
+        check=True, capture_output=True,
+    )
+
+    app = tmp_path / "app.py"
+    app.write_text(
+        "import inspect, httpx, openai, tidewall_otel\n"
+        "import tidewall_otel._guard as G\n"
+        "from openai.resources.chat.completions.completions import Completions\n"
+        "asked = []\n"
+        "G.post_guard = lambda **kw: (asked.append(kw['payload']), {'result': {\n"
+        "    'blocked': False, 'transformed': False, 'policy': 'p'}})[1]\n"
+        "def ok(request):\n"
+        "    return httpx.Response(200, json={'id': 'x', 'object': 'chat.completion',\n"
+        "        'created': 0, 'model': 'gpt-4o', 'choices': [{'index': 0,\n"
+        "        'finish_reason': 'stop', 'message': {'role': 'assistant',\n"
+        "        'content': 'ok'}}]})\n"
+        "c = openai.OpenAI(api_key='t',\n"
+        "                  http_client=httpx.Client(transport=httpx.MockTransport(ok)))\n"
+        "c.chat.completions.create(model='gpt-4o',\n"
+        "                          messages=[{'role': 'user', 'content': 'hi'}])\n"
+        "patched = getattr(inspect.getattr_static(Completions, 'create'),\n"
+        "                  '__tidewall_wrapper__', False)\n"
+        "print(f'patched={patched} asked={len(asked)} "
+        "lifecycle={tidewall_otel.state().lifecycle}')\n"
+    )
+
+    result = subprocess.run(
+        [str(bindir / "opentelemetry-instrument"), str(python), str(app)],
+        capture_output=True, text=True, cwd=tmp_path,
+        env={"PATH": str(bindir) + ":/usr/bin:/bin",
+             "TIDEWALL_BASE_URL": "https://guard.example", "TIDEWALL_TOKEN": "t"},
+    )
+    line = next((l for l in result.stdout.splitlines() if l.startswith("patched=")), "")
+    assert line == "patched=True asked=1 lifecycle=installed", (
+        f"stdout={result.stdout!r} stderr={result.stderr[-800:]!r}")

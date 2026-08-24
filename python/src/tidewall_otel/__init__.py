@@ -36,6 +36,8 @@ import logging
 from tidewall_otel._config import TidewallConfig
 from tidewall_otel._exceptions import TidewallConfigError
 from tidewall_otel._manifest import SURFACES
+from typing import Any
+
 from tidewall_otel._state import State
 
 __version__ = "0.1.0"
@@ -176,6 +178,27 @@ def _configure_logging(config: TidewallConfig) -> None:
             datefmt="%H:%M:%S",
         ))
         root_logger.addHandler(handler)
+
+
+def _publish(instrumentor: Any) -> None:
+    """Adopt an instrumentor installed through the OTel entry point.
+
+    `opentelemetry-instrument` never calls :func:`activate`; it constructs the
+    instrumentor and calls its hook directly. Without this, the SDK really is
+    patched and every call really does reach the guard, while :func:`state`
+    still reports the module's initial `uninstalled` -- an operator wiring
+    :func:`is_active` into a health check under the documented zero-code
+    workflow would read False and conclude they were unprotected.
+
+    Deliberately NOT a call to `activate()`. That direction would recurse:
+    activate constructs an instrumentor and calls its hook, which would call
+    activate again, and only under the entry point -- never in the direct path
+    most tests exercise. Two tests pin both directions of that loop.
+    """
+    global _instrumentor_instance, _state
+
+    _instrumentor_instance = instrumentor
+    _state = instrumentor.state
 
 
 def state() -> State:
