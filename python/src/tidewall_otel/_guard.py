@@ -80,18 +80,24 @@ class TidewallGuard:
         payload, so the envelope has one definition rather than being
         assembled inline wherever a request is sent.
         """
-        return {
+        extra_info: dict[str, Any] = {"app_name": self._config.app_name}
+        payload: dict[str, Any] = {
             "guard_input": guard_input,
             "event_type": event_type,
             "app_id": self._config.app_id,
-            "user_id": self._config.user_id,
             "llm_provider": llm_provider,
             "model": model,
-            "extra_info": {
-                "app_name": self._config.app_name,
-                "user_name": self._config.user_id,
-            },
+            "extra_info": extra_info,
         }
+
+        # OMITTED, not blank. An empty string still asserts a field the
+        # operator never set, and a downstream consumer treating presence as
+        # meaningful would record it as an identity.
+        if self._config.user_id:
+            payload["user_id"] = self._config.user_id
+            extra_info["user_name"] = self._config.user_id
+
+        return payload
 
     def check_raw(self, *, guard_input: dict, event_type: str = "input",
                   model: str = "", llm_provider: str = "") -> dict:

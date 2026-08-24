@@ -104,12 +104,13 @@ class TidewallInstrumentor(BaseInstrumentor):
     _config: TidewallConfig | None = None
 
     def instrumentation_dependencies(self) -> Collection[str]:
-        # Returning an empty collection means OTel will load this
-        # instrumentor regardless of which AI SDK (if any) is installed,
-        # and we decide what to patch at runtime. This is intentional —
-        # the alternative would be to require either openai or anthropic
-        # as a dependency, which would force unnecessary installs.
-        return []
+        """The SDKs this adapter instruments.
+
+        The OTel loader reads this to decide whether to load us at all, so an
+        empty list means `opentelemetry-instrument` may skip the adapter
+        entirely -- instrumentation silently absent rather than failing.
+        """
+        return ("openai >= 1.40.0", "anthropic >= 0.27.0")
 
     def instrument_refusers(self, *, reason: str) -> None:
         """Install a refuser at every manifest boundary.
@@ -218,9 +219,21 @@ class TidewallInstrumentor(BaseInstrumentor):
         # compares before writing and reports not-ours rather than deleting
         # another agent's wrapper. Without this, refusers installed at
         # activation survive deactivation entirely.
+        self.residuals: list[str] = []
+
         manager = getattr(self, "_manager", None)
         if manager is not None:
-            manager.remove()
+            for (module_path, attribute), outcome in manager.remove().items():
+                if outcome.value != "removed":
+                    # STUCK, not removed. Reporting it as uninstrumented would
+                    # leave another agent's SDK carrying our wrapper while our
+                    # state says we are gone -- the removal-side twin of
+                    # reporting enforcement while unguarded.
+                    self.residuals.append(
+                        f"{module_path}.{attribute}: {outcome.value} -- wrapper NOT removed"
+                    )
+                    logger.warning("Tidewall could not remove %s.%s: %s",
+                                   module_path, attribute, outcome.value)
             self._manager = None
 
         executor = getattr(self, "_executor", None)

@@ -83,10 +83,11 @@ class TidewallConfig:
             "TIDEWALL_APP_NAME", "Tidewall OTel Instrumentation"
         )
     )
+    # NO $USER FALLBACK. The OS account name is not ours to disclose, and it
+    # was previously sent twice by default -- as user_id and again as
+    # extra_info.user_name. Sending an identity must be an explicit choice.
     user_id: str = field(
-        default_factory=lambda: os.environ.get(
-            "TIDEWALL_USER_ID", os.environ.get("USER", "unknown")
-        )
+        default_factory=lambda: os.environ.get("TIDEWALL_USER_ID", "")
     )
     mode: str = field(default_factory=lambda: os.environ.get("TIDEWALL_MODE", "enforce"))
     log_level: str = field(
