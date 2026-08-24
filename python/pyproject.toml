@@ -1,6 +1,10 @@
 [build-system]
 requires = ["setuptools>=68.0", "wheel"]
-build-backend = "setuptools.build_meta"
+# OUR backend, not setuptools' directly. `backend-path` makes _build_pth
+# importable during an isolated build; it does not make its functions PEP 517
+# hooks, because the frontend calls them on the NAMED backend.
+build-backend = "_build_pth"
+backend-path = ["."]
 
 [project]
 name = "tidewall-otel"
@@ -68,6 +72,9 @@ tidewall-instrument = "tidewall_otel._bootstrap.cli:main"
 # this entry point and activates TidewallInstrumentor automatically.
 [project.entry-points."opentelemetry_instrumentor"]
 tidewall = "tidewall_otel._instrumentor:TidewallInstrumentor"
+
+[tool.setuptools]
+py-modules = ["tidewall_otel_bootstrap"]      # the module the .pth imports
 
 [tool.setuptools.packages.find]
 where = ["src"]
