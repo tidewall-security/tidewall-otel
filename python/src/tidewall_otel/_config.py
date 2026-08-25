@@ -44,6 +44,56 @@ def _positive_float(name: str, default: str) -> float:
 
 
 
+class Secret:
+    """A string that does not appear in any rendering of its container.
+
+    `field(repr=False)` protects exactly one route -- the generated dataclass
+    repr -- and the token stayed visible through `dataclasses.asdict`, `vars`,
+    `copy(config).__dict__` and `pickle`. `asdict` in particular is how
+    structured logging normally serialises a config object, so the redaction
+    covered the careful case and missed the common one.
+
+    Redacting at the VALUE means every route that extracts the field gets this
+    object, and every route that renders it gets `***`. The raw string is
+    reachable only by asking for it by name.
+
+    Not a security boundary: `reveal()` exists, and anything that deliberately
+    serialises the revealed value -- including `pickle`, which must keep the
+    real bytes or a forked worker loses its credential -- still carries it.
+    It removes the accident, not the intent.
+    """
+
+    __slots__ = ("_value",)
+
+    def __init__(self, value: str = "") -> None:
+        self._value = value
+
+    def reveal(self) -> str:
+        """The raw value. Named so it cannot be reached by accident."""
+        return self._value
+
+    def __bool__(self) -> bool:
+        return bool(self._value)
+
+    def __len__(self) -> int:
+        return len(self._value)
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, Secret):
+            return self._value == other._value
+        if isinstance(other, str):
+            return self._value == other
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash(self._value)
+
+    def __repr__(self) -> str:
+        return "Secret('***')" if self._value else "Secret('')"
+
+    __str__ = __repr__
+
+
 @dataclass
 class TidewallConfig:
     """Runtime configuration for the Tidewall instrumentation agent.
@@ -89,9 +139,8 @@ class TidewallConfig:
     #: refused). Nothing protected its REPRESENTATION, and the two are the
     #: same asset. `__post_init__` still validates it, and `_http.post_guard`
     #: still reads it -- only the repr is redacted.
-    token: str = field(
-        default_factory=lambda: os.environ.get("TIDEWALL_TOKEN", ""),
-        repr=False,
+    token: Secret = field(
+        default_factory=lambda: Secret(os.environ.get("TIDEWALL_TOKEN", ""))
     )
     app_id: str = field(
         default_factory=lambda: os.environ.get("TIDEWALL_APP_ID", "tidewall-otel")
@@ -126,6 +175,10 @@ class TidewallConfig:
     )
 
     def __post_init__(self) -> None:
+        # Accept a plain string: `TidewallConfig(token="...")` is the obvious
+        # thing to write, and refusing it would trade one footgun for another.
+        if not isinstance(self.token, Secret):
+            object.__setattr__(self, "token", Secret(self.token or ""))
         """Policy errors RAISE; connection settings are collected by
         ``validate``.
 

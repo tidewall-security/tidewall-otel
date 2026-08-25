@@ -131,25 +131,82 @@ def test_the_TOKEN_is_never_in_the_config_repr(monkeypatch):
 
 
 def test_the_token_is_absent_from_EVERY_public_rendering(monkeypatch):
-    """Not just repr: anything that stringifies the object by any route.
+    """Every route that RENDERS the config, not every route named `repr`.
 
-    Named separately because "not in repr" is a weaker claim than the one
-    that matters, and this programme has repeatedly shipped the weaker one.
+    The first version of this test called itself "EVERY public rendering" and
+    checked six repr-derived forms. `dataclasses.asdict`, `vars`,
+    `copy(config).__dict__` and `pickle` all still carried the token --
+    `field(repr=False)` protects exactly one route. `asdict` is how structured
+    logging normally serialises a config object, so the redaction covered the
+    careful case and missed the common one.
+
+    The sixth quantifier defect of this session, in the test written to avoid
+    quantifier defects. Redacting at the VALUE rather than at the field is
+    what makes the general claim true.
     """
+    import copy
+    import dataclasses
     import pprint
 
     monkeypatch.setenv("TIDEWALL_BASE_URL", "https://guard.example")
     monkeypatch.setenv("TIDEWALL_TOKEN", "sk-SUPERSECRET-do-not-print")
 
     config = TidewallConfig()
+
     renderings = {
         "repr": repr(config),
         "str": str(config),
+        "f-string": f"{config}",
+        "format": "{}".format(config),                        # noqa: UP032
         "pprint": pprint.pformat(config),
         "list-repr": repr([config]),
         "dict-repr": repr({"config": config}),
         "exception": repr(ValueError(config)),
+        "asdict": repr(dataclasses.asdict(config)),
+        "vars": repr(vars(config)),
+        "instance-dict": repr(config.__dict__),
+        "copy-dict": repr(copy.copy(config).__dict__),
+        "deepcopy-dict": repr(copy.deepcopy(config).__dict__),
+        "token-repr": repr(config.token),
+        "token-str": str(config.token),
     }
-    leaked = {name: text for name, text in renderings.items()
-              if "SUPERSECRET" in text}
-    assert not leaked, f"the token leaked through: {sorted(leaked)}"
+    leaked = sorted(name for name, text in renderings.items()
+                    if "SUPERSECRET" in text)
+    assert not leaked, f"the token leaked through: {leaked}"
+
+    assert config.token.reveal() == "sk-SUPERSECRET-do-not-print", (
+        "the value must still be retrievable by name")
+
+
+def test_the_token_DOES_survive_pickle_and_that_is_documented(monkeypatch):
+    """The honest exception, asserted so it cannot become a surprise.
+
+    `pickle` must carry the real bytes -- a forked worker that loses its
+    credential cannot call the guard. This is not a rendering; nothing
+    displays it. Pinning it here means the boundary is stated rather than
+    assumed, and a future change that silently starts redacting pickle (and
+    so breaks multiprocessing) fails loudly instead.
+    """
+    import pickle
+
+    monkeypatch.setenv("TIDEWALL_BASE_URL", "https://guard.example")
+    monkeypatch.setenv("TIDEWALL_TOKEN", "sk-SUPERSECRET-do-not-print")
+
+    config = TidewallConfig()
+    restored = pickle.loads(pickle.dumps(config))
+
+    assert restored.token.reveal() == "sk-SUPERSECRET-do-not-print"
+    assert "SUPERSECRET" not in repr(restored), (
+        "a round-tripped config must redact exactly as the original does")
+
+
+def test_a_string_token_is_COERCED_so_the_obvious_call_still_works(monkeypatch):
+    """`TidewallConfig(token="...")` is what anyone would write."""
+    monkeypatch.delenv("TIDEWALL_TOKEN", raising=False)
+
+    config = TidewallConfig(base_url="https://guard.example", token="plain-string")
+
+    assert config.token.reveal() == "plain-string"
+    assert "plain-string" not in repr(config)
+    assert config.token, "a non-empty token must be truthy"
+    assert not TidewallConfig(base_url="https://g.example", token="").token

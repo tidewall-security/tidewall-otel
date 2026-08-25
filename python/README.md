@@ -62,13 +62,17 @@ it can submit prompts as your application and read the verdicts.
 - Supply it through the environment or a secrets manager. Do not commit it,
   and do not pass it on a command line, where it is visible in the process
   table and shell history.
-- **Do not log your configuration object.** `TidewallConfig` deliberately
-  omits the token from its `repr`, so `logger.info("%s", config)` is safe —
-  but `config.token` is not, and neither is a hand-rolled dict of settings.
-- Error reporters that capture frame locals (Sentry and similar do this by
-  default) will capture anything you have put in a local variable. The
-  redacted `repr` protects the config object; it cannot protect a variable
-  you assigned the raw token to.
+- `config.token` is a `Secret`, not a `str`. It renders as `Secret('***')`
+  everywhere — `repr`, `str`, `dataclasses.asdict`, `vars`, copies — so
+  logging or serialising the config object does not disclose it. Call
+  `config.token.reveal()` to get the raw value, which is deliberately awkward
+  so it cannot happen by accident.
+- **`pickle` still carries the real value**, because a forked worker that
+  loses its credential cannot call the guard. Do not persist a pickled config
+  anywhere you would not persist the token itself.
+- The redaction protects the config object, not a variable you assigned
+  `reveal()` to. Error reporters that capture frame locals — Sentry and
+  similar do this by default — will capture whatever you put in a local.
 - The agent never writes the token to a log, and refuses to send it over a
   plaintext connection or follow a redirect that would carry it to another
   origin.
