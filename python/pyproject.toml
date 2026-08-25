@@ -51,8 +51,14 @@ otel = [
     # to the stub in _instrumentor.py and the OTel entry point does nothing.
     "opentelemetry-instrumentation>=0.41b0",
 ]
-openai = ["openai>=1.0.0"]
-anthropic = ["anthropic>=0.20.0"]
+# CEILINGS MATTER. These must match the manifest's `version_range`, which is
+# the range that has actually been tested. Unbounded floors let a fresh install
+# resolve openai 3.x, which routes through `httpx2` rather than `httpx` -- so
+# the transport allowlist matched nothing, every ORDINARY client was reported
+# as a construction-time escape, and `is_active()` was False for everyone.
+# CI installs this extra, so CI was red on both matrix versions.
+openai = ["openai>=1.40.0,<2.0.0"]
+anthropic = ["anthropic>=0.27.0,<1.0.0"]
 dev = [
     "tidewall-otel[otel,openai,anthropic]",
     "pytest>=7.0",
@@ -61,6 +67,13 @@ dev = [
     "build>=1.0",          # the packaging acceptance invokes `python -m build`
     "pyflakes>=3.0",       # the test-suite breadth check
     "httpx>=0.24",         # wire-body capture over httpx.MockTransport
+    # The bootstrap acceptance calls `_build_pth.build_editable()` in the
+    # CURRENT interpreter, not through an isolated build, so setuptools must
+    # be importable here. Python 3.12 stopped bundling it into new venvs, so
+    # on 3.12 -- one of the two versions CI runs -- four bootstrap tests
+    # failed with a bare CalledProcessError from the build backend. Declared
+    # rather than assumed, which is the same lesson as the `otel` extra.
+    "setuptools>=68.0",
 ]
 all = ["tidewall-otel[otel,openai,anthropic]"]
 
