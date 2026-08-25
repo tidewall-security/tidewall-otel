@@ -357,3 +357,76 @@ def test_a_FAILED_finder_install_is_reported_as_uncovered(monkeypatch):
 
     assert state.is_active() is False, (
         "reported active while knowing a boundary can never be patched")
+
+
+def test_a_STUCK_removal_keeps_the_manager_so_deactivate_can_RETRY(monkeypatch):
+    """Adversarial review finding 3, and it is not merely untidy.
+
+    `remove()` deliberately retains `not_ours` and `errored` entries so
+    removal can be retried once the conflicting wrapper goes. `_uninstrument`
+    then discarded the manager unconditionally -- the only object holding
+    their `pre_install_identity` -- which made that retry unreachable from
+    the public API.
+
+    The consequence: when the foreign layer is later removed, OUR wrapper
+    becomes the live attribute again, with nothing left able to take it off.
+    Permanent stale instrumentation on somebody else's SDK, while the
+    residual report says only that we noticed.
+    """
+    import sys
+    import types
+
+    import wrapt
+
+    from tidewall_otel._manager import PatchManager
+
+    module = types.ModuleType("stuck_sdk")
+    module.Target = type("Target", (), {"create": staticmethod(lambda: "original")})
+    monkeypatch.setitem(sys.modules, "stuck_sdk", module)
+
+    manager = PatchManager()
+    manager.install("stuck_sdk", "Target.create", lambda w, i, a, k: w(*a, **k))
+
+    # Another agent wraps on top, so removal must decline.
+    wrapt.wrap_function_wrapper(module, "Target.create",
+                                lambda w, i, a, k: "foreign")
+    theirs = inspect.getattr_static(module.Target, "create")
+
+    instrumentor = TidewallInstrumentor()
+    instrumentor._manager = manager
+    instrumentor._uninstrument()
+
+    assert instrumentor.residuals, "a stuck entry was not reported"
+    assert instrumentor._manager is manager, (
+        "the manager was discarded, so the retained entry can never be removed")
+    assert inspect.getattr_static(module.Target, "create") is theirs
+
+    # The foreign layer goes. Restore EXACTLY the object the manager
+    # installed -- re-wrapping it in a fresh `staticmethod` would change its
+    # identity, and removal compares identity, so the retry would decline
+    # again for a different reason and the test would prove nothing.
+    pristine = manager.journal[0].pre_install_identity
+    setattr(module.Target, "create", manager.journal[0].installed)
+
+    instrumentor._uninstrument()
+
+    # Assert IDENTITY, not the call result. Our wrapper is a pass-through, so
+    # `create()` returns "original" whether or not it was ever removed -- the
+    # first version of this assertion passed in both worlds.
+    assert inspect.getattr_static(module.Target, "create") is pristine, (
+        "the retry did not restore the original attribute")
+    assert manager.journal == [], "the journal was not discharged"
+    assert instrumentor._manager is None, "a fully discharged manager was kept"
+
+
+def test_a_CLEAN_removal_still_releases_the_manager():
+    """The other direction: retention must be conditional, or every
+    deactivation leaks a manager and `is_active()` bookkeeping drifts."""
+    tidewall_otel.activate()
+    instrumentor = tidewall_otel._instrumentor_instance
+    assert instrumentor._manager is not None
+
+    instrumentor._uninstrument()
+
+    assert instrumentor._manager is None
+    assert not instrumentor.residuals

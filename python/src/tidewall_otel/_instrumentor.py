@@ -333,7 +333,27 @@ class TidewallInstrumentor(BaseInstrumentor):
                     )
                     logger.warning("Tidewall could not remove %s.%s: %s",
                                    module_path, attribute, outcome.value)
-            self._manager = None
+
+            # KEEP THE MANAGER while its journal still holds anything. It
+            # deliberately retains `not_ours` and `errored` entries so removal
+            # can be retried once the foreign wrapper goes or the transient
+            # failure clears -- and this line discarded the only object
+            # holding their `pre_install_identity`, which made that retry
+            # unreachable from the public API.
+            #
+            # The consequence is not merely untidy. When the foreign layer is
+            # later removed, OUR wrapper becomes the live attribute again,
+            # with nothing left that can take it off: permanent stale
+            # instrumentation on somebody else's SDK. A second deactivate()
+            # now retries and can finish the job.
+            if not manager.journal:
+                self._manager = None
+            else:
+                logger.warning(
+                    "Tidewall is retaining %d journal entry(ies) it could not "
+                    "remove; call deactivate() again once the conflicting "
+                    "wrapper is gone", len(manager.journal),
+                )
 
         executor = getattr(self, "_executor", None)
         if executor is not None:

@@ -186,7 +186,7 @@ class PatchManager:
             added = self.journal[mark:]
             discharged: set[int] = set()
             try:
-                self._undo_entries(added, discharged, compare=False)
+                self._undo_entries(added, discharged)
             finally:
                 self.journal[mark:] = [entry for index, entry in enumerate(added)
                                        if index not in discharged]
@@ -221,11 +221,11 @@ class PatchManager:
         self._write(owner, name, entry.pre_install_identity)
         return RemovalOutcome.REMOVED
 
-    def _undo_entries(self, entries: list[JournalEntry], discharged: set[int],
-                      *, compare: bool) -> dict[tuple[str, str], RemovalOutcome]:
+    def _undo_entries(self, entries: list[JournalEntry],
+                      discharged: set[int]) -> dict[tuple[str, str], RemovalOutcome]:
         """Undo `entries` newest-first, under ONE per-entry failure discipline.
 
-        Every branch -- patch or finder, compared removal or unconditional
+        Every branch -- patch or finder, removal or
         rollback -- contains its own exceptions, records ERRORED, and leaves
         the entry journalled for retry. Four consecutive review rounds each
         found one undo branch left outside the protection the previous round
@@ -269,16 +269,23 @@ class PatchManager:
             # `entry.installed`, they were classified `not-ours`, and they
             # were retained forever. The retry guarantee defeated itself
             # on the first exception.
+            # ALWAYS COMPARE, including rollback. The old rollback branch
+            # wrote `pre_install_identity` back unconditionally, justified by
+            # "these are patches WE just made, in a window where nothing else
+            # has run". That window is not enforced and does not exist:
+            # another thread can replace the attribute, and resolving or
+            # writing one can execute arbitrary import, descriptor or
+            # metaclass code that patches it. Rollback then silently deleted
+            # a wrapper installed after ours -- the exact corruption the
+            # ownership comparison exists to prevent, committed by the path
+            # that skipped it.
+            #
+            # Sharing the loop was right; the `compare` parameter was not.
+            # Transactional rollback still has to prove the current value is
+            # the object this transaction installed, so there is only one
+            # policy and `_restore` is it.
             try:
-                if compare:
-                    outcome = self._restore(entry)
-                else:
-                    # Rollback policy: unconditional. These are patches WE
-                    # just made, in a window where nothing else has run, so
-                    # there is no foreign wrapper to preserve.
-                    owner, name = _resolve_owner(entry.module, entry.attribute)
-                    self._write(owner, name, entry.pre_install_identity)
-                    outcome = RemovalOutcome.REMOVED
+                outcome = self._restore(entry)
             except Exception:
                 logger.warning("Tidewall could not remove %s.%s",
                                entry.module, entry.attribute, exc_info=True)
@@ -289,7 +296,7 @@ class PatchManager:
                 discharged.add(index)
         return outcomes
 
-    def _discharge(self, *, compare: bool) -> dict[tuple[str, str], RemovalOutcome]:
+    def _discharge(self) -> dict[tuple[str, str], RemovalOutcome]:
         """Undo the whole journal, then commit whatever survives.
 
         The commit runs in `finally`: partial progress must not be forgotten,
@@ -302,7 +309,7 @@ class PatchManager:
         """
         discharged: set[int] = set()
         try:
-            return self._undo_entries(self.journal, discharged, compare=compare)
+            return self._undo_entries(self.journal, discharged)
         finally:
             self.journal[:] = [entry for index, entry in enumerate(self.journal)
                                if index not in discharged]
@@ -327,7 +334,7 @@ class PatchManager:
         A deleting B's wrapper to reinstate its own -- is the corruption the
         ownership comparison exists to prevent.
         """
-        return self._discharge(compare=True)
+        return self._discharge()
 
     def rollback(self) -> None:
         """Reverse order, unconditionally: these are patches WE just made, in
@@ -340,7 +347,7 @@ class PatchManager:
         still installed, so the journal is telling the truth -- and a later
         `remove()` discharges it.
         """
-        self._discharge(compare=False)
+        self._discharge()
 
     # -- late imports -----------------------------------------------------
 

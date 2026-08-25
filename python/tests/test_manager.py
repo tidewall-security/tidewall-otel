@@ -1,5 +1,6 @@
 """The patch manager (O-6, O-7). Task 6 of the P0 remediation plan."""
 
+import inspect
 import sys
 import types
 
@@ -662,3 +663,31 @@ def test_a_failed_FIRST_install_is_still_reported_uncovered(monkeypatch):
 
     assert manager.dispositions["firstfail_sdk"] == "uncovered"
     assert module.Target.create() == "original"
+
+
+def test_ROLLBACK_refuses_to_delete_a_wrapper_installed_after_ours(module):
+    """Adversarial review finding 1. Rollback compared nothing before writing.
+
+    Its justification was that these are patches WE just made, in a window
+    where nothing else has run. That window is not enforced and does not
+    exist: another thread can replace the attribute, and resolving or writing
+    one can execute arbitrary import, descriptor or metaclass code that
+    patches it. Rollback then silently deleted a wrapper installed after ours
+    -- the exact corruption the ownership comparison exists to prevent,
+    committed by the one path that skipped it.
+    """
+    import wrapt
+
+    manager = PatchManager()
+    manager.install(module.__name__, "Target.create", wrapper_factory("tw"))
+
+    # Someone else wraps our surface before the transaction unwinds.
+    wrapt.wrap_function_wrapper(module.__name__, "Target.create",
+                                lambda w, i, a, k: "foreign")
+    theirs = inspect.getattr_static(module.Target, "create")
+
+    manager.rollback()
+
+    assert inspect.getattr_static(module.Target, "create") is theirs, (
+        "rollback deleted a wrapper installed after ours")
+    assert manager.journal, "the entry it could not roll back was discarded"
