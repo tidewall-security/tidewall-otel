@@ -440,3 +440,55 @@ def test_a_SUCCESSFUL_removal_still_empties_the_journal(module):
     assert outcomes[(module.__name__, "Target.create")] is RemovalOutcome.REMOVED
     assert manager.journal == []
     assert module.Target().create() == "original"
+
+
+def test_a_RAISING_restore_does_not_strand_the_entries_already_removed(monkeypatch):
+    """Round 12's P1: the retry guarantee defeated itself on the first error.
+
+    `remove()` restores in reverse order and only committed the reduced
+    journal after the whole loop succeeded. If a later entry restored cleanly
+    and an earlier one raised -- its module gone from `sys.modules`, say --
+    the assignment never ran and the original journal survived, entries
+    already restored included. On retry those attributes no longer held
+    `entry.installed`, so they were classified `not-ours` and retained
+    forever: a journal entry no retry could ever discharge.
+
+    Also exercises the handler itself. `logger` was referenced there and
+    never defined in this module, so the first exception would have raised
+    NameError out of the error path -- invisible because nothing reached it.
+    """
+    import sys
+    import types
+
+    modules = {}
+    for name in ("r12_first", "r12_second"):
+        module = types.ModuleType(name)
+        module.Target = type("Target", (), {"create": staticmethod(lambda: "original")})
+        monkeypatch.setitem(sys.modules, name, module)
+        modules[name] = module
+
+    manager = PatchManager()
+    manager.install("r12_first", "Target.create", wrapper_factory("first"))
+    manager.install("r12_second", "Target.create", wrapper_factory("second"))
+
+    # The FIRST-installed module disappears; reverse order restores the second
+    # successfully and then fails resolving the first.
+    monkeypatch.delitem(sys.modules, "r12_first")
+
+    outcomes = manager.remove()
+
+    assert outcomes[("r12_second", "Target.create")] is RemovalOutcome.REMOVED
+    assert outcomes[("r12_first", "Target.create")] is RemovalOutcome.ERRORED
+    assert modules["r12_second"].Target.create() == "original"
+
+    retained = {(entry.module, entry.attribute) for entry in manager.journal}
+    assert retained == {("r12_first", "Target.create")}, (
+        f"a successfully restored entry was stranded in the journal: {retained}")
+
+    # And the retry discharges it once the module is back.
+    monkeypatch.setitem(sys.modules, "r12_first", modules["r12_first"])
+    retry = manager.remove()
+
+    assert retry[("r12_first", "Target.create")] is RemovalOutcome.REMOVED
+    assert manager.journal == [], "the journal was never discharged"
+    assert modules["r12_first"].Target.create() == "original"

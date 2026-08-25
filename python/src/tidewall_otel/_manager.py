@@ -25,6 +25,7 @@ would be an unachievable criterion.
 from __future__ import annotations
 
 import enum
+import logging
 import importlib
 import importlib.abc
 import importlib.machinery
@@ -34,10 +35,17 @@ from dataclasses import dataclass
 from typing import Any, Callable, Iterable
 
 
+logger = logging.getLogger("tidewall.otel.manager")
+
+
 class RemovalOutcome(enum.Enum):
     REMOVED = "removed"
     NOT_OURS = "not-ours"
     FOREIGN = "foreign"
+    #: `_restore` raised -- the module went away, the owner would not resolve,
+    #: or the write failed. Distinct from NOT_OURS, which means we compared
+    #: and someone else was there. This one means we never got to compare.
+    ERRORED = "errored"
 
 
 @dataclass
@@ -188,20 +196,39 @@ class PatchManager:
         """
         outcomes: dict[tuple[str, str], RemovalOutcome] = {}
         retained: list[JournalEntry] = []
-        for entry in reversed(self.journal):
-            if entry.kind == "finder":
-                if entry.finder in sys.meta_path:
-                    sys.meta_path.remove(entry.finder)
-                continue
-            outcome = self._restore(entry)
-            outcomes[(entry.module, entry.attribute)] = outcome
-            if outcome is not RemovalOutcome.REMOVED:
-                retained.append(entry)
+        try:
+            for entry in reversed(self.journal):
+                if entry.kind == "finder":
+                    if entry.finder in sys.meta_path:
+                        sys.meta_path.remove(entry.finder)
+                    continue
 
-        # Reversed again, so the journal keeps its original install order and
-        # a retry still undoes in reverse.
-        self.journal[:] = list(reversed(retained))
-        self._finder = None
+                # PER-ENTRY. `_restore` can raise -- the module was removed
+                # from sys.modules, the owner will not resolve, the write
+                # fails. Letting that escape the loop meant the journal
+                # assignment below never ran, so entries ALREADY restored
+                # stayed journalled; on retry their attribute no longer held
+                # `entry.installed`, they were classified `not-ours`, and they
+                # were retained forever. The retry guarantee defeated itself
+                # on the first exception.
+                try:
+                    outcome = self._restore(entry)
+                except Exception:
+                    logger.warning("Tidewall could not remove %s.%s",
+                                   entry.module, entry.attribute, exc_info=True)
+                    outcome = RemovalOutcome.ERRORED
+
+                outcomes[(entry.module, entry.attribute)] = outcome
+                if outcome is not RemovalOutcome.REMOVED:
+                    retained.append(entry)
+        finally:
+            # Committed even if something escapes anyway: partial progress
+            # must not be forgotten, or a later retry mistakes our own
+            # restored attribute for a foreign one.
+            # Reversed again, so the journal keeps its original install order
+            # and a retry still undoes in reverse.
+            self.journal[:] = list(reversed(retained))
+            self._finder = None
         return outcomes
 
     def rollback(self) -> None:
