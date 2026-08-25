@@ -299,3 +299,39 @@ def test_an_ABSENT_sdk_does_not_make_a_guarded_app_report_inactive(monkeypatch):
         f"an absent provider's surfaces were recorded: {state.surfaces}")
     assert state.is_active() is True, (
         f"a fully guarded app reported inactive: {state.surfaces}")
+
+
+def test_a_FAILED_finder_install_is_reported_as_uncovered(monkeypatch):
+    """Round 7's other P1, and a correction to my own reasoning.
+
+    I argued that surfaces in a not-yet-imported module should stay out of
+    `state.surfaces` because `is_active()` is a claim over boundaries PRESENT.
+    That holds only while the finder installs. When it FAILS, the agent knows
+    a boundary that may arrive can never be patched -- and it was recording
+    exactly that in `manager.dispositions` while `is_active()` returned True.
+
+    The design is explicit: if the finder cannot be installed, in-scope
+    surfaces from not-yet-imported modules are `uncovered`.
+    """
+    import tidewall_otel._instrumentor as instrumentor_module
+    from tidewall_otel._manager import PatchManager
+
+    monkeypatch.setenv("TIDEWALL_BASE_URL", "https://guard.example")
+    monkeypatch.setenv("TIDEWALL_TOKEN", "t")
+    monkeypatch.setenv("TIDEWALL_MODE", "enforce")
+    monkeypatch.setattr(instrumentor_module, "_sdk_available",
+                        lambda module: "anthropic" not in module)
+
+    def cannot_install(self, modules):
+        for name in frozenset(modules):
+            self.dispositions[name] = "uncovered"
+
+    monkeypatch.setattr(PatchManager, "install_finder", cannot_install)
+
+    tidewall_otel.activate()
+    state = tidewall_otel.state()
+
+    assert state.surfaces.get("Messages.create") == "uncovered", state.surfaces
+    assert state.is_active() is False, (
+        "reported active while knowing a boundary can never be patched")
+    assert any(event.reason == "finder_not_installed" for event in state.events)

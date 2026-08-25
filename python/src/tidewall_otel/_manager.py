@@ -169,15 +169,38 @@ class PatchManager:
         return RemovalOutcome.REMOVED
 
     def remove(self) -> dict[tuple[str, str], RemovalOutcome]:
-        """Undo in reverse order, comparing before writing."""
+        """Undo in reverse order, comparing before writing.
+
+        RETAINS entries that could not be removed. Clearing the whole journal
+        discarded `pre_install_identity` for exactly the wrappers still
+        installed, which strands them permanently:
+
+            A patches, then B patches on top.
+            A.remove()  -> not-ours (correct: B is current, restoring would
+                           delete B) -- and A forgets everything.
+            B.remove()  -> removed, which restores A's wrapper to the class.
+            A's wrapper is now current, and nothing on earth can remove it.
+
+        Keeping the entry makes removal RETRYABLE, so a second `remove()`
+        after the other agent has gone completes the job. The alternative --
+        A deleting B's wrapper to reinstate its own -- is the corruption the
+        ownership comparison exists to prevent.
+        """
         outcomes: dict[tuple[str, str], RemovalOutcome] = {}
+        retained: list[JournalEntry] = []
         for entry in reversed(self.journal):
             if entry.kind == "finder":
                 if entry.finder in sys.meta_path:
                     sys.meta_path.remove(entry.finder)
                 continue
-            outcomes[(entry.module, entry.attribute)] = self._restore(entry)
-        self.journal.clear()
+            outcome = self._restore(entry)
+            outcomes[(entry.module, entry.attribute)] = outcome
+            if outcome is not RemovalOutcome.REMOVED:
+                retained.append(entry)
+
+        # Reversed again, so the journal keeps its original install order and
+        # a retry still undoes in reverse.
+        self.journal[:] = list(reversed(retained))
         self._finder = None
         return outcomes
 

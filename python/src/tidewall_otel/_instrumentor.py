@@ -264,6 +264,34 @@ class TidewallInstrumentor(BaseInstrumentor):
 
         if deferred:
             self._manager.install_finder(deferred)
+
+            # TWO CASES, and only one of them is "no boundary present".
+            #
+            # Finder INSTALLED: the module is absent now and will be patched
+            # if it ever arrives, so it contributes no boundary and stays out
+            # of `state.surfaces` -- otherwise an app that installed one
+            # provider and is fully guarded reports inactive.
+            #
+            # Finder FAILED: the agent now KNOWS that a boundary which may
+            # arrive can never be patched. Staying silent there was the same
+            # argument applied where it does not hold, and it let `is_active()`
+            # return True while `manager.dispositions` recorded `uncovered`
+            # for that very module. The design is explicit: if the finder
+            # cannot be installed, in-scope surfaces from not-yet-imported
+            # modules are `uncovered`.
+            for module, attributes in deferred.items():
+                if self._manager.dispositions.get(module) != "uncovered":
+                    continue
+                for attribute in attributes:
+                    # `record_unverified` would be wrong twice here: the
+                    # disposition is `uncovered`, not `unverified`, and it
+                    # keys `surfaces` by the name given -- passing the module
+                    # path would file a module as though it were a surface.
+                    self._state.surfaces[attribute] = "uncovered"
+                    self._state.record_skip(
+                        attribute, reason="finder_not_installed",
+                        detail=f"{module} cannot be patched if it is imported later")
+
             logger.info(
                 "Tidewall registered %d boundary(ies) in not-yet-imported "
                 "module(s) %s; they are patched on import",

@@ -390,3 +390,47 @@ def test_identity_capture_is_DESCRIPTOR_SAFE(module):
     assert Descriptored.create() == "original"
     # The stored object is restored, not a bound re-derivation of it.
     assert inspect.getattr_static(Descriptored, "create") is stored
+
+
+def test_an_unremovable_entry_is_RETAINED_so_removal_can_be_retried(module):
+    """Round 7's P1. Clearing the whole journal strands the wrapper forever.
+
+    A patches, then another agent B patches on top.
+    `A.remove()` correctly returns `not-ours` -- restoring would delete B --
+    but it also cleared A's journal, discarding the `pre_install_identity`
+    for the one entry still installed. When B later removes itself, A's
+    wrapper is restored to the class as the current value, and A no longer
+    holds anything that could remove it.
+
+    So the ownership comparison, which exists to avoid corrupting another
+    agent's stack, turned into a permanent leak of our own. Retaining the
+    entry makes removal retryable instead.
+    """
+    manager_a, manager_b = PatchManager(), PatchManager()
+    manager_a.install(module.__name__, "Target.create", wrapper_factory("A"))
+    manager_b.install(module.__name__, "Target.create", wrapper_factory("B"))
+
+    first = manager_a.remove()
+    assert first[(module.__name__, "Target.create")] is RemovalOutcome.NOT_OURS
+    assert manager_a.journal, "the entry that could not be removed was discarded"
+
+    manager_b.remove()
+
+    retry = manager_a.remove()
+    assert retry[(module.__name__, "Target.create")] is RemovalOutcome.REMOVED
+    assert manager_a.journal == [], "a removed entry was retained"
+    assert module.Target().create() == "original", (
+        f"a wrapper was stranded: {module.Target().create()}")
+
+
+def test_a_SUCCESSFUL_removal_still_empties_the_journal(module):
+    """The other direction: retention must be conditional, or every manager
+    accumulates entries it has already undone and a retry re-restores them."""
+    manager = PatchManager()
+    manager.install(module.__name__, "Target.create", wrapper_factory("only"))
+
+    outcomes = manager.remove()
+
+    assert outcomes[(module.__name__, "Target.create")] is RemovalOutcome.REMOVED
+    assert manager.journal == []
+    assert module.Target().create() == "original"
