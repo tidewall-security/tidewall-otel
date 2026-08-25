@@ -492,3 +492,112 @@ def test_a_RAISING_restore_does_not_strand_the_entries_already_removed(monkeypat
     assert retry[("r12_first", "Target.create")] is RemovalOutcome.REMOVED
     assert manager.journal == [], "the journal was never discharged"
     assert modules["r12_first"].Target.create() == "original"
+
+
+def test_a_finder_that_cannot_be_REMOVED_is_retained_for_retry(monkeypatch):
+    """Round 13's finding 1: the round-12 protection wrapped the patch branch
+    and left the finder branch bare.
+
+    A raising `sys.meta_path.remove()` escaped to the `finally`, whose
+    `retained` list never contains the finder -- so the journal and `_finder`
+    were erased while the finder was still installed. Unlike a retained patch
+    entry, nothing could ever retry it: stranded permanently.
+    """
+    # Sandbox meta_path FIRST, so the finder never enters the real one and
+    # teardown restores a clean interpreter.
+    monkeypatch.setattr(sys, "meta_path", list(sys.meta_path))
+
+    manager = PatchManager()
+    manager.install_finder({"stuck_sdk"})
+    finder = manager._finder
+
+    class Unremovable(list):
+        def remove(self, *args, **kwargs):
+            raise RuntimeError("meta_path is locked")
+
+    monkeypatch.setattr(sys, "meta_path", Unremovable(sys.meta_path))
+    outcomes = manager.remove()
+
+    # Reported, not raised -- and reported under a key `_uninstrument` can
+    # turn into a residual instead of claiming a clean removal.
+    assert outcomes[("sys.meta_path", "finder")] is RemovalOutcome.ERRORED
+    assert any(e.kind == "finder" for e in manager.journal), (
+        "the stuck finder was forgotten while still installed")
+    assert manager._finder is finder, "the reference to the stuck finder was erased"
+    assert finder in sys.meta_path
+
+    # And the retry discharges it once meta_path is writable again.
+    monkeypatch.setattr(sys, "meta_path", list(sys.meta_path))
+    manager.remove()
+
+    assert finder not in sys.meta_path
+    assert manager.journal == [], "the discharged finder was retained"
+    assert manager._finder is None
+
+
+def test_a_FAILING_rollback_does_not_mask_the_original_install_error(module):
+    """Round 13's finding 2: `install_all()` called `rollback()` unprotected.
+
+    A rollback exception REPLACED the installation exception -- the caller
+    debugged "rollback boom" while the actual install failure went unreported
+    -- and the journal was never committed, so an installed wrapper survived
+    an `install_all()` that claimed, by raising, to have installed nothing.
+    """
+    manager = PatchManager()
+    manager.install("fake_sdk", "Target.create", wrapper_factory("tw"))
+
+    import unittest.mock as mock
+    with mock.patch.object(PatchManager, "_write",
+                           side_effect=RuntimeError("rollback boom")):
+        # `Target.missing` fails BEFORE any write, so within this block the
+        # only `_write` calls are rollback's.
+        with pytest.raises(AttributeError, match="missing"):
+            manager.install_all([("fake_sdk", "Target.missing",
+                                  wrapper_factory("tw"))])
+
+    # The journal tells the truth: the entry rollback could not restore is
+    # still installed, and stays journalled rather than being cleared.
+    assert [(e.module, e.attribute) for e in manager.journal] == [
+        ("fake_sdk", "Target.create")]
+    assert Target().create() == "tw:original"
+
+    # And a later remove() discharges it once writes work again.
+    outcomes = manager.remove()
+    assert outcomes[("fake_sdk", "Target.create")] is RemovalOutcome.REMOVED
+    assert Target().create() == "original"
+
+
+def test_a_failure_mid_LATE_install_rolls_back_ONLY_that_modules_surfaces(
+        module, monkeypatch):
+    """Round 13's finding 3: `install_for_module()` was not transactional.
+
+    It runs inside `exec_module()` on import. A failure on a later surface
+    raised out of the user's import with an earlier surface still patched and
+    journalled, and the module got no disposition at all. The rollback must
+    also be SCOPED: entries journalled before this import are other modules'
+    live coverage, not part of the failed transaction.
+    """
+    other = types.ModuleType("other_sdk")
+    other.Target = type("Target", (), {"create": lambda self: "other"})
+    monkeypatch.setitem(sys.modules, "other_sdk", other)
+
+    manager = PatchManager()
+    manager.install("other_sdk", "Target.create", wrapper_factory("pre"))
+
+    manager.register_surface("fake_sdk", "Target.create", wrapper_factory("tw"))
+    manager.register_surface("fake_sdk", "Missing.create", wrapper_factory("tw"))
+
+    original = Target.create
+    with pytest.raises(AttributeError, match="Missing"):
+        manager.install_for_module("fake_sdk")
+
+    # This module's partial patch is rolled back and un-journalled...
+    assert Target.create is original, "an earlier surface stayed patched"
+    assert [(e.module, e.attribute) for e in manager.journal] == [
+        ("other_sdk", "Target.create")], "the rollback was not scoped"
+    # ...coverage installed before the failed import is untouched...
+    assert other.Target().create() == "pre:other"
+    # ...and the module is dispositioned, not silent, until a retry covers it.
+    assert manager.dispositions.get("fake_sdk") == "uncovered"
+
+    manager.remove()

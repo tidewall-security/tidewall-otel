@@ -34,7 +34,6 @@ from __future__ import annotations
 import logging
 
 from tidewall_otel._config import TidewallConfig
-from tidewall_otel._exceptions import TidewallConfigError
 from tidewall_otel._manifest import SURFACES
 from typing import Any
 

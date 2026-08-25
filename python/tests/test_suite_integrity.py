@@ -472,3 +472,25 @@ def test_every_DOCUMENTED_default_matches_the_code():
 # practice this suite already demonstrated better than any detector could --
 # `@pytest.mark.parametrize("surface", SURFACES)` derives its cases from the
 # real collection, so the defect cannot be written in the first place.
+
+def test_production_code_is_pyflakes_CLEAN(capsys):
+    """Not only undefined names: every pyflakes report over `src/`.
+
+    Two lint defects survived the undefined-name check because it filters to
+    that one message class -- a duplicated `TidewallConfigError` import that
+    silently shadowed the first, and an unused `TidewallError` import left
+    behind when exceptions moved modules. Neither breaks anything today; both
+    are the residue of edits that did not finish, and a redefinition in
+    particular is how an import starts resolving to something unintended.
+
+    Runs the same tool the suite already trusts, without the filter.
+    """
+    from pyflakes.api import checkRecursive
+    from pyflakes.reporter import Reporter
+
+    import io
+
+    out, err = io.StringIO(), io.StringIO()
+    count = checkRecursive([str(SRC)], Reporter(out, err))
+
+    assert count == 0, f"pyflakes over src/:\n{out.getvalue()}{err.getvalue()}"

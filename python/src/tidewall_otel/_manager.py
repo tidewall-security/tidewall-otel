@@ -145,7 +145,15 @@ class PatchManager:
 
     def install_all(self, specs: Iterable[tuple[str, str, Callable]],
                     fail_on: tuple[str, str] | None = None) -> None:
-        """Transactional: any failure rolls back every earlier patch."""
+        """Transactional: any failure rolls back every earlier patch.
+
+        `rollback()` is NON-RAISING by construction (see its docstring), so
+        the `raise` below always re-raises the ORIGINAL installation failure.
+        When rollback could raise, its exception REPLACED the original here:
+        the caller debugged "rollback boom" while the actual install failure
+        went unreported -- and the journal was never committed, so state
+        claimed nothing was wrong while a wrapper stayed installed.
+        """
         try:
             for module, attribute, wrapper in specs:
                 if fail_on == (module, attribute):
@@ -160,8 +168,35 @@ class PatchManager:
         self._surfaces.setdefault(module, []).append((attribute, wrapper))
 
     def install_for_module(self, module: str) -> None:
-        for attribute, wrapper in self._surfaces.get(module, []):
-            self.install(module, attribute, wrapper)
+        """Transactional per module, exactly like `install_all()`.
+
+        This runs inside `_PatchingLoader.exec_module()`, AFTER the provider
+        module has executed. Without the rollback, a failure on a later
+        surface raised out of the user's import with an EARLIER surface still
+        patched and journalled: a partially guarded module whose disposition
+        said nothing at all. Only THIS call's entries are rolled back --
+        earlier journal entries are other modules' live coverage (and the
+        finder), not ours to undo.
+        """
+        mark = len(self.journal)
+        try:
+            for attribute, wrapper in self._surfaces.get(module, []):
+                self.install(module, attribute, wrapper)
+        except BaseException:
+            added = self.journal[mark:]
+            discharged: set[int] = set()
+            try:
+                self._undo_entries(added, discharged, compare=False)
+            finally:
+                self.journal[mark:] = [entry for index, entry in enumerate(added)
+                                       if index not in discharged]
+                # The exception still propagates to the importer and the
+                # finder does not mark the module patched, so the next import
+                # retries (and overwrites this on success). Until then the
+                # module's surfaces are unguarded, and the disposition map
+                # must say so rather than stay silent.
+                self.dispositions[module] = "uncovered"
+            raise
 
     # -- removal ----------------------------------------------------------
 
@@ -175,6 +210,94 @@ class PatchManager:
 
         self._write(owner, name, entry.pre_install_identity)
         return RemovalOutcome.REMOVED
+
+    def _undo_entries(self, entries: list[JournalEntry], discharged: set[int],
+                      *, compare: bool) -> dict[tuple[str, str], RemovalOutcome]:
+        """Undo `entries` newest-first, under ONE per-entry failure discipline.
+
+        Every branch -- patch or finder, compared removal or unconditional
+        rollback -- contains its own exceptions, records ERRORED, and leaves
+        the entry journalled for retry. Four consecutive review rounds each
+        found one undo branch left outside the protection the previous round
+        added to another (round 7: retention; round 12: the patch branch;
+        round 13: the finder branch, `rollback`, and `install_for_module`).
+        One shared loop is the fix for the PATTERN, not the instance: a new
+        entry kind or a new caller inherits the discipline instead of
+        re-implementing it bare.
+
+        `discharged` is an out-parameter collecting the indices successfully
+        undone, filled AS THE LOOP RUNS, so the caller's `finally` can drop
+        exactly those from its journal even when a BaseException (say,
+        KeyboardInterrupt) escapes mid-loop. Entries not yet reached are then
+        still journalled -- they are still installed, and forgetting them
+        strands their wrappers with no `pre_install_identity` left anywhere.
+        """
+        outcomes: dict[tuple[str, str], RemovalOutcome] = {}
+        for index in range(len(entries) - 1, -1, -1):
+            entry = entries[index]
+            if entry.kind == "finder":
+                # Same protection as patches. When this branch was bare, a
+                # raising `sys.meta_path.remove()` escaped to the caller's
+                # `finally`, which erased the journal and `_finder` while the
+                # finder was still installed: not retryable, stranded forever.
+                try:
+                    if entry.finder in sys.meta_path:
+                        sys.meta_path.remove(entry.finder)
+                except Exception:
+                    logger.warning("Tidewall could not remove its import "
+                                   "finder from sys.meta_path", exc_info=True)
+                    outcomes[(entry.module, entry.attribute)] = RemovalOutcome.ERRORED
+                    continue
+                discharged.add(index)
+                continue
+
+            # PER-ENTRY. `_restore` can raise -- the module was removed
+            # from sys.modules, the owner will not resolve, the write
+            # fails. Letting that escape the loop meant the journal
+            # commit never ran, so entries ALREADY restored stayed
+            # journalled; on retry their attribute no longer held
+            # `entry.installed`, they were classified `not-ours`, and they
+            # were retained forever. The retry guarantee defeated itself
+            # on the first exception.
+            try:
+                if compare:
+                    outcome = self._restore(entry)
+                else:
+                    # Rollback policy: unconditional. These are patches WE
+                    # just made, in a window where nothing else has run, so
+                    # there is no foreign wrapper to preserve.
+                    owner, name = _resolve_owner(entry.module, entry.attribute)
+                    self._write(owner, name, entry.pre_install_identity)
+                    outcome = RemovalOutcome.REMOVED
+            except Exception:
+                logger.warning("Tidewall could not remove %s.%s",
+                               entry.module, entry.attribute, exc_info=True)
+                outcome = RemovalOutcome.ERRORED
+
+            outcomes[(entry.module, entry.attribute)] = outcome
+            if outcome is RemovalOutcome.REMOVED:
+                discharged.add(index)
+        return outcomes
+
+    def _discharge(self, *, compare: bool) -> dict[tuple[str, str], RemovalOutcome]:
+        """Undo the whole journal, then commit whatever survives.
+
+        The commit runs in `finally`: partial progress must not be forgotten,
+        or a later retry mistakes our own restored attribute for a foreign
+        one. Only entries actually undone leave the journal, so install order
+        is preserved and a retry still undoes in reverse. `_finder` survives
+        exactly as long as a finder entry does -- clearing it while the
+        finder was still in `sys.meta_path` made a stuck finder invisible as
+        well as stuck.
+        """
+        discharged: set[int] = set()
+        try:
+            return self._undo_entries(self.journal, discharged, compare=compare)
+        finally:
+            self.journal[:] = [entry for index, entry in enumerate(self.journal)
+                               if index not in discharged]
+            if not any(entry.kind == "finder" for entry in self.journal):
+                self._finder = None
 
     def remove(self) -> dict[tuple[str, str], RemovalOutcome]:
         """Undo in reverse order, comparing before writing.
@@ -194,54 +317,20 @@ class PatchManager:
         A deleting B's wrapper to reinstate its own -- is the corruption the
         ownership comparison exists to prevent.
         """
-        outcomes: dict[tuple[str, str], RemovalOutcome] = {}
-        retained: list[JournalEntry] = []
-        try:
-            for entry in reversed(self.journal):
-                if entry.kind == "finder":
-                    if entry.finder in sys.meta_path:
-                        sys.meta_path.remove(entry.finder)
-                    continue
-
-                # PER-ENTRY. `_restore` can raise -- the module was removed
-                # from sys.modules, the owner will not resolve, the write
-                # fails. Letting that escape the loop meant the journal
-                # assignment below never ran, so entries ALREADY restored
-                # stayed journalled; on retry their attribute no longer held
-                # `entry.installed`, they were classified `not-ours`, and they
-                # were retained forever. The retry guarantee defeated itself
-                # on the first exception.
-                try:
-                    outcome = self._restore(entry)
-                except Exception:
-                    logger.warning("Tidewall could not remove %s.%s",
-                                   entry.module, entry.attribute, exc_info=True)
-                    outcome = RemovalOutcome.ERRORED
-
-                outcomes[(entry.module, entry.attribute)] = outcome
-                if outcome is not RemovalOutcome.REMOVED:
-                    retained.append(entry)
-        finally:
-            # Committed even if something escapes anyway: partial progress
-            # must not be forgotten, or a later retry mistakes our own
-            # restored attribute for a foreign one.
-            # Reversed again, so the journal keeps its original install order
-            # and a retry still undoes in reverse.
-            self.journal[:] = list(reversed(retained))
-            self._finder = None
-        return outcomes
+        return self._discharge(compare=True)
 
     def rollback(self) -> None:
         """Reverse order, unconditionally: these are patches WE just made, in
-        a window where nothing else has run."""
-        for entry in reversed(self.journal):
-            if entry.kind == "finder":
-                if entry.finder in sys.meta_path:
-                    sys.meta_path.remove(entry.finder)
-                continue
-            owner, name = _resolve_owner(entry.module, entry.attribute)
-            self._write(owner, name, entry.pre_install_identity)
-        self.journal.clear()
+        a window where nothing else has run.
+
+        NEVER RAISES (short of a BaseException). `install_all()` calls this
+        from its `except` and re-raises the ORIGINAL installation failure; a
+        raising rollback would replace that exception AND skip the journal
+        commit. An entry that cannot be restored stays journalled -- it is
+        still installed, so the journal is telling the truth -- and a later
+        `remove()` discharges it.
+        """
+        self._discharge(compare=False)
 
     # -- late imports -----------------------------------------------------
 
@@ -261,7 +350,11 @@ class PatchManager:
             return
 
         self._finder = finder
-        self.journal.append(JournalEntry(kind="finder", finder=finder))
+        # Named, not blank: when removal of the finder fails, the ERRORED
+        # outcome is keyed like every patch outcome, so `_uninstrument` can
+        # report the stuck finder as a residual instead of reporting clean.
+        self.journal.append(JournalEntry(kind="finder", module="sys.meta_path",
+                                         attribute="finder", finder=finder))
         for module in modules:
             self.dispositions.setdefault(module, "pending-import")
 
