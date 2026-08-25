@@ -38,8 +38,22 @@ def clean(monkeypatch):
             monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("TIDEWALL_BASE_URL", "https://guard.example")
     monkeypatch.setenv("TIDEWALL_TOKEN", "t")
+
+    # Residual instrumentors are module-level and survive deactivate() by
+    # design -- that is the whole point of parking them. A test that leaves
+    # one behind therefore makes the NEXT test's activate() park it too, and
+    # the failure surfaces as an unrelated assertion three tests later.
+    tidewall_otel._residual_instrumentors.clear()
     yield
     tidewall_otel.deactivate()
+
+    # HARD reset. A test that restores an SDK attribute directly leaves the
+    # manager holding an entry whose `installed` object is no longer anywhere,
+    # so removal declines forever and the instrumentor is retained by design.
+    # The next test's `activate()` then parks it, and the failure surfaces as
+    # an unrelated assertion in a later test.
+    tidewall_otel._residual_instrumentors.clear()
+    tidewall_otel._instrumentor_instance = None
 
 
 @pytest.fixture
@@ -432,3 +446,82 @@ def test_deactivate_RETRIES_through_the_public_api_after_a_conflict_clears():
         assert tidewall_otel.state().lifecycle == "removed"
     finally:
         Completions.create = pristine
+
+
+def test_REACTIVATION_does_not_orphan_a_retained_removal_journal():
+    """The full public sequence the previous fixes still failed.
+
+    activate -> foreign wrapper -> deactivate (residual, journal retained)
+    -> ACTIVATE AGAIN -> conflict clears -> deactivate.
+
+    `activate()` blocked only on lifecycle `installed`, so a re-activation
+    while `residual` replaced `_instrumentor_instance` outright. That
+    destroyed the only route to the retained journal and its
+    `pre_install_identity`: when the foreign wrapper was later removed, our
+    stale wrapper became live again with nothing able to remove it -- and the
+    new activation reported `installed`, hiding it.
+
+    Parking rather than blocking is deliberate. Refusing to activate while a
+    residual exists would let one stuck foreign wrapper leave the process
+    unguarded for the rest of its life, trading a stale layer for no layer.
+    """
+    import inspect
+
+    import wrapt
+    from openai.resources.chat.completions.completions import Completions
+
+    pristine = inspect.getattr_static(Completions, "create")
+    try:
+        tidewall_otel.activate()
+        wrapt.wrap_function_wrapper(
+            "openai.resources.chat.completions.completions", "Completions.create",
+            lambda wrapped, instance, args, kwargs: "foreign")
+        foreign = inspect.getattr_static(Completions, "create")
+
+        tidewall_otel.deactivate()
+        assert tidewall_otel.state().lifecycle == "residual"
+
+        tidewall_otel.activate()
+        assert tidewall_otel._residual_instrumentors, (
+            "the retained journal was orphaned by re-activation")
+
+        # The conflict clears; deactivation must discharge BOTH the live
+        # instrumentor and the parked one.
+        Completions.create = foreign.__wrapped__
+        tidewall_otel.deactivate()
+
+        assert inspect.getattr_static(Completions, "create") is pristine, (
+            "a stale wrapper survived every deactivation")
+        assert tidewall_otel._residual_instrumentors == [], (
+            "a discharged residual was not released")
+    finally:
+        Completions.create = pristine
+        tidewall_otel._residual_instrumentors.clear()
+
+
+def test_activation_still_RETRIES_a_residual_before_parking_it():
+    """If the conflict has already cleared, re-activation should discharge
+    the residual outright rather than accumulate it."""
+    import inspect
+
+    import wrapt
+    from openai.resources.chat.completions.completions import Completions
+
+    pristine = inspect.getattr_static(Completions, "create")
+    try:
+        tidewall_otel.activate()
+        wrapt.wrap_function_wrapper(
+            "openai.resources.chat.completions.completions", "Completions.create",
+            lambda wrapped, instance, args, kwargs: "foreign")
+        foreign = inspect.getattr_static(Completions, "create")
+        tidewall_otel.deactivate()
+
+        Completions.create = foreign.__wrapped__      # clears BEFORE re-activating
+        tidewall_otel.activate()
+
+        assert tidewall_otel._residual_instrumentors == [], (
+            "a residual whose conflict had cleared was parked anyway")
+    finally:
+        tidewall_otel.deactivate()
+        Completions.create = pristine
+        tidewall_otel._residual_instrumentors.clear()

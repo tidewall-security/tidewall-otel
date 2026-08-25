@@ -71,6 +71,10 @@ __all__ = [
 logger = logging.getLogger("tidewall.otel")
 
 _instrumentor_instance = None
+#: Instrumentors whose journal still holds entries removal declined. Parked
+#: rather than dropped, so the ONLY route to their `pre_install_identity`
+#: survives a re-activation; discharged on any later `deactivate()`.
+_residual_instrumentors: list = []
 _state = State()
 
 
@@ -130,6 +134,31 @@ def activate(config: TidewallConfig | None = None) -> None:
     _configure_logging(config)
 
     from tidewall_otel._instrumentor import TidewallInstrumentor
+
+    # PARK, do not drop. A previous deactivation may have retained an
+    # instrumentor because a foreign wrapper made removal decline.
+    # Overwriting it here destroyed the only route to that journal: when the
+    # foreign wrapper was later removed, our stale wrapper became live again
+    # with nothing able to remove it, and the new activation reported
+    # `installed`, hiding it.
+    #
+    # Retry first in case the conflict has cleared; park whatever still will
+    # not discharge. Blocking activation instead would let one stuck wrapper
+    # prevent guarding for the rest of the process, trading a stale layer for
+    # an unguarded one.
+    previous = _instrumentor_instance
+    if previous is not None:
+        previous_manager = getattr(previous, "_manager", None)
+        if previous_manager is not None and previous_manager.journal:
+            previous.retry_removal()
+            if previous_manager.journal and previous not in _residual_instrumentors:
+                _residual_instrumentors.append(previous)
+                logger.warning(
+                    "Tidewall is activating with %d undischarged journal "
+                    "entry(ies) from a previous deactivation; they are "
+                    "retried on the next deactivate()",
+                    len(previous_manager.journal),
+                )
 
     _instrumentor_instance = TidewallInstrumentor()
     _instrumentor_instance.instrument(config=config)
@@ -256,6 +285,17 @@ def deactivate() -> None:
     global _instrumentor_instance, _state
 
     residuals: list[str] = []
+
+    # Parked residuals first: the conflict that blocked them may have cleared,
+    # and each holds the only copy of its entries' pre-install identity.
+    for parked in list(_residual_instrumentors):
+        parked.retry_removal()
+        parked_manager = getattr(parked, "_manager", None)
+        if parked_manager is None or not parked_manager.journal:
+            _residual_instrumentors.remove(parked)
+        else:
+            residuals.extend(getattr(parked, "residuals", ()) or ())
+
     if _instrumentor_instance:
         instrumentor = _instrumentor_instance
 
