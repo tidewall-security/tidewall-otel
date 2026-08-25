@@ -73,10 +73,23 @@ class BoundedExecutor:
 
     def shutdown(self) -> None:
         """Idempotent. Does not wait: in-flight guard calls are abandoned,
-        exactly as a cancelled dispatch abandons them."""
-        self._shutdown = True
-        if self._pool is not None:
-            self._pool.shutdown(wait=False)
+        exactly as a cancelled dispatch abandons them.
+
+        The flag and the pool are retired TOGETHER under the admission lock.
+        Previously `_shutdown = True` was published first and the pool torn
+        down after, with neither under the lock, while `submit_nowait` gated
+        only on `_pool is None` -- which `shutdown()` never set. So a submit
+        beginning after `is_shutdown()` already read True was admitted and
+        ran. `is_shutdown()` is what the fork hook consults to decide not to
+        revive the pool, and what `_uninstrument` relies on to stop guard
+        work, so a window where it says "stopped" while accepting new work is
+        the contract inverted.
+        """
+        with self._lock:
+            pool, self._pool = self._pool, None
+            self._shutdown = True
+        if pool is not None:
+            pool.shutdown(wait=False)
 
     def is_shutdown(self) -> bool:
         return self._shutdown
@@ -121,11 +134,17 @@ class BoundedExecutor:
 
     def submit_nowait(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Future:
         """Admit and submit, without waiting. Raises ExecutorSaturated."""
-        if self._pool is None:
-            raise RuntimeError("executor is shut down")
+        # Read the pool ONCE under the lock, so a concurrent shutdown either
+        # happens entirely before this check (and we refuse) or entirely
+        # after (and the pool is live when we captured it). Not held across
+        # `_acquire`, which takes the same non-reentrant lock.
+        with self._lock:
+            if self._shutdown or self._pool is None:
+                raise RuntimeError("executor is shut down")
+            pool = self._pool
         self._acquire()
         try:
-            future = self._pool.submit(fn, *args, **kwargs)
+            future = pool.submit(fn, *args, **kwargs)
             # REQUIRED by `outstanding()`: without this the count is always
             # zero and every bounded/drains assertion observes nothing.
             self._admitted.add(future)

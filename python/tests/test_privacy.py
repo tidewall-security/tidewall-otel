@@ -61,9 +61,16 @@ def test_the_user_id_is_OMITTED_when_USER_is_unset(monkeypatch):
 
     payload = TidewallGuard(TidewallConfig())._payload_for({"messages": []})
 
-    assert "user_id" not in payload or payload["user_id"], "empty user_id sent"
-    assert "user_name" not in payload.get("extra_info", {}) or \
-        payload["extra_info"]["user_name"], "empty user_name sent"
+    # ABSENT, not "absent or truthy". The previous form was
+    #     "user_id" not in payload or payload["user_id"]
+    # which passes for ANY non-empty value, so it accepted a leaked identity:
+    # defaulting `user_id` to "leaked-default" left this test green. It guarded
+    # only against sending an empty string, while its name and docstring
+    # promise the field is not sent at all.
+    assert "user_id" not in payload, f"user_id was sent: {payload.get('user_id')!r}"
+    extra_info = payload.get("extra_info", {})
+    assert "user_name" not in extra_info, (
+        f"extra_info.user_name was sent: {extra_info.get('user_name')!r}")
 
 
 def test_the_OS_account_name_is_not_sent_by_default(monkeypatch):

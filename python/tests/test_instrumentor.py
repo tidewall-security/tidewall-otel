@@ -1,5 +1,6 @@
 """The OTel adapter. Task 14 of the P0 remediation plan."""
 
+import dataclasses
 import inspect
 
 import pytest
@@ -223,3 +224,78 @@ def test_deactivation_reports_a_preserved_foreign_wrapper_as_a_RESIDUAL(monkeypa
 
     assert instrumentor.residuals, "a preserved foreign wrapper was not reported"
     assert any("not-ours" in r for r in instrumentor.residuals), instrumentor.residuals
+
+
+def test_a_not_yet_imported_SDK_is_patched_when_it_ARRIVES(tmp_path, monkeypatch):
+    """Round 6's P1. The design requires a journal-owned meta-path finder so a
+    module imported AFTER activation is still patched.
+
+    `PatchManager` implemented it and its unit tests passed, but `_instrument`
+    said `continue` and never called `register_surface` or `install_finder` --
+    the requirement was built, tested in isolation, and left unreachable.
+
+    The plan records that v1 dropped this same requirement and then reported
+    §5 covered. Leaving the manager's implementation unwired dropped it again
+    one layer along, under a green suite. That is rule 18 with the roles
+    reversed: not a caller wired wrongly, but a callee never called.
+    """
+    import sys
+
+    import tidewall_otel._instrumentor as instrumentor_module
+    import tidewall_otel._manifest as manifest_module
+    from tidewall_otel._config import TidewallConfig
+
+    (tmp_path / "late_sdk.py").write_text(
+        "class Target:\n"
+        "    def create(self, **kwargs):\n"
+        "        return 'original'\n"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.delitem(sys.modules, "late_sdk", raising=False)
+
+    surface = dataclasses.replace(manifest_module.OPENAI_CHAT_SYNC,
+                                  module="late_sdk", attribute="Target.create")
+    # `_instrument` imports SURFACES from the manifest INSIDE the method, so
+    # the name to patch is the manifest's, not the instrumentor's.
+    monkeypatch.setattr(manifest_module, "SURFACES", (surface,))
+    monkeypatch.setattr(instrumentor_module, "_sdk_available",
+                        lambda module: module != "late_sdk")
+
+    instrumentor = instrumentor_module.TidewallInstrumentor()
+    instrumentor._instrument(config=TidewallConfig(
+        base_url="https://guard.example", token="t"))
+    try:
+        module = __import__("late_sdk")
+        assert getattr(inspect.getattr_static(module.Target, "create"),
+                       "__tidewall_wrapper__", False), (
+            "a module imported after activation was left unguarded")
+    finally:
+        instrumentor._uninstrument()
+
+
+def test_an_ABSENT_sdk_does_not_make_a_guarded_app_report_inactive(monkeypatch):
+    """The other direction, and the one that condemns everyone if wrong.
+
+    `is_active()` is a universal claim over the boundaries PRESENT. A provider
+    that is not installed presents none. Recording its surfaces as `uncovered`
+    or `deferred` would make `is_active()` False for an application that
+    installed one provider and is fully guarded on it -- the same
+    over-correction the escape detector had to avoid.
+    """
+    import tidewall_otel._instrumentor as instrumentor_module
+
+    monkeypatch.setenv("TIDEWALL_BASE_URL", "https://guard.example")
+    monkeypatch.setenv("TIDEWALL_TOKEN", "t")
+    monkeypatch.setenv("TIDEWALL_MODE", "enforce")
+    # anthropic is not installed in this hypothetical deployment
+    monkeypatch.setattr(instrumentor_module, "_sdk_available",
+                        lambda module: "anthropic" not in module)
+
+    tidewall_otel.activate()
+    state = tidewall_otel.state()
+
+    assert state.surfaces, "no boundary was recorded at all"
+    assert not any("Messages" in name for name in state.surfaces), (
+        f"an absent provider's surfaces were recorded: {state.surfaces}")
+    assert state.is_active() is True, (
+        f"a fully guarded app reported inactive: {state.surfaces}")

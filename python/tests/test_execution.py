@@ -209,3 +209,62 @@ async def test_saturation_is_reported_from_the_SAME_pool():
         task.cancel()
     blocker.set()
     ex.shutdown()
+
+
+def test_shutdown_LINEARISES_against_a_concurrent_submit():
+    """Round 6's second P1. `is_shutdown()` must never say "stopped" while
+    still admitting work.
+
+    `_shutdown = True` was published before the pool was torn down, with
+    neither under the admission lock, and `submit_nowait` gated only on
+    `_pool is None` -- which `shutdown()` never set. A submit that began
+    after `is_shutdown()` already read True was therefore admitted and ran.
+
+    That flag is what the fork hook consults to decide not to revive the pool
+    and what `_uninstrument` relies on to stop guard work, so a window where
+    it reports stopped while accepting new work inverts the contract.
+
+    The pool proxy pauses inside `shutdown()` after the flag is published,
+    which is exactly the interval that was unguarded.
+    """
+    executor = BoundedExecutor(max_workers=1, queue_size=0)
+    real_pool = executor._pool
+    entered = threading.Event()
+    release = threading.Event()
+
+    class PausingPool:
+        def submit(self, *args, **kwargs):
+            return real_pool.submit(*args, **kwargs)
+
+        def shutdown(self, *args, **kwargs):
+            entered.set()
+            assert release.wait(5), "shutdown was never released"
+            return real_pool.shutdown(*args, **kwargs)
+
+    executor._pool = PausingPool()
+    thread = threading.Thread(target=executor.shutdown)
+    thread.start()
+    try:
+        assert entered.wait(5), "shutdown never reached the pool"
+        assert executor.is_shutdown(), "the flag should already be visible"
+
+        with pytest.raises(RuntimeError, match="shut down"):
+            executor.submit_nowait(lambda: "ran after shutdown began")
+    finally:
+        release.set()
+        thread.join(5)
+        real_pool.shutdown(wait=False)
+
+
+def test_a_refused_post_shutdown_submit_does_NOT_leak_capacity():
+    """Refusing must not consume a slot -- otherwise a shut-down executor
+    that is somehow revived would start already saturated."""
+    executor = BoundedExecutor(max_workers=1, queue_size=0)
+    executor.shutdown()
+
+    for _ in range(3):
+        with pytest.raises(RuntimeError, match="shut down"):
+            executor.submit_nowait(lambda: None)
+
+    assert executor.outstanding() == 0
+    assert executor._inflight == 0, "a refused submit consumed a slot"

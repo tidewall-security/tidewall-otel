@@ -225,11 +225,35 @@ class TidewallInstrumentor(BaseInstrumentor):
         }
 
         specs = []
+        deferred: dict[str, list[str]] = {}
         for surface in SURFACES:
-            if not _sdk_available(surface.module):
-                continue
             factory = factories[(surface.provider, surface.kind)]
             wrapper = factory(self._guard, config, self._executor, self._state)
+
+            if not _sdk_available(surface.module):
+                # NOT `continue`. The design requires a journal-owned
+                # meta-path finder so a module imported AFTER activation is
+                # still patched; a surface in a not-yet-imported module is
+                # otherwise uncovered forever.
+                #
+                # `PatchManager` implements this and its unit tests pass, but
+                # nothing here called it -- the requirement was built, tested
+                # in isolation, and left unreachable. The plan records that v1
+                # dropped this same requirement and then reported it covered;
+                # leaving the manager's implementation unwired drops it again
+                # one layer along, with a green suite over it.
+                self._manager.register_surface(surface.module, surface.attribute,
+                                               wrapper)
+                deferred.setdefault(surface.module, []).append(surface.attribute)
+                # DELIBERATELY NOT recorded in `state.surfaces`. `is_active()`
+                # is a universal claim over the boundaries PRESENT, and an
+                # unimportable module presents none. Recording these would make
+                # `is_active()` False for an application that installed only
+                # one provider and is fully guarded on it -- the same
+                # condemn-everyone over-correction the escape detector had to
+                # avoid. The finder still patches them if they ever arrive.
+                continue
+
             specs.append((surface.module, surface.attribute, wrapper))
             self._state.surfaces[surface.attribute] = disposition_for(
                 surface, _installed_version(surface.provider)
@@ -237,6 +261,14 @@ class TidewallInstrumentor(BaseInstrumentor):
 
         # Transactional: any failure rolls back every earlier patch.
         self._manager.install_all(specs)
+
+        if deferred:
+            self._manager.install_finder(deferred)
+            logger.info(
+                "Tidewall registered %d boundary(ies) in not-yet-imported "
+                "module(s) %s; they are patched on import",
+                sum(len(a) for a in deferred.values()), sorted(deferred),
+            )
 
         self._state.lifecycle = "installed"
 
