@@ -629,12 +629,14 @@ def test_a_PERMANENT_residual_survives_repeated_deactivation():
     try:
         manager.install("perm_sdk", "Target.create", lambda w, i, a, k: w(*a, **k))
 
-        class Doomed:
-            pass
+        watch = weakref.ref(victim.Target)
+        del victim.Target
+        del sys.modules["perm_sdk"]
+        del victim
+        import gc
 
-        doomed = Doomed()
-        manager.journal[0].owner_ref = weakref.ref(doomed)
-        del doomed
+        gc.collect()
+        assert watch() is None, "the owner survived; this test proves nothing"
 
         tidewall_otel._residual_managers.append(manager)
         tidewall_otel.deactivate()

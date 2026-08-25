@@ -746,48 +746,81 @@ def test_an_entry_appended_RE_ENTRANTLY_during_undo_survives_the_commit(module):
     assert manager.journal == []
 
 
-def test_a_COLLECTED_owner_is_unrecoverable_and_recorded(module):
+def test_a_COLLECTED_owner_is_unrecoverable_and_recorded():
     """The only PROVABLE irrecoverable condition: the owner is gone.
 
     An attribute can always be recreated, so a missing one proves nothing --
-    an earlier version used `hasattr` and so classified a live, retryable
-    wrapper as permanent whenever a foreign descriptor raised on class access
-    or a reload made the attribute briefly absent. An owner that has been
-    collected can never carry anything again, and nobody else can reach it
-    either.
+    an earlier version used `hasattr` and classified a live, retryable wrapper
+    as permanent whenever a foreign descriptor raised on class access or a
+    reload made the attribute briefly absent. An owner that has been collected
+    can never carry anything again, and nobody else can reach it either.
 
-    NOTE ON REACHABILITY: in normal operation this cannot fire, because the
-    installed wrapper closure captures its owner strongly, so the weak
-    reference never dies. It is asserted here on a manufactured dead
-    reference. The classification is therefore correct but effectively
-    unreachable, which is recorded rather than hidden: boundedness of the
-    residual list does NOT come from it.
+    This drives a REAL collection rather than a manufactured dead reference.
+    It only became reachable once the installed wrapper stopped capturing its
+    owner strongly: that capture kept the patched class alive for the life of
+    the process and made the journal's weak reference immortal, so this
+    classification had no trigger at all.
     """
+    import gc
+    import sys
+    import types
     import weakref
 
-    from tidewall_otel._manager import JournalEntry
+    victim = types.ModuleType("collected_sdk")
+    victim.Target = type("Target", (), {"create": staticmethod(lambda: "orig")})
+    sys.modules["collected_sdk"] = victim
 
     manager = PatchManager()
-    manager.install(module.__name__, "Target.create", wrapper_factory("tw"))
+    manager.install("collected_sdk", "Target.create", wrapper_factory("tw"))
+    owner_watch = weakref.ref(victim.Target)
 
-    class Doomed:
-        pass
+    del victim.Target
+    del sys.modules["collected_sdk"]
+    del victim
+    gc.collect()
 
-    doomed = Doomed()
-    entry = manager.journal[0]
-    entry.owner_ref = weakref.ref(doomed)
-    del doomed
+    assert owner_watch() is None, (
+        "the owner is still referenced, so this test proves nothing")
 
     outcomes = manager.remove()
 
-    assert outcomes[(module.__name__, "Target.create")] is RemovalOutcome.UNRECOVERABLE
+    assert outcomes[("collected_sdk", "Target.create")] is RemovalOutcome.UNRECOVERABLE
     assert manager.journal == [], "an entry nothing can discharge was kept"
     assert manager.permanent_residuals, "it was dropped without a record"
-    assert "unrecoverable" in manager.permanent_residuals[0]
+    assert "collected" in manager.permanent_residuals[0]
 
     again = manager.remove()
     assert again == {}
     assert len(manager.permanent_residuals) == 1
+
+
+def test_the_installed_wrapper_does_not_PIN_the_class_it_patches():
+    """The capture that made the classification unreachable, asserted directly.
+
+    A strong capture kept every patched class or module alive for the life of
+    the process. It also made the journal's weak reference immortal, which is
+    why `UNRECOVERABLE` could never fire.
+    """
+    import gc
+    import sys
+    import types
+    import weakref
+
+    victim = types.ModuleType("pinned_sdk")
+    victim.Target = type("Target", (), {"create": staticmethod(lambda: "orig")})
+    sys.modules["pinned_sdk"] = victim
+
+    manager = PatchManager()
+    manager.install("pinned_sdk", "Target.create", wrapper_factory("tw"))
+    watch = weakref.ref(victim.Target)
+
+    del victim.Target
+    del sys.modules["pinned_sdk"]
+    del victim
+    gc.collect()
+
+    assert watch() is None, (
+        "the installed wrapper is pinning the class it patched")
 
 
 def test_a_MISSING_attribute_is_retryable_not_permanent(module):

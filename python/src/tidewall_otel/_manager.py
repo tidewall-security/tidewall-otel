@@ -180,6 +180,8 @@ class PatchManager:
         before = self._identity(owner, name)
         original = getattr(owner, name)
 
+        owner_ref = _weak(owner)
+
         def installed(*args, **kwargs):
             """Adapt the descriptor call to wrapt's wrapper convention.
 
@@ -191,11 +193,20 @@ class PatchManager:
             passed, because the tests called the wrapper directly with
             already-correct arguments.
             """
-            if args and hasattr(original, "__get__") and not isinstance(owner, type(None)):
+            # `owner_ref`, not `owner`. Capturing the owner STRONGLY here kept
+            # the patched class or module alive for the life of the process --
+            # and, worse, made the journal's weak reference immortal, so
+            # `UNRECOVERABLE` could never fire and the classification that
+            # bounds the residual list had no reachable trigger. The closure
+            # only ever needed the owner as the `instance` argument, which it
+            # can dereference at call time; if the owner really has been
+            # collected, nothing can be calling this wrapper anyway.
+            live_owner = owner_ref() if isinstance(owner_ref, weakref.ref) else owner_ref
+            if args and hasattr(original, "__get__") and live_owner is not None:
                 receiver, rest = args[0], args[1:]
                 bound = original.__get__(receiver, type(receiver))
                 return wrapper(bound, receiver, rest, kwargs)
-            return wrapper(original, owner, args, kwargs)
+            return wrapper(original, live_owner, args, kwargs)
 
         installed.__tidewall_wrapper__ = True
 
@@ -213,7 +224,7 @@ class PatchManager:
         self._journal(JournalEntry(
             kind="patch", module=module, attribute=attribute,
             pre_install_identity=before, installed=installed,
-            owner_ref=_weak(owner),
+            owner_ref=owner_ref,
         ))
         return installed
 
@@ -398,13 +409,13 @@ class PatchManager:
                 # the life of the process while achieving nothing. Recorded
                 # first, so stopping the retry never means going quiet.
                 record = (f"{entry.module}.{entry.attribute}: unrecoverable -- "
-                          f"the owner no longer carries this attribute")
+                          f"the class or module that carried it was collected")
                 if record not in self.permanent_residuals:
                     self.permanent_residuals.append(record)
                 logger.error(
-                    "Tidewall cannot restore %s.%s: the owner no longer "
-                    "carries it. This is permanent and will not be retried.",
-                    entry.module, entry.attribute,
+                    "Tidewall cannot restore %s.%s: the class or module that "
+                    "carried it has been collected. This is permanent and "
+                    "will not be retried.", entry.module, entry.attribute,
                 )
 
             if outcome in (RemovalOutcome.REMOVED, RemovalOutcome.UNRECOVERABLE):
