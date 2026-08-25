@@ -216,3 +216,68 @@ def test_the_DECLARED_sdk_ranges_match_the_ranges_the_manifest_VOUCHES_for():
                 f"{provider}: pyproject declares {actual!r}, "
                 f"manifest vouches for {expected!r}")
     assert not mismatches, "\n".join(mismatches)
+
+
+def test_the_agent_WORKS_without_the_otel_extra_installed(tmp_path):
+    """The fallback `BaseInstrumentor` stub, which is now tested nowhere else.
+
+    `_instrumentor.py` falls back to a local stub when
+    `opentelemetry-instrumentation` is absent, so the agent works for anyone
+    who installs `tidewall-otel` without the `otel` extra. Until now that
+    path was the one every local run exercised BY ACCIDENT, because the dev
+    interpreter happened to lack the package -- and the real base class was
+    exercised only by CI.
+
+    Installing the real one locally fixed a fix that was wrong on the
+    production path, and inverted the gap: the stub is now what nothing
+    covers. Both paths ship, so both are tested deliberately rather than by
+    whatever happens to be installed.
+
+    The two differ in a way that matters: the real `BaseInstrumentor` is a
+    SINGLETON and the stub is not.
+    """
+    root = PYPROJECT.parent
+    subprocess.run(
+        [sys.executable, "-m", "build", "--wheel", "--outdir", str(tmp_path)],
+        cwd=root, check=True, capture_output=True,
+    )
+    wheel = next(tmp_path.glob("*.whl"))
+
+    venv = tmp_path / "venv"
+    subprocess.run([sys.executable, "-m", "venv", str(venv)], check=True)
+    python = venv / ("Scripts" if sys.platform == "win32" else "bin") / "python"
+
+    # NO [otel] extra -- but DO use [openai], which carries the version
+    # ceiling. Installing `openai` bare resolves to a major outside the
+    # manifest's vouched range, and every surface is then honestly reported
+    # `unverified` -- correct behaviour that would make this test look like a
+    # stub failure. The ceiling is the thing being relied on, not bypassed.
+    subprocess.run(
+        [str(python), "-m", "pip", "install", "-q", f"{wheel}[openai]", "httpx"],
+        check=True, capture_output=True,
+    )
+
+    probe = tmp_path / "probe.py"
+    probe.write_text(
+        "import tidewall_otel\n"
+        "import tidewall_otel._instrumentor as m\n"
+        "tidewall_otel.activate()\n"
+        "state = tidewall_otel.state()\n"
+        "print(f'stub={not m._HAS_OTEL_INSTRUMENTOR} "
+        "lifecycle={state.lifecycle} active={state.is_active()}')\n"
+        "tidewall_otel.deactivate()\n"
+        "print(f'after={tidewall_otel.state().lifecycle}')\n"
+    )
+
+    result = subprocess.run(
+        [str(python), str(probe)], capture_output=True, text=True,
+        env={"PATH": "/usr/bin:/bin",
+             "TIDEWALL_BASE_URL": "https://guard.example", "TIDEWALL_TOKEN": "t"},
+    )
+    out = result.stdout
+    assert "stub=True" in out, f"the extra leaked in: {out}{result.stderr[-400:]}"
+    assert "lifecycle=installed" in out, (
+        f"the agent did not activate without the otel extra: "
+        f"{out}{result.stderr[-400:]}")
+    assert "active=True" in out, out
+    assert "after=removed" in out, out
