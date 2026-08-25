@@ -81,6 +81,12 @@ _instrumentor_instance = None
 #: `instrument()` then overwrites `self._manager` and loses the journal just
 #: as completely. The manager is the thing that actually holds the entries.
 _residual_managers: list = []
+#: Wrappers that can NEVER be removed: the class or module that carried them
+#: is gone, so there is nothing to restore the original onto. Retrying cannot
+#: help, so they are not retried -- but they are not forgotten either, because
+#: silently dropping evidence that our code is still installed somewhere is
+#: precisely the fail-open this agent exists to remove.
+_permanent_residuals: list = []
 _state = State()
 
 
@@ -276,9 +282,13 @@ def deactivate() -> None:
     # and each holds the only copy of its entries' pre-install identity.
     for parked in list(_residual_managers):
         for (module_path, attribute), outcome in parked.remove().items():
-            if outcome.value != "removed":
+            if outcome.value not in ("removed", "unrecoverable"):
                 residuals.append(
                     f"{module_path}.{attribute}: {outcome.value} -- wrapper NOT removed")
+        # Permanent residuals are carried forward once and never retried.
+        for record in parked.permanent_residuals:
+            if record not in _permanent_residuals:
+                _permanent_residuals.append(record)
         if not parked.journal:
             _residual_managers.remove(parked)
 
@@ -319,6 +329,10 @@ def deactivate() -> None:
     for residual in residuals:
         surface, _, reason = residual.partition(": ")
         _state.record_unverified(surface, reason="not_removed", detail=reason)
+
+    for record in _permanent_residuals:
+        surface, _, reason = record.partition(": ")
+        _state.record_unverified(surface, reason="unrecoverable", detail=reason)
 
 
 def is_active() -> bool:

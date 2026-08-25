@@ -42,10 +42,18 @@ class RemovalOutcome(enum.Enum):
     REMOVED = "removed"
     NOT_OURS = "not-ours"
     FOREIGN = "foreign"
-    #: `_restore` raised -- the module went away, the owner would not resolve,
-    #: or the write failed. Distinct from NOT_OURS, which means we compared
-    #: and someone else was there. This one means we never got to compare.
+    #: `_restore` raised -- the write failed, or something transient went
+    #: wrong. Distinct from NOT_OURS, which means we compared and someone else
+    #: was there. This one means we never got to compare. RETRYABLE.
     ERRORED = "errored"
+    #: The owner object is gone: the class or module we patched no longer
+    #: exists, so there is nothing left to restore the original onto. NOT
+    #: retryable -- no future call can make a vanished owner reappear, and
+    #: retrying forever keeps a journal alive and a lifecycle at `residual`
+    #: for the life of the process while achieving nothing. Recorded durably
+    #: instead, because silently dropping it is the fail-open this manager
+    #: exists to remove.
+    UNRECOVERABLE = "unrecoverable"
 
 
 @dataclass
@@ -56,6 +64,13 @@ class JournalEntry:
     pre_install_identity: Any = None
     installed: Any = None
     finder: Any = None
+    #: The object we patched -- the class or module itself, held directly.
+    #: Removal used to re-resolve it from `module`/`attribute`, which imports
+    #: the module if it has left `sys.modules`; that can yield a DIFFERENT
+    #: module instance whose attribute can never match `installed`, so the
+    #: entry looked foreign forever. Holding the owner removes both the
+    #: re-import and the ambiguity.
+    owner: Any = None
     #: Stable identity, assigned once at append. Discharge is by THIS, never
     #: by position: resolving or writing an attribute can run arbitrary
     #: import, descriptor or metaclass code that re-enters the manager and
@@ -86,6 +101,12 @@ class PatchManager:
     def __init__(self) -> None:
         self.journal: list[JournalEntry] = []
         self.residuals: list[str] = []
+        #: Entries classified UNRECOVERABLE: the owner no longer carries the
+        #: attribute, so no retry can ever discharge them. Kept as a durable
+        #: record rather than retried, because retrying achieves nothing and
+        #: dropping them silently is the fail-open this manager exists to
+        #: remove. Never cleared: a permanent residual is permanent.
+        self.permanent_residuals: list[str] = []
         self.dispositions: dict[str, str] = {}
         self._surfaces: dict[str, list[tuple[str, Callable]]] = {}
         self._finder: Any = None
@@ -159,7 +180,7 @@ class PatchManager:
         self._write(owner, name, installed)
         self._journal(JournalEntry(
             kind="patch", module=module, attribute=attribute,
-            pre_install_identity=before, installed=installed,
+            pre_install_identity=before, installed=installed, owner=owner,
         ))
         return installed
 
@@ -234,7 +255,18 @@ class PatchManager:
     # -- removal ----------------------------------------------------------
 
     def _restore(self, entry: JournalEntry) -> RemovalOutcome:
-        owner, name = _resolve_owner(entry.module, entry.attribute)
+        owner = entry.owner
+        name = entry.attribute.split(".")[-1]
+
+        if owner is None:                       # pre-`owner` entry, or a finder
+            owner, name = _resolve_owner(entry.module, entry.attribute)
+
+        # UNRECOVERABLE, not errored. If the attribute is no longer present on
+        # the owner at all, there is nothing to compare and nothing to restore
+        # onto. No later call can change that, so retrying is pure cost.
+        if not hasattr(owner, name):
+            return RemovalOutcome.UNRECOVERABLE
+
         current = self._identity(owner, name)
 
         if current is not entry.installed:
@@ -315,7 +347,24 @@ class PatchManager:
                 outcome = RemovalOutcome.ERRORED
 
             outcomes[(entry.module, entry.attribute)] = outcome
-            if outcome is RemovalOutcome.REMOVED:
+
+            if outcome is RemovalOutcome.UNRECOVERABLE:
+                # Leaves the journal like a success, but for the opposite
+                # reason: nothing can be done, so retrying it forever would
+                # keep this manager alive and the lifecycle at `residual` for
+                # the life of the process while achieving nothing. Recorded
+                # first, so stopping the retry never means going quiet.
+                record = (f"{entry.module}.{entry.attribute}: unrecoverable -- "
+                          f"the owner no longer carries this attribute")
+                if record not in self.permanent_residuals:
+                    self.permanent_residuals.append(record)
+                logger.error(
+                    "Tidewall cannot restore %s.%s: the owner no longer "
+                    "carries it. This is permanent and will not be retried.",
+                    entry.module, entry.attribute,
+                )
+
+            if outcome in (RemovalOutcome.REMOVED, RemovalOutcome.UNRECOVERABLE):
                 discharged.add(entry.seq)
         return outcomes
 

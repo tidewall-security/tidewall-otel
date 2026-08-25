@@ -472,9 +472,18 @@ def test_a_RAISING_restore_does_not_strand_the_entries_already_removed(monkeypat
     manager.install("r12_first", "Target.create", wrapper_factory("first"))
     manager.install("r12_second", "Target.create", wrapper_factory("second"))
 
-    # The FIRST-installed module disappears; reverse order restores the second
-    # successfully and then fails resolving the first.
-    monkeypatch.delitem(sys.modules, "r12_first")
+    # Make the FIRST-installed entry's write fail. Removing its module from
+    # sys.modules no longer does that: entries hold their owner object
+    # directly, so a vanished module is not a failure any more -- which is the
+    # point of holding it. A raising write is now the honest construction.
+    real_write = manager._write
+
+    def failing_write(owner, name, value):
+        if owner is modules["r12_first"].Target:
+            raise RuntimeError("write boom")
+        return real_write(owner, name, value)
+
+    manager._write = failing_write
 
     outcomes = manager.remove()
 
@@ -487,7 +496,7 @@ def test_a_RAISING_restore_does_not_strand_the_entries_already_removed(monkeypat
         f"a successfully restored entry was stranded in the journal: {retained}")
 
     # And the retry discharges it once the module is back.
-    monkeypatch.setitem(sys.modules, "r12_first", modules["r12_first"])
+    manager._write = real_write
     retry = manager.remove()
 
     assert retry[("r12_first", "Target.create")] is RemovalOutcome.REMOVED
@@ -735,3 +744,73 @@ def test_an_entry_appended_RE_ENTRANTLY_during_undo_survives_the_commit(module):
     outcomes = manager.remove()
     assert outcomes[(module.__name__, "Second.create")] is RemovalOutcome.REMOVED
     assert manager.journal == []
+
+
+def test_an_UNRECOVERABLE_entry_leaves_the_journal_but_is_recorded(module):
+    """A vanished owner cannot be restored onto, so retrying is pure cost.
+
+    Retrying forever kept the manager alive and the public lifecycle at
+    `residual` for the life of the process while achieving nothing. Dropping
+    it silently would be the fail-open this manager exists to remove. So it
+    is classified, stops being retried, and is kept as a durable record.
+    """
+    manager = PatchManager()
+    manager.install(module.__name__, "Target.create", wrapper_factory("tw"))
+
+    # The attribute the entry describes ceases to exist on its owner.
+    del module.Target.create
+
+    outcomes = manager.remove()
+
+    assert outcomes[(module.__name__, "Target.create")] is RemovalOutcome.UNRECOVERABLE
+    assert manager.journal == [], (
+        "an entry nothing can discharge was kept for retry anyway")
+    assert manager.permanent_residuals, "it was dropped without a record"
+    assert "unrecoverable" in manager.permanent_residuals[0]
+
+    # And retrying does not resurrect or duplicate it.
+    again = manager.remove()
+    assert again == {}
+    assert len(manager.permanent_residuals) == 1
+
+
+def test_a_NOT_OURS_entry_is_still_retained_for_retry(module):
+    """The other direction, and the one that must not be swept up.
+
+    A foreign wrapper can be removed later, so `not_ours` stays retryable.
+    Only a vanished owner is permanent.
+    """
+    import wrapt
+
+    manager = PatchManager()
+    manager.install(module.__name__, "Target.create", wrapper_factory("tw"))
+    wrapt.wrap_function_wrapper(module.__name__, "Target.create",
+                                lambda w, i, a, k: "foreign")
+
+    outcomes = manager.remove()
+
+    assert outcomes[(module.__name__, "Target.create")] is RemovalOutcome.NOT_OURS
+    assert manager.journal, "a retryable entry was discarded"
+    assert manager.permanent_residuals == [], (
+        "a removable conflict was recorded as permanent")
+
+
+def test_a_vanished_MODULE_no_longer_breaks_removal_at_all(module, monkeypatch):
+    """Entries hold their owner object, so removal never re-imports.
+
+    Re-resolving by name imported the module if it had left `sys.modules`,
+    which can yield a DIFFERENT module instance whose attribute can never
+    match `installed` -- so the entry looked foreign forever. Holding the
+    owner removes the re-import and the ambiguity together.
+    """
+    import sys
+
+    manager = PatchManager()
+    manager.install(module.__name__, "Target.create", wrapper_factory("tw"))
+
+    monkeypatch.delitem(sys.modules, module.__name__)
+
+    outcomes = manager.remove()
+
+    assert outcomes[(module.__name__, "Target.create")] is RemovalOutcome.REMOVED
+    assert module.Target().create() == "original"
