@@ -56,6 +56,14 @@ class JournalEntry:
     pre_install_identity: Any = None
     installed: Any = None
     finder: Any = None
+    #: Stable identity, assigned once at append. Discharge is by THIS, never
+    #: by position: resolving or writing an attribute can run arbitrary
+    #: import, descriptor or metaclass code that re-enters the manager and
+    #: appends an entry mid-undo. A positional commit computed before that
+    #: append then deleted the newcomer -- while its wrapper was installed --
+    #: making it unremovable. Positions are valid only under a no-reentrancy
+    #: invariant these operations do not satisfy.
+    seq: int = -1
 
 
 def _resolve_owner(module_name: str, attribute: str) -> tuple[Any, str]:
@@ -81,6 +89,18 @@ class PatchManager:
         self.dispositions: dict[str, str] = {}
         self._surfaces: dict[str, list[tuple[str, Callable]]] = {}
         self._finder: Any = None
+        self._next_seq = 0
+
+    def _journal(self, entry: JournalEntry) -> JournalEntry:
+        """Stamp an entry with its stable identity and append it.
+
+        One append path, so no entry reaches the journal without a `seq` and
+        is silently unmatchable at discharge.
+        """
+        entry.seq = self._next_seq
+        self._next_seq += 1
+        self.journal.append(entry)
+        return entry
 
     # -- identity ---------------------------------------------------------
 
@@ -137,7 +157,7 @@ class PatchManager:
                 )
 
         self._write(owner, name, installed)
-        self.journal.append(JournalEntry(
+        self._journal(JournalEntry(
             kind="patch", module=module, attribute=attribute,
             pre_install_identity=before, installed=installed,
         ))
@@ -188,8 +208,11 @@ class PatchManager:
             try:
                 self._undo_entries(added, discharged)
             finally:
-                self.journal[mark:] = [entry for index, entry in enumerate(added)
-                                       if index not in discharged]
+                # By seq, over the LIVE journal -- never a slice assignment
+                # from the stale `added` snapshot, which would drop anything
+                # appended re-entrantly while this rollback ran.
+                self.journal[:] = [entry for entry in self.journal
+                                   if entry.seq not in discharged]
                 # WHAT SURVIVED decides the disposition, not the fact that
                 # this call failed. The scoped rollback undoes only THIS
                 # call's entries, so an earlier successful install for the
@@ -258,7 +281,7 @@ class PatchManager:
                                    "finder from sys.meta_path", exc_info=True)
                     outcomes[(entry.module, entry.attribute)] = RemovalOutcome.ERRORED
                     continue
-                discharged.add(index)
+                discharged.add(entry.seq)
                 continue
 
             # PER-ENTRY. `_restore` can raise -- the module was removed
@@ -293,7 +316,7 @@ class PatchManager:
 
             outcomes[(entry.module, entry.attribute)] = outcome
             if outcome is RemovalOutcome.REMOVED:
-                discharged.add(index)
+                discharged.add(entry.seq)
         return outcomes
 
     def _discharge(self) -> dict[tuple[str, str], RemovalOutcome]:
@@ -311,8 +334,12 @@ class PatchManager:
         try:
             return self._undo_entries(self.journal, discharged)
         finally:
-            self.journal[:] = [entry for index, entry in enumerate(self.journal)
-                               if index not in discharged]
+            # Filter the LIVE journal by seq. Slicing it against positions
+            # computed before the undo deleted any entry appended
+            # re-entrantly during it -- while that entry's wrapper was
+            # installed, so nothing could ever remove it.
+            self.journal[:] = [entry for entry in self.journal
+                               if entry.seq not in discharged]
             if not any(entry.kind == "finder" for entry in self.journal):
                 self._finder = None
 
@@ -370,8 +397,8 @@ class PatchManager:
         # Named, not blank: when removal of the finder fails, the ERRORED
         # outcome is keyed like every patch outcome, so `_uninstrument` can
         # report the stuck finder as a residual instead of reporting clean.
-        self.journal.append(JournalEntry(kind="finder", module="sys.meta_path",
-                                         attribute="finder", finder=finder))
+        self._journal(JournalEntry(kind="finder", module="sys.meta_path",
+                                   attribute="finder", finder=finder))
         for module in modules:
             self.dispositions.setdefault(module, "pending-import")
 

@@ -691,3 +691,47 @@ def test_ROLLBACK_refuses_to_delete_a_wrapper_installed_after_ours(module):
     assert inspect.getattr_static(module.Target, "create") is theirs, (
         "rollback deleted a wrapper installed after ours")
     assert manager.journal, "the entry it could not roll back was discarded"
+
+
+def test_an_entry_appended_RE_ENTRANTLY_during_undo_survives_the_commit(module):
+    """Adversarial review finding 2, and why positions were unsound.
+
+    Resolving or writing a patched attribute can execute arbitrary import,
+    descriptor or metaclass code, which can re-enter this manager and append
+    a journal entry mid-undo. The commit filtered by POSITION, computed
+    before that append -- so the newcomer was deleted from the journal while
+    its wrapper was installed, and nothing could ever remove it.
+
+    Discharge is by stable `seq` over the LIVE journal, so an entry that did
+    not exist when the undo began cannot be discharged by it.
+    """
+    manager = PatchManager()
+    manager.install(module.__name__, "Target.create", wrapper_factory("first"))
+
+    newcomer = {}
+    real_restore = manager._restore
+
+    def restore_then_reenter(entry):
+        outcome = real_restore(entry)
+        if not newcomer:            # exactly what user code inside setattr does
+            module.Second = type("Second", (), {"create": lambda self: "second"})
+            manager.install(module.__name__, "Second.create",
+                            wrapper_factory("late"))
+            newcomer["seq"] = manager.journal[-1].seq
+        return outcome
+
+    manager._restore = restore_then_reenter
+    manager.remove()
+
+    assert newcomer, "the re-entrant install never ran"
+    assert newcomer["seq"] in {entry.seq for entry in manager.journal}, (
+        "an entry appended during the undo was deleted from the journal "
+        "while its wrapper was still installed")
+    assert getattr(inspect.getattr_static(module.Second, "create"),
+                   "__tidewall_wrapper__", False), (
+        "precondition: the re-entrant install really did patch")
+
+    # Still removable, which is the whole point.
+    outcomes = manager.remove()
+    assert outcomes[(module.__name__, "Second.create")] is RemovalOutcome.REMOVED
+    assert manager.journal == []
