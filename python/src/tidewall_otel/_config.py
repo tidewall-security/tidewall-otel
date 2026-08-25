@@ -57,7 +57,8 @@ class TidewallConfig:
         TIDEWALL_TOKEN      - API token for authenticating with the guard server
         TIDEWALL_APP_ID     - Application identifier recorded in guard events
         TIDEWALL_APP_NAME   - Human-readable application name for dashboards
-        TIDEWALL_USER_ID    - User identifier (defaults to ``$USER``)
+        TIDEWALL_USER_ID    - User identifier. NO DEFAULT: the OS account name
+                              is not collected unless this is set explicitly.
         TIDEWALL_MODE       - Enforcement mode: ``enforce`` (default), ``monitor``,
                               or ``dry-run``
         TIDEWALL_LOG_LEVEL  - Logging verbosity: ``debug``, ``info`` (default),

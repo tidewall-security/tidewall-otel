@@ -340,3 +340,80 @@ def test_every_public_exception_is_a_TidewallError():
                 outsiders.append(name)
     assert not outsiders, (
         f"public exceptions outside the TidewallError hierarchy: {outsiders}")
+
+
+def test_no_document_claims_the_OS_ACCOUNT_NAME_is_a_default():
+    """P0-2's claim, asserted against every document that could restate it.
+
+    The name-set drift checks compare only which variables appear, never what
+    is said about them, so they passed while `_config.py`'s own reference still
+    read "TIDEWALL_USER_ID - User identifier (defaults to ``$USER``)". The
+    README had been corrected and the module docstring had not.
+
+    A wrong default is worse than a missing one here: it tells an operator the
+    OS account name is collected by default, which is precisely the privacy
+    defect P0-2 removed. Anyone reading it would either wrongly avoid the
+    library or wrongly file a privacy exception for it.
+    """
+    import re
+
+    from tidewall_otel._config import TidewallConfig
+
+    assert TidewallConfig(mode="dry-run").user_id == "", (
+        "the implementation grew a default identity; this test is now wrong")
+
+    root = Path(__file__).resolve().parents[2]
+    docs = (root / "README.md", root / "python" / "README.md",
+            root / "python" / "src" / "tidewall_otel" / "_config.py")
+
+    offenders = []
+    for doc in docs:
+        for match in re.finditer(r"TIDEWALL_USER_ID", doc.read_text()):
+            window = doc.read_text()[match.start():match.start() + 260]
+            window = window.split("\n\n")[0]
+            if re.search(r"\$USER|default[s]?\s+to\s+`*\$?USER", window):
+                offenders.append(f"{doc.name}: {' '.join(window.split())[:110]}")
+    assert not offenders, (
+        "documents claiming an OS-account-name default:\n" + "\n".join(offenders))
+
+
+def test_every_DOCUMENTED_default_matches_the_code():
+    """The general form. Names matching is not the claim a table makes.
+
+    Each row asserts a DEFAULT, and a table can name every variable correctly
+    while getting every value wrong. Compares the README's Default column
+    against a freshly constructed `TidewallConfig`.
+    """
+    import re
+
+    from tidewall_otel._config import TidewallConfig
+
+    config = TidewallConfig(base_url="https://guard.example", token="t")
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text()
+
+    mismatches = []
+    for var, default in re.findall(
+            r"\|\s*`(TIDEWALL_[A-Z_]+)`\s*\|\s*([^|]+?)\s*\|", readme):
+        if default.startswith("("):          # (required) / (none)
+            continue
+        attribute = var[len("TIDEWALL_"):].lower()
+        for candidate in (attribute, attribute + "_s"):
+            if hasattr(config, candidate):
+                actual = getattr(config, candidate)
+                break
+        else:
+            mismatches.append(f"{var}: documented but no config field")
+            continue
+        documented = default.strip().strip("`")
+        # Compare NUMERICALLY when both sides are numbers: the README writes
+        # `10` and the field holds 10.0. An earlier version normalised by
+        # stripping trailing zeros, which turned "10" into "1" and reported a
+        # mismatch on two correct rows -- a detector wrong in the direction
+        # that gets it deleted rather than trusted.
+        try:
+            same = float(documented) == float(actual)
+        except (TypeError, ValueError):
+            same = documented == str(actual)
+        if not same:
+            mismatches.append(f"{var}: README says {documented!r}, code gives {actual!r}")
+    assert not mismatches, "\n".join(mismatches)
