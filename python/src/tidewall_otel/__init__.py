@@ -71,10 +71,16 @@ __all__ = [
 logger = logging.getLogger("tidewall.otel")
 
 _instrumentor_instance = None
-#: Instrumentors whose journal still holds entries removal declined. Parked
-#: rather than dropped, so the ONLY route to their `pre_install_identity`
-#: survives a re-activation; discharged on any later `deactivate()`.
-_residual_instrumentors: list = []
+#: MANAGERS whose journal still holds entries removal declined. Parked rather
+#: than dropped, so the ONLY route to their `pre_install_identity` survives a
+#: re-activation; discharged on any later `deactivate()`.
+#:
+#: Managers, NOT instrumentors. The real `BaseInstrumentor` is a SINGLETON --
+#: `TidewallInstrumentor()` returns the same object every time -- so parking
+#: "the previous instrumentor" is a no-op on the production OTel path, and
+#: `instrument()` then overwrites `self._manager` and loses the journal just
+#: as completely. The manager is the thing that actually holds the entries.
+_residual_managers: list = []
 _state = State()
 
 
@@ -151,8 +157,8 @@ def activate(config: TidewallConfig | None = None) -> None:
         previous_manager = getattr(previous, "_manager", None)
         if previous_manager is not None and previous_manager.journal:
             previous.retry_removal()
-            if previous_manager.journal and previous not in _residual_instrumentors:
-                _residual_instrumentors.append(previous)
+            if previous_manager.journal and previous_manager not in _residual_managers:
+                _residual_managers.append(previous_manager)
                 logger.warning(
                     "Tidewall is activating with %d undischarged journal "
                     "entry(ies) from a previous deactivation; they are "
@@ -288,13 +294,13 @@ def deactivate() -> None:
 
     # Parked residuals first: the conflict that blocked them may have cleared,
     # and each holds the only copy of its entries' pre-install identity.
-    for parked in list(_residual_instrumentors):
-        parked.retry_removal()
-        parked_manager = getattr(parked, "_manager", None)
-        if parked_manager is None or not parked_manager.journal:
-            _residual_instrumentors.remove(parked)
-        else:
-            residuals.extend(getattr(parked, "residuals", ()) or ())
+    for parked in list(_residual_managers):
+        for (module_path, attribute), outcome in parked.remove().items():
+            if outcome.value != "removed":
+                residuals.append(
+                    f"{module_path}.{attribute}: {outcome.value} -- wrapper NOT removed")
+        if not parked.journal:
+            _residual_managers.remove(parked)
 
     if _instrumentor_instance:
         instrumentor = _instrumentor_instance

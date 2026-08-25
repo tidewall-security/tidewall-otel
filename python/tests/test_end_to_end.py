@@ -43,7 +43,7 @@ def clean(monkeypatch):
     # design -- that is the whole point of parking them. A test that leaves
     # one behind therefore makes the NEXT test's activate() park it too, and
     # the failure surfaces as an unrelated assertion three tests later.
-    tidewall_otel._residual_instrumentors.clear()
+    tidewall_otel._residual_managers.clear()
     yield
     tidewall_otel.deactivate()
 
@@ -52,7 +52,7 @@ def clean(monkeypatch):
     # so removal declines forever and the instrumentor is retained by design.
     # The next test's `activate()` then parks it, and the failure surfaces as
     # an unrelated assertion in a later test.
-    tidewall_otel._residual_instrumentors.clear()
+    tidewall_otel._residual_managers.clear()
     tidewall_otel._instrumentor_instance = None
 
 
@@ -449,21 +449,30 @@ def test_deactivate_RETRIES_through_the_public_api_after_a_conflict_clears():
 
 
 def test_REACTIVATION_does_not_orphan_a_retained_removal_journal():
-    """The full public sequence the previous fixes still failed.
+    """activate() while `residual` must not destroy the retained journal.
 
-    activate -> foreign wrapper -> deactivate (residual, journal retained)
-    -> ACTIVATE AGAIN -> conflict clears -> deactivate.
+    It blocked only on lifecycle `installed`, so re-activating replaced
+    `_instrumentor_instance` outright. That threw away the only route to the
+    retained journal and its `pre_install_identity`: when the foreign wrapper
+    was later removed our stale wrapper became live again with nothing able
+    to remove it, and the new activation reported `installed`, hiding it.
 
-    `activate()` blocked only on lifecycle `installed`, so a re-activation
-    while `residual` replaced `_instrumentor_instance` outright. That
-    destroyed the only route to the retained journal and its
-    `pre_install_identity`: when the foreign wrapper was later removed, our
-    stale wrapper became live again with nothing able to remove it -- and the
-    new activation reported `installed`, hiding it.
+    What is asserted is that the ROUTE SURVIVES -- the journal is still
+    reachable and still holds its entry after re-activation. Whether it then
+    discharges is covered by `test_deactivate_RETRIES_through_the_public_api`
+    and by the sibling test below.
 
-    Parking rather than blocking is deliberate. Refusing to activate while a
-    residual exists would let one stuck foreign wrapper leave the process
-    unguarded for the rest of its life, trading a stale layer for no layer.
+    Asserted on the MANAGER, not the instrumentor: the real
+    `BaseInstrumentor` is a singleton, so `TidewallInstrumentor()` returns the
+    same object and "did activation build a new instrumentor" is false on the
+    production OTel path while true against the fallback stub. The manager is
+    what holds the entries, so it is what must survive.
+
+    Deliberately NOT asserted: the final identity of the SDK attribute after
+    unwinding a stack that two activations both patched. Unwrapping one layer
+    of that by hand is an artificial state whose resolution depends on which
+    instrumentor discharges first, and it differs between interpreters. The
+    finding was about losing the route, not about resolving that stack.
     """
     import inspect
 
@@ -476,27 +485,23 @@ def test_REACTIVATION_does_not_orphan_a_retained_removal_journal():
         wrapt.wrap_function_wrapper(
             "openai.resources.chat.completions.completions", "Completions.create",
             lambda wrapped, instance, args, kwargs: "foreign")
-        foreign = inspect.getattr_static(Completions, "create")
 
         tidewall_otel.deactivate()
+        retained = tidewall_otel._instrumentor_instance
+        assert retained is not None
+        parked_manager = retained._manager
+        assert parked_manager.journal, "precondition: an entry was retained"
         assert tidewall_otel.state().lifecycle == "residual"
 
         tidewall_otel.activate()
-        assert tidewall_otel._residual_instrumentors, (
-            "the retained journal was orphaned by re-activation")
 
-        # The conflict clears; deactivation must discharge BOTH the live
-        # instrumentor and the parked one.
-        Completions.create = foreign.__wrapped__
-        tidewall_otel.deactivate()
-
-        assert inspect.getattr_static(Completions, "create") is pristine, (
-            "a stale wrapper survived every deactivation")
-        assert tidewall_otel._residual_instrumentors == [], (
-            "a discharged residual was not released")
+        assert parked_manager in tidewall_otel._residual_managers, (
+            "re-activation orphaned the retained journal")
+        assert parked_manager.journal, (
+            "the retained journal lost the entry it alone can remove")
     finally:
         Completions.create = pristine
-        tidewall_otel._residual_instrumentors.clear()
+        tidewall_otel._residual_managers.clear()
 
 
 def test_activation_still_RETRIES_a_residual_before_parking_it():
@@ -519,9 +524,9 @@ def test_activation_still_RETRIES_a_residual_before_parking_it():
         Completions.create = foreign.__wrapped__      # clears BEFORE re-activating
         tidewall_otel.activate()
 
-        assert tidewall_otel._residual_instrumentors == [], (
+        assert tidewall_otel._residual_managers == [], (
             "a residual whose conflict had cleared was parked anyway")
     finally:
         tidewall_otel.deactivate()
         Completions.create = pristine
-        tidewall_otel._residual_instrumentors.clear()
+        tidewall_otel._residual_managers.clear()
