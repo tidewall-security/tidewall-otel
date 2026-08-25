@@ -124,8 +124,17 @@ def test_a_transform_preserves_every_untouched_provider_kwarg(config):
             {"role": "user", "content": "clean"}]}), config)
 
     assert isinstance(decision, Transform)
-    assert decision.kwargs["temperature"] == 0.2
-    assert decision.kwargs["seed"] == 7
+
+    # DERIVED, not named. Listing `temperature` and `seed` checks the two
+    # kwargs the author happened to think of; a kwarg added to the fixture
+    # later, or dropped by the transform, would go unnoticed under a name
+    # promising EVERY untouched kwarg.
+    untouched = {key: value for key, value in call.kwargs.items()
+                 if key != "messages"}
+    assert {key: decision.kwargs.get(key) for key in untouched} == untouched, (
+        f"a kwarg the guard never saw was altered: {decision.kwargs}")
+    assert set(decision.kwargs) == set(call.kwargs), (
+        "the transform added or dropped a kwarg")
     assert decision.kwargs["messages"][0]["content"] == "clean"
 
 

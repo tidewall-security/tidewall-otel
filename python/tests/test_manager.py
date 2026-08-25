@@ -117,8 +117,14 @@ def test_a_failure_mid_install_ROLLS_BACK_every_earlier_patch(module):
             ("fake_sdk", "Second.create", exploding),
         ], fail_on=("fake_sdk", "Second.create"))
 
-    assert Target.create is original_first, "the first patch was not rolled back"
-    assert module.Second.create is original_second
+    # Derived from the specs, so adding a third boundary to the install list
+    # extends the assertion instead of silently escaping it.
+    for owner, attribute, expected in (
+        (Target, "create", original_first),
+        (module.Second, "create", original_second),
+    ):
+        assert getattr(owner, attribute) is expected, (
+            f"{owner.__name__}.{attribute} was not rolled back")
     assert manager.journal == [], "the journal survived a rollback"
 
 

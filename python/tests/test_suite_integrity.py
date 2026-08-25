@@ -5,6 +5,7 @@ on: a test that cannot run proves nothing, and neither does one with no body.
 """
 
 import ast
+import re
 import textwrap
 from pathlib import Path
 
@@ -427,3 +428,115 @@ def test_every_DOCUMENTED_default_matches_the_code():
         if not same:
             mismatches.append(f"{var}: README says {documented!r}, code gives {actual!r}")
     assert not mismatches, "\n".join(mismatches)
+
+
+def _universal_claims_without_universal_bodies(tree):
+    """Tests whose NAME claims a universal and whose BODY asserts a single case.
+
+    Eight instances of this shipped in one programme, twice inside the fix for
+    a previous instance. Reading does not catch them: each looks exactly like
+    the assertion its name promises.
+
+    DELIBERATELY NARROW, because a bad detector is worse than none (a green
+    light over an analysis nobody trusts). It flags only `every`/`all` in the
+    name -- the unambiguous universals -- and only when the body contains no
+    iteration, no comprehension, and no collection comparison at all. It does
+    NOT flag `never`/`only`/`absent`, which are routinely correct as a single
+    assertion about a single subject.
+
+    So it cannot catch a universal implemented over the wrong set, or one that
+    iterates a hand-written list instead of deriving it. It catches the shape
+    that actually shipped: a name saying EVERY over a body checking one.
+    """
+    # `_every_` ONLY. "all" matches "at_all", as in
+    # `test_dry_run_makes_NO_guard_call_at_all`, which is not a universal
+    # claim -- the first version of this detector flagged it.
+    universal_name = re.compile(r"_every_", re.IGNORECASE)
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not node.name.startswith("test_"):
+            continue
+        if not universal_name.search("_" + node.name + "_"):
+            continue
+
+        # PARAMETRISATION IS THE UNIVERSAL, and the strongest form of it:
+        # `@pytest.mark.parametrize("surface", SURFACES)` derives its cases
+        # from the data and runs one test per member, which is exactly the fix
+        # this detector exists to encourage. The first version flagged those
+        # as defects -- it would have condemned the best tests in the suite,
+        # which is how a detector gets muted instead of trusted.
+        parametrised = any(
+            isinstance(dec, ast.Call)
+            and isinstance(dec.func, ast.Attribute)
+            and dec.func.attr == "parametrize"
+            for dec in node.decorator_list
+        )
+        if parametrised:
+            continue
+
+        iterates = any(
+            isinstance(inner, (ast.For, ast.AsyncFor, ast.comprehension,
+                               ast.ListComp, ast.SetComp, ast.DictComp,
+                               ast.GeneratorExp))
+            for inner in ast.walk(node)
+        )
+        compares_collections = any(
+            isinstance(inner, ast.Compare)
+            and any(isinstance(op, (ast.LtE, ast.GtE, ast.In, ast.NotIn))
+                    for op in inner.ops)
+            for inner in ast.walk(node)
+        )
+        calls_any_or_all = any(
+            isinstance(inner, ast.Call) and isinstance(inner.func, ast.Name)
+            and inner.func.id in {"all", "any", "set", "sorted", "len"}
+            for inner in ast.walk(node)
+        )
+        if not (iterates or compares_collections or calls_any_or_all):
+            yield node.lineno, node.name
+
+
+def test_no_test_claims_a_UNIVERSAL_while_checking_one_case():
+    """The class, not the instance.
+
+    Rule: if the name says EVERY or ALL, the body must range over something.
+    A test named for a universal that asserts a single named member is the
+    defect that recurred eight times here -- including in the test written to
+    close the seventh.
+    """
+    import re as _re  # noqa: F401 -- `re` is used by the helper above
+
+    offenders = []
+    for path in sorted(Path(__file__).parent.glob("test_*.py")):
+        tree = ast.parse(path.read_text())
+        for lineno, name in _universal_claims_without_universal_bodies(tree):
+            offenders.append(f"{path.name}:{lineno} {name}")
+    assert not offenders, (
+        "tests claiming a universal while checking one case:\n"
+        + "\n".join(offenders))
+
+
+def test_the_universal_detector_CATCHES_the_shape_that_shipped():
+    """Known-positive, planting the real defect: the round-8 finding, where a
+    test named for every deferred surface asserted one by name."""
+    shipped = ast.parse(
+        "def test_every_deferred_surface_is_uncovered():\n"
+        "    assert state.surfaces['Messages.create'] == 'uncovered'\n"
+    )
+    assert list(_universal_claims_without_universal_bodies(shipped))
+
+    derived = ast.parse(
+        "def test_every_deferred_surface_is_uncovered():\n"
+        "    deferred = {s.attribute for s in SURFACES}\n"
+        "    assert deferred <= uncovered\n"
+    )
+    assert not list(_universal_claims_without_universal_bodies(derived))
+
+    # `never` is NOT flagged: a single assertion about a single subject is
+    # the correct implementation of that word.
+    single = ast.parse(
+        "def test_the_token_is_never_in_the_repr():\n"
+        "    assert 'secret' not in repr(config)\n"
+    )
+    assert not list(_universal_claims_without_universal_bodies(single))
