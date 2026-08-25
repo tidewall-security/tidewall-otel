@@ -183,8 +183,24 @@ def test_the_DECLARED_sdk_ranges_match_the_ranges_the_manifest_VOUCHES_for():
 
     extras = tomllib.loads(PYPROJECT.read_text())["project"]["optional-dependencies"]
 
-    vouched = {s.provider: s.version_range for s in SURFACES}
-    assert vouched, "the manifest declares no surfaces"
+    # COLLECT, do not collapse. `{s.provider: s.version_range for s in
+    # SURFACES}` keeps only the LAST surface per provider, so a later surface
+    # could carry any range at all and this test would not notice -- proven by
+    # mutating AsyncCompletions.create to ">=999.0.0,<1000.0.0", which left it
+    # passing. Disposition is computed PER SURFACE from `Surface.version_range`
+    # while packaging is declared per provider, so the surfaces of one provider
+    # agreeing is a precondition for the comparison below to mean anything.
+    by_provider: dict[str, set[str]] = {}
+    for surface in SURFACES:
+        by_provider.setdefault(surface.provider, set()).add(surface.version_range)
+    assert by_provider, "the manifest declares no surfaces"
+
+    disagreeing = {p: sorted(r) for p, r in by_provider.items() if len(r) > 1}
+    assert not disagreeing, (
+        "surfaces of one provider vouch for different ranges, so no single "
+        f"packaging declaration can match them all: {disagreeing}")
+
+    vouched = {p: r.pop() for p, r in by_provider.items()}
 
     mismatches = []
     for provider, version_range in sorted(vouched.items()):
