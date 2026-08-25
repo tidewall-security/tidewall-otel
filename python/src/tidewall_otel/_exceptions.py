@@ -56,3 +56,20 @@ class TidewallRefusedError(TidewallError):
     def __init__(self, message: str, outcome_kind: str = "") -> None:
         super().__init__(message)
         self.outcome_kind = outcome_kind
+
+
+class LossyInputError(TidewallRefusedError):
+    """The call carries content the guard cannot be shown faithfully."""
+
+    def __init__(self, paths: tuple[str, ...]) -> None:
+        super().__init__(
+            f"refusing: input cannot be represented to the guard at {list(paths)}",
+            outcome_kind="lossy",
+        )
+        self.paths = paths
+
+    #: `paths` names WHICH arguments could not be represented, because the
+    #: caller can act on that: dropping `extra_body` makes the call
+    #: inspectable, whereas a guard failure is not something they can fix.
+    #: Public for the same reason -- a caller who cannot name the type cannot
+    #: distinguish the two without importing a private module.

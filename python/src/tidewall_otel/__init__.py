@@ -39,6 +39,7 @@ from tidewall_otel._manifest import SURFACES
 from typing import Any
 
 from tidewall_otel._exceptions import (
+    LossyInputError,
     TidewallBlockedError,
     TidewallConfigError,
     TidewallError,
@@ -63,6 +64,7 @@ __all__ = [
     "TidewallError",
     "TidewallBlockedError",
     "TidewallRefusedError",
+    "LossyInputError",
     "TidewallConfigError",
     "TidewallActivationRefusedError",
 ]

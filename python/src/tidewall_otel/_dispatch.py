@@ -23,21 +23,10 @@ from typing import Any, Callable, Protocol
 from ._bound import bound_nodes
 from ._coverage import classify_input
 from ._execution import DeadlineExceeded, ExecutorSaturated
-from ._exceptions import TidewallRefusedError, TidewallBlockedError, TidewallError
+from ._exceptions import LossyInputError, TidewallRefusedError, TidewallBlockedError, TidewallError
 from ._http import GuardSchemaInvalid, GuardTimeout, GuardUnreachable
 from ._manifest import Surface, client_escapes
 from ._response import Outcome, classify_response
-
-
-class LossyInputError(TidewallRefusedError):
-    """The call carries content the guard cannot be shown faithfully."""
-
-    def __init__(self, paths: tuple[str, ...]) -> None:
-        super().__init__(
-            f"refusing: input cannot be represented to the guard at {list(paths)}",
-            outcome_kind="lossy",
-        )
-        self.paths = paths
 
 
 # -- state carried through dispatch ---------------------------------------
