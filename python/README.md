@@ -53,6 +53,26 @@ Configure via environment variables (recommended) or by passing a
 | `TIDEWALL_GUARD_DEADLINE` | `10` | Caller-latency bound, seconds — how long a caller waits for the guard before the mode contract applies. |
 | `TIDEWALL_ON_ACTIVATION_FAILURE` | `exit` | What happens when activation fails: `exit` (raise, so the process does not continue believing it is guarded), `disable` (run unguarded, with the state saying so), or `block` (install refusers, so calls fail rather than pass unchecked). |
 
+
+### Handling `TIDEWALL_TOKEN`
+
+`TIDEWALL_TOKEN` is a bearer credential for your guard server. Anyone holding
+it can submit prompts as your application and read the verdicts.
+
+- Supply it through the environment or a secrets manager. Do not commit it,
+  and do not pass it on a command line, where it is visible in the process
+  table and shell history.
+- **Do not log your configuration object.** `TidewallConfig` deliberately
+  omits the token from its `repr`, so `logger.info("%s", config)` is safe —
+  but `config.token` is not, and neither is a hand-rolled dict of settings.
+- Error reporters that capture frame locals (Sentry and similar do this by
+  default) will capture anything you have put in a local variable. The
+  redacted `repr` protects the config object; it cannot protect a variable
+  you assigned the raw token to.
+- The agent never writes the token to a log, and refuses to send it over a
+  plaintext connection or follow a redirect that would carry it to another
+  origin.
+
 ## Activation
 
 There are three ways to turn the agent on. Pick whichever fits your

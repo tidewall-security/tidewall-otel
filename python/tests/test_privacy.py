@@ -2,6 +2,7 @@
 
 import pytest
 
+from tidewall_otel._config import TidewallConfig
 from tidewall_otel._manifest import SURFACES
 from tidewall_otel._span_helper import gen_ai_span
 
@@ -94,3 +95,54 @@ def test_an_EXPLICIT_user_id_is_still_sent(monkeypatch):
 
     payload = TidewallGuard(TidewallConfig())._payload_for({"messages": []})
     assert payload["user_id"] == "service-account-7"
+
+
+def test_the_TOKEN_is_never_in_the_config_repr(monkeypatch):
+    """The bearer credential must not travel in a repr.
+
+    `TidewallConfig` is public API, so its repr goes wherever the application
+    puts it: `logger.info("config: %s", config)`, a crash handler dumping
+    locals, or an error reporter capturing frame locals -- Sentry does that by
+    default. The plain dataclass repr printed
+    `token='...'` in cleartext.
+
+    P0-3 protected this token IN TRANSIT: https enforced, redirects refused,
+    no plaintext scheme. Nothing protected its REPRESENTATION, and they are
+    the same asset -- an attacker reading it from a log has it just as
+    completely as one reading it off the wire.
+    """
+    monkeypatch.setenv("TIDEWALL_BASE_URL", "https://guard.example")
+    monkeypatch.setenv("TIDEWALL_TOKEN", "sk-SUPERSECRET-do-not-print")
+
+    config = TidewallConfig()
+
+    assert config.token == "sk-SUPERSECRET-do-not-print", "the value is still usable"
+    assert "SUPERSECRET" not in repr(config), repr(config)
+    assert "SUPERSECRET" not in str(config), str(config)
+    assert "SUPERSECRET" not in f"{config}"
+    assert "SUPERSECRET" not in "{}".format(config)          # noqa: UP032
+
+
+def test_the_token_is_absent_from_EVERY_public_rendering(monkeypatch):
+    """Not just repr: anything that stringifies the object by any route.
+
+    Named separately because "not in repr" is a weaker claim than the one
+    that matters, and this programme has repeatedly shipped the weaker one.
+    """
+    import pprint
+
+    monkeypatch.setenv("TIDEWALL_BASE_URL", "https://guard.example")
+    monkeypatch.setenv("TIDEWALL_TOKEN", "sk-SUPERSECRET-do-not-print")
+
+    config = TidewallConfig()
+    renderings = {
+        "repr": repr(config),
+        "str": str(config),
+        "pprint": pprint.pformat(config),
+        "list-repr": repr([config]),
+        "dict-repr": repr({"config": config}),
+        "exception": repr(ValueError(config)),
+    }
+    leaked = {name: text for name, text in renderings.items()
+              if "SUPERSECRET" in text}
+    assert not leaked, f"the token leaked through: {sorted(leaked)}"

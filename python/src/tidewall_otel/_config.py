@@ -78,7 +78,21 @@ class TidewallConfig:
     base_url: str = field(
         default_factory=lambda: os.environ.get("TIDEWALL_BASE_URL", "")
     )
-    token: str = field(default_factory=lambda: os.environ.get("TIDEWALL_TOKEN", ""))
+    #: ``repr=False``. This is the bearer credential for the guard, and
+    #: `TidewallConfig` is public API, so its repr travels wherever the
+    #: application puts it: a `logger.info("config: %s", config)`, a crash
+    #: handler dumping locals, or an error reporter that captures frame
+    #: locals -- Sentry does this by default. The default dataclass repr
+    #: printed it in cleartext.
+    #:
+    #: P0-3 protected this token in transit (https enforced, redirects
+    #: refused). Nothing protected its REPRESENTATION, and the two are the
+    #: same asset. `__post_init__` still validates it, and `_http.post_guard`
+    #: still reads it -- only the repr is redacted.
+    token: str = field(
+        default_factory=lambda: os.environ.get("TIDEWALL_TOKEN", ""),
+        repr=False,
+    )
     app_id: str = field(
         default_factory=lambda: os.environ.get("TIDEWALL_APP_ID", "tidewall-otel")
     )
