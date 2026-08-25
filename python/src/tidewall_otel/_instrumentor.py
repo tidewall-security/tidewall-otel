@@ -215,6 +215,7 @@ class TidewallInstrumentor(BaseInstrumentor):
         self._guard = TidewallGuard(config)
         self._executor = BoundedExecutor()
         self._state = State(lifecycle="installing", mode=config.mode)
+        self._hand_off_residual_manager()
         self._manager = PatchManager()
 
         factories = {
@@ -311,6 +312,39 @@ class TidewallInstrumentor(BaseInstrumentor):
             "Tidewall instrumentation active (mode=%s, surfaces=%s)",
             config.mode, sorted(self._state.surfaces),
         )
+
+    def _hand_off_residual_manager(self) -> None:
+        """Preserve a retained journal before a new manager replaces it.
+
+        The real `BaseInstrumentor` is a SINGLETON, so a second
+        instrumentation reaches the same object and overwrites `_manager`.
+        `activate()` parks the old one first -- but the documented
+        `opentelemetry-instrument` entry point never calls `activate()`: it
+        invokes `BaseInstrumentor.instrument()`, which lands here directly.
+        Parking only in `activate()` therefore protected the path most under
+        test and left the production zero-code path exactly as it was, able
+        to orphan a journal whose entries nothing else can ever remove.
+
+        Lives here so BOTH callers get it, rather than being duplicated at
+        each entry point where the next one added would forget it.
+        """
+        previous = getattr(self, "_manager", None)
+        if previous is None or not previous.journal:
+            return
+
+        self.retry_removal()
+        if not previous.journal:
+            return
+
+        import tidewall_otel
+
+        if previous not in tidewall_otel._residual_managers:
+            tidewall_otel._residual_managers.append(previous)
+            logger.warning(
+                "Tidewall is re-instrumenting with %d undischarged journal "
+                "entry(ies); they are retried on the next deactivate()",
+                len(previous.journal),
+            )
 
     def retry_removal(self) -> None:
         """Re-run removal for entries an earlier deactivation could not undo.

@@ -55,6 +55,15 @@ def clean(monkeypatch):
     tidewall_otel._residual_managers.clear()
     tidewall_otel._instrumentor_instance = None
 
+    # And the SINGLETON's own manager. The real `BaseInstrumentor` returns the
+    # same object from every construction, so its `_manager` -- and any stuck
+    # journal on it -- survives clearing the module-level reference entirely.
+    # The next activation would hand that journal straight back into the
+    # parked list and every later test would read `residual`.
+    from tidewall_otel._instrumentor import TidewallInstrumentor
+
+    TidewallInstrumentor()._manager = None
+
 
 @pytest.fixture
 def guard_says(monkeypatch):
@@ -359,6 +368,23 @@ def test_deactivation_that_could_NOT_remove_reports_residual_not_removed(monkeyp
 
     assert inspect.getattr_static(Completions, "create") is pristine
 
+    # Restoring the class by hand above left a journal entry whose `installed`
+    # object is nowhere, so it can never discharge and would keep the
+    # lifecycle at `residual` for every later cycle -- correctly, which is
+    # exactly why the next assertion needs a clean slate rather than a
+    # weakened expectation.
+    tidewall_otel._residual_managers.clear()
+    tidewall_otel._instrumentor_instance = None
+
+    # And the SINGLETON's own manager. The real `BaseInstrumentor` returns the
+    # same object from every construction, so its `_manager` -- and any stuck
+    # journal on it -- survives clearing the module-level reference entirely.
+    # The next activation would hand that journal straight back into the
+    # parked list and every later test would read `residual`.
+    from tidewall_otel._instrumentor import TidewallInstrumentor
+
+    TidewallInstrumentor()._manager = None
+
     # And the honest case still reports removed.
     tidewall_otel.activate()
     tidewall_otel.deactivate()
@@ -530,3 +556,47 @@ def test_activation_still_RETRIES_a_residual_before_parking_it():
         tidewall_otel.deactivate()
         Completions.create = pristine
         tidewall_otel._residual_managers.clear()
+
+
+def test_a_STUCK_parked_residual_is_not_hidden_by_a_clean_current_removal():
+    """Fourth-pass finding: `deactivate()` replaced the residual list.
+
+    The parked-manager loop appended its failures, and the active-instrumentor
+    branch then did `residuals = list(instrumentor.residuals)` -- discarding
+    every one of them. So a parked manager that was still stuck vanished from
+    the report and lifecycle read `removed`, telling an operator the SDK was
+    pristine while our wrapper waited under someone else's.
+
+    Constructed with a parked manager that cannot discharge alongside a
+    current activation that removes cleanly.
+    """
+    import sys
+    import types
+
+    from tidewall_otel._manager import PatchManager
+
+    stuck_module = types.ModuleType("stuck_parked_sdk")
+    stuck_module.Target = type("Target", (), {"create": staticmethod(lambda: "orig")})
+    sys.modules["stuck_parked_sdk"] = stuck_module
+    try:
+        stuck = PatchManager()
+        stuck.install("stuck_parked_sdk", "Target.create", lambda w, i, a, k: w(*a, **k))
+        # Someone replaces it, so removal will decline forever.
+        stuck_module.Target.create = staticmethod(lambda: "foreign")
+        tidewall_otel._residual_managers.append(stuck)
+
+        # A current activation that removes cleanly.
+        tidewall_otel.activate()
+        tidewall_otel.deactivate()
+
+        assert tidewall_otel._residual_managers, (
+            "the stuck parked manager was dropped")
+        assert tidewall_otel.state().lifecycle == "residual", (
+            "a clean current removal reported `removed` while a parked "
+            "residual was still stuck")
+        assert any(event.reason == "not_removed"
+                   for event in tidewall_otel.state().events), (
+            "the parked residual was not reported at all")
+    finally:
+        tidewall_otel._residual_managers.clear()
+        sys.modules.pop("stuck_parked_sdk", None)

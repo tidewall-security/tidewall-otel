@@ -141,30 +141,10 @@ def activate(config: TidewallConfig | None = None) -> None:
 
     from tidewall_otel._instrumentor import TidewallInstrumentor
 
-    # PARK, do not drop. A previous deactivation may have retained an
-    # instrumentor because a foreign wrapper made removal decline.
-    # Overwriting it here destroyed the only route to that journal: when the
-    # foreign wrapper was later removed, our stale wrapper became live again
-    # with nothing able to remove it, and the new activation reported
-    # `installed`, hiding it.
-    #
-    # Retry first in case the conflict has cleared; park whatever still will
-    # not discharge. Blocking activation instead would let one stuck wrapper
-    # prevent guarding for the rest of the process, trading a stale layer for
-    # an unguarded one.
-    previous = _instrumentor_instance
-    if previous is not None:
-        previous_manager = getattr(previous, "_manager", None)
-        if previous_manager is not None and previous_manager.journal:
-            previous.retry_removal()
-            if previous_manager.journal and previous_manager not in _residual_managers:
-                _residual_managers.append(previous_manager)
-                logger.warning(
-                    "Tidewall is activating with %d undischarged journal "
-                    "entry(ies) from a previous deactivation; they are "
-                    "retried on the next deactivate()",
-                    len(previous_manager.journal),
-                )
+    # Parking a retained journal happens in `_instrument()`, not here: the
+    # documented `opentelemetry-instrument` entry point never calls this
+    # function, so logic placed here protects only the path under test. One
+    # place, reached by both callers.
 
     _instrumentor_instance = TidewallInstrumentor()
     _instrumentor_instance.instrument(config=config)
@@ -316,7 +296,12 @@ def deactivate() -> None:
         else:
             instrumentor.retry_removal()
 
-        residuals = list(getattr(instrumentor, "residuals", ()) or ())
+        # EXTEND. Assigning here threw away every parked residual collected
+        # above, so a still-stuck parked manager vanished from the report and
+        # lifecycle read `removed` while `_residual_managers` still held a
+        # live, retryable entry -- state claiming the SDK is pristine while
+        # our wrapper waits under someone else's.
+        residuals.extend(getattr(instrumentor, "residuals", ()) or ())
 
         # Hold the instance only while something is still undischarged, so a
         # later deactivate() can finish once the conflicting wrapper goes.
@@ -324,8 +309,13 @@ def deactivate() -> None:
         if manager is None or not manager.journal:
             _instrumentor_instance = None
 
-    _state = State(lifecycle="residual" if residuals else "removed",
-                   mode=_state.mode)
+    # Lifecycle from BOTH sources: this deactivation's outcomes AND anything
+    # still parked. A clean current removal alongside a stuck parked manager
+    # is not `removed`.
+    _state = State(
+        lifecycle="residual" if (residuals or _residual_managers) else "removed",
+        mode=_state.mode,
+    )
     for residual in residuals:
         surface, _, reason = residual.partition(": ")
         _state.record_unverified(surface, reason="not_removed", detail=reason)
