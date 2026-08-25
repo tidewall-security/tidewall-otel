@@ -601,3 +601,64 @@ def test_a_failure_mid_LATE_install_rolls_back_ONLY_that_modules_surfaces(
     assert manager.dispositions.get("fake_sdk") == "uncovered"
 
     manager.remove()
+
+
+def test_a_failed_REINSTALL_does_not_report_a_live_patch_as_uncovered(monkeypatch):
+    """Round 14's finding, recovered from a killed reviewer's log.
+
+    `install_for_module` rolls back only ITS call's entries -- earlier ones
+    are live coverage, not part of this transaction -- but then wrote
+    `uncovered` unconditionally. So after a reload, or any second pass over a
+    module already patched, the disposition said the boundary was unguarded
+    while it was demonstrably patched and still guarding.
+
+    That is the same defect this agent exists to prevent, pointing the other
+    way: state disagreeing with reality. Under-claiming is the safer
+    direction, but an operator reading `uncovered` for a guarded module still
+    acts on a false report.
+
+    `unverified` rather than `covered` for the partial case: some surfaces of
+    the module took and some did not, so the agent cannot vouch for the module
+    as a whole.
+    """
+    import sys
+    import types
+
+    module = types.ModuleType("reinstall_sdk")
+    module.Target = type("Target", (), {"create": staticmethod(lambda: "original")})
+    monkeypatch.setitem(sys.modules, "reinstall_sdk", module)
+
+    manager = PatchManager()
+    manager.register_surface("reinstall_sdk", "Target.create", wrapper_factory("first"))
+    manager.install_for_module("reinstall_sdk")
+
+    assert module.Target.create() == "first:original", "precondition: it patched"
+
+    # A second pass adds a surface that cannot resolve.
+    manager.register_surface("reinstall_sdk", "Target.absent", wrapper_factory("second"))
+    with pytest.raises(AttributeError):
+        manager.install_for_module("reinstall_sdk")
+
+    assert module.Target.create() == "first:original", (
+        "the scoped rollback undid an earlier call's live patch")
+    assert manager.dispositions["reinstall_sdk"] == "unverified", (
+        f"a live patch was reported as {manager.dispositions['reinstall_sdk']!r}")
+
+
+def test_a_failed_FIRST_install_is_still_reported_uncovered(monkeypatch):
+    """The other direction. If nothing of this module survived, `uncovered`
+    is the truthful answer and must not be softened to `unverified`."""
+    import sys
+    import types
+
+    module = types.ModuleType("firstfail_sdk")
+    module.Target = type("Target", (), {"create": staticmethod(lambda: "original")})
+    monkeypatch.setitem(sys.modules, "firstfail_sdk", module)
+
+    manager = PatchManager()
+    manager.register_surface("firstfail_sdk", "Target.absent", wrapper_factory("x"))
+    with pytest.raises(AttributeError):
+        manager.install_for_module("firstfail_sdk")
+
+    assert manager.dispositions["firstfail_sdk"] == "uncovered"
+    assert module.Target.create() == "original"

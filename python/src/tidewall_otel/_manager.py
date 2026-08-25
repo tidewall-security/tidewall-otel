@@ -190,12 +190,22 @@ class PatchManager:
             finally:
                 self.journal[mark:] = [entry for index, entry in enumerate(added)
                                        if index not in discharged]
-                # The exception still propagates to the importer and the
-                # finder does not mark the module patched, so the next import
-                # retries (and overwrites this on success). Until then the
-                # module's surfaces are unguarded, and the disposition map
-                # must say so rather than stay silent.
-                self.dispositions[module] = "uncovered"
+                # WHAT SURVIVED decides the disposition, not the fact that
+                # this call failed. The scoped rollback undoes only THIS
+                # call's entries, so an earlier successful install for the
+                # same module -- a reload, or a second pass over a module
+                # already patched -- is still live and still guarding. Writing
+                # "uncovered" unconditionally reported a boundary as unguarded
+                # while it was demonstrably patched and working, which is the
+                # state-lying-about-reality defect this agent exists to avoid,
+                # merely pointing the other way.
+                #
+                # "unverified" rather than "covered" for the partial case: some
+                # surfaces of this module took and some did not, so the agent
+                # cannot vouch for the module as a whole.
+                survives = any(entry.kind == "patch" and entry.module == module
+                               for entry in self.journal)
+                self.dispositions[module] = "unverified" if survives else "uncovered"
             raise
 
     # -- removal ----------------------------------------------------------
