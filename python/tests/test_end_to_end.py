@@ -381,3 +381,54 @@ def test_DRY_RUN_reaches_the_provider_and_NEVER_contacts_the_guard(
     assert state.mode == "dry-run"
     assert state.is_active() is False, (
         "dry-run must not claim to be enforcing -- it never asks the guard")
+
+
+def test_deactivate_RETRIES_through_the_public_api_after_a_conflict_clears():
+    """The retry must be reachable by the only API a caller has.
+
+    An earlier fix made `_uninstrument()` keep its manager when entries could
+    not be removed -- necessary, and not sufficient. Two barriers still stood
+    in front of the public path: `deactivate()` discarded
+    `_instrumentor_instance` regardless, and `BaseInstrumentor.uninstrument()`
+    gates on a flag the first deactivation clears, so a second call did
+    nothing at all.
+
+    The regression test for that fix called the PRIVATE `_uninstrument()`
+    twice and so walked past both barriers. It proved the manager retained
+    the entry and nothing about whether anyone could ever use it -- the same
+    defect as testing dispatch directly and never testing activation.
+    """
+    import inspect
+
+    import wrapt
+    from openai.resources.chat.completions.completions import Completions
+
+    pristine = inspect.getattr_static(Completions, "create")
+    try:
+        tidewall_otel.activate()
+
+        # Another agent wraps on top, so removal must decline.
+        wrapt.wrap_function_wrapper(
+            "openai.resources.chat.completions.completions", "Completions.create",
+            lambda wrapped, instance, args, kwargs: "foreign")
+        foreign = inspect.getattr_static(Completions, "create")
+
+        tidewall_otel.deactivate()
+
+        assert tidewall_otel._instrumentor_instance is not None, (
+            "the instrumentor was discarded, so no retry is possible")
+        assert inspect.getattr_static(Completions, "create") is foreign, (
+            "deactivation deleted a wrapper installed after ours")
+        assert tidewall_otel.state().lifecycle == "residual"
+
+        # The conflicting wrapper goes; the public API must finish the job.
+        Completions.create = foreign.__wrapped__
+        tidewall_otel.deactivate()
+
+        assert inspect.getattr_static(Completions, "create") is pristine, (
+            "the retry did not restore the original attribute")
+        assert tidewall_otel._instrumentor_instance is None, (
+            "a fully discharged instrumentor was retained")
+        assert tidewall_otel.state().lifecycle == "removed"
+    finally:
+        Completions.create = pristine

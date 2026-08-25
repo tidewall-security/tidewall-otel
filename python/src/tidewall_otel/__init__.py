@@ -257,9 +257,26 @@ def deactivate() -> None:
 
     residuals: list[str] = []
     if _instrumentor_instance:
-        _instrumentor_instance.uninstrument()
-        residuals = list(getattr(_instrumentor_instance, "residuals", ()) or ())
-        _instrumentor_instance = None
+        instrumentor = _instrumentor_instance
+
+        # The FIRST deactivation goes through the OTel gate; a retry cannot,
+        # because that gate has already fired. Discarding the instance here --
+        # or letting the gate swallow the second call -- left the manager's
+        # retained entries unreachable through the public API, which is the
+        # only API a caller has. The manager keeping them was necessary and
+        # not sufficient.
+        if getattr(instrumentor, "_is_instrumented_by_opentelemetry", False):
+            instrumentor.uninstrument()
+        else:
+            instrumentor.retry_removal()
+
+        residuals = list(getattr(instrumentor, "residuals", ()) or ())
+
+        # Hold the instance only while something is still undischarged, so a
+        # later deactivate() can finish once the conflicting wrapper goes.
+        manager = getattr(instrumentor, "_manager", None)
+        if manager is None or not manager.journal:
+            _instrumentor_instance = None
 
     _state = State(lifecycle="residual" if residuals else "removed",
                    mode=_state.mode)

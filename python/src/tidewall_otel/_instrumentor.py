@@ -312,6 +312,21 @@ class TidewallInstrumentor(BaseInstrumentor):
             config.mode, sorted(self._state.surfaces),
         )
 
+    def retry_removal(self) -> None:
+        """Re-run removal for entries an earlier deactivation could not undo.
+
+        `BaseInstrumentor.uninstrument()` gates on
+        `_is_instrumented_by_opentelemetry`, which the first deactivation
+        clears -- so the retry the manager supports stayed unreachable
+        through the normal path even after `deactivate()` stopped discarding
+        the instrumentor. This bypasses that gate deliberately: it is not a
+        second uninstrumentation, it is the completion of the first.
+
+        Idempotent. With an empty journal it removes nothing and reports
+        nothing.
+        """
+        self._uninstrument()
+
     def _uninstrument(self, **kwargs: Any) -> None:
         """Remove all applied patches and restore the original SDK methods."""
         # Patches installed through the PatchManager are ITS to remove: it
