@@ -14,6 +14,7 @@ import pytest
 from tests._fixtures import undefined_names_under
 
 TESTS = Path(__file__).resolve().parent
+SRC = Path(__file__).resolve().parents[1] / "src" / "tidewall_otel"
 
 
 def test_no_module_calls_an_UNDEFINED_name():
@@ -23,6 +24,28 @@ def test_no_module_calls_an_UNDEFINED_name():
     so the import discipline is checked rather than asserted.
     """
     problems = undefined_names_under(TESTS)
+    assert not problems, "\n".join(problems)
+
+
+def test_no_PRODUCTION_module_references_an_undefined_name():
+    """The same check, aimed at `src/` -- where it was never pointed.
+
+    Round 12's error handler referenced a `logger` that `_manager.py` never
+    defined, so the first exception on that branch would have raised
+    `NameError` out of the error path. It was invisible because no test
+    reached the branch, and coverage cannot help: an untested failure path is
+    exactly where this hides.
+
+    But the suite already owned the detector. `undefined_names_under` was
+    called only with `TESTS`, one directory away from the defect it would have
+    caught instantly -- reintroducing the missing binding makes pyflakes
+    report `undefined name 'logger'` at the handler.
+
+    Static analysis reaches branches tests do not, which is precisely why it
+    is worth running over production code and not only over the suite that
+    exercises it.
+    """
+    problems = undefined_names_under(SRC)
     assert not problems, "\n".join(problems)
 
 
