@@ -93,6 +93,17 @@ def test_every_declination_is_a_TidewallError(monkeypatch, label, guard,
         f"{label}: got {type(caught.value).__name__}, expected "
         f"{expected.__name__}")
 
+    # And the CONCRETE type must be publicly nameable. Catching it via the
+    # base class is not the whole contract: a caller who wants to tell "you
+    # sent something I cannot inspect" (fixable -- drop `extra_body`) from
+    # "the guard failed" (not fixable) has to name the narrower type, and
+    # cannot if it lives only in a private module. `LossyInputError` was
+    # exactly that case; nothing failed when it was un-exported, because
+    # every test caught it through `TidewallError`.
+    concrete = type(caught.value).__name__
+    assert concrete in tidewall_otel.__all__, (
+        f"{label}: callers receive {concrete}, which is not in __all__")
+
 
 def test_a_transport_failure_NEVER_escapes_as_a_GuardAPIError(monkeypatch):
     """The specific hazard, stated as its own test.
