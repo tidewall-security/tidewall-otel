@@ -746,32 +746,66 @@ def test_an_entry_appended_RE_ENTRANTLY_during_undo_survives_the_commit(module):
     assert manager.journal == []
 
 
-def test_an_UNRECOVERABLE_entry_leaves_the_journal_but_is_recorded(module):
-    """A vanished owner cannot be restored onto, so retrying is pure cost.
+def test_a_COLLECTED_owner_is_unrecoverable_and_recorded(module):
+    """The only PROVABLE irrecoverable condition: the owner is gone.
 
-    Retrying forever kept the manager alive and the public lifecycle at
-    `residual` for the life of the process while achieving nothing. Dropping
-    it silently would be the fail-open this manager exists to remove. So it
-    is classified, stops being retried, and is kept as a durable record.
+    An attribute can always be recreated, so a missing one proves nothing --
+    an earlier version used `hasattr` and so classified a live, retryable
+    wrapper as permanent whenever a foreign descriptor raised on class access
+    or a reload made the attribute briefly absent. An owner that has been
+    collected can never carry anything again, and nobody else can reach it
+    either.
+
+    NOTE ON REACHABILITY: in normal operation this cannot fire, because the
+    installed wrapper closure captures its owner strongly, so the weak
+    reference never dies. It is asserted here on a manufactured dead
+    reference. The classification is therefore correct but effectively
+    unreachable, which is recorded rather than hidden: boundedness of the
+    residual list does NOT come from it.
     """
+    import weakref
+
+    from tidewall_otel._manager import JournalEntry
+
     manager = PatchManager()
     manager.install(module.__name__, "Target.create", wrapper_factory("tw"))
 
-    # The attribute the entry describes ceases to exist on its owner.
-    del module.Target.create
+    class Doomed:
+        pass
+
+    doomed = Doomed()
+    entry = manager.journal[0]
+    entry.owner_ref = weakref.ref(doomed)
+    del doomed
 
     outcomes = manager.remove()
 
     assert outcomes[(module.__name__, "Target.create")] is RemovalOutcome.UNRECOVERABLE
-    assert manager.journal == [], (
-        "an entry nothing can discharge was kept for retry anyway")
+    assert manager.journal == [], "an entry nothing can discharge was kept"
     assert manager.permanent_residuals, "it was dropped without a record"
     assert "unrecoverable" in manager.permanent_residuals[0]
 
-    # And retrying does not resurrect or duplicate it.
     again = manager.remove()
     assert again == {}
     assert len(manager.permanent_residuals) == 1
+
+
+def test_a_MISSING_attribute_is_retryable_not_permanent(module):
+    """`hasattr` was wrong twice: it runs descriptor and metaclass code, and
+    turns any `AttributeError` into False. A foreign descriptor that raises on
+    class access while still delegating to our wrapper on instances was
+    classified permanent and stopped being retried -- with the wrapper live.
+    """
+    manager = PatchManager()
+    manager.install(module.__name__, "Target.create", wrapper_factory("tw"))
+
+    del module.Target.create            # absent now; recreatable later
+
+    outcomes = manager.remove()
+
+    assert outcomes[(module.__name__, "Target.create")] is not RemovalOutcome.UNRECOVERABLE
+    assert manager.journal, "a recreatable attribute was discharged permanently"
+    assert manager.permanent_residuals == []
 
 
 def test_a_NOT_OURS_entry_is_still_retained_for_retry(module):

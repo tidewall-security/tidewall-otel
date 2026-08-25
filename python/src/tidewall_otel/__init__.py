@@ -301,10 +301,23 @@ def deactivate() -> None:
         # retained entries unreachable through the public API, which is the
         # only API a caller has. The manager keeping them was necessary and
         # not sufficient.
+        # CAPTURE the manager first. `_uninstrument()` clears it once the
+        # journal empties, and unrecoverable entries empty the journal -- so
+        # reading `permanent_residuals` afterwards found nothing, and the
+        # "durable" record lasted exactly one call before a second
+        # `deactivate()` reported `removed`. On the real singleton path this
+        # is the only manager there is.
+        current_manager = getattr(instrumentor, "_manager", None)
+
         if getattr(instrumentor, "_is_instrumented_by_opentelemetry", False):
             instrumentor.uninstrument()
         else:
             instrumentor.retry_removal()
+
+        if current_manager is not None:
+            for record in current_manager.permanent_residuals:
+                if record not in _permanent_residuals:
+                    _permanent_residuals.append(record)
 
         # EXTEND. Assigning here threw away every parked residual collected
         # above, so a still-stuck parked manager vanished from the report and

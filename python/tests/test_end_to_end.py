@@ -600,3 +600,61 @@ def test_a_STUCK_parked_residual_is_not_hidden_by_a_clean_current_removal():
     finally:
         tidewall_otel._residual_managers.clear()
         sys.modules.pop("stuck_parked_sdk", None)
+
+
+def test_a_PERMANENT_residual_survives_repeated_deactivation():
+    """Finding: the durable record lasted exactly one call.
+
+    `_uninstrument()` clears its manager once the journal empties, and
+    unrecoverable entries empty it -- so `deactivate()` read
+    `permanent_residuals` from a manager that was already gone. The first
+    call reported the outcome, the instrumentor was dropped, and a second
+    `deactivate()` built a fresh state reporting `removed`, contradicting the
+    claim that the record is durable.
+
+    On the real `BaseInstrumentor` singleton this is the only manager there
+    is, so the record has to be copied out before either reference is cleared.
+    """
+    import weakref
+
+    from tidewall_otel._manager import PatchManager
+
+    manager = PatchManager()
+    import sys
+    import types
+
+    victim = types.ModuleType("perm_sdk")
+    victim.Target = type("Target", (), {"create": staticmethod(lambda: "orig")})
+    sys.modules["perm_sdk"] = victim
+    try:
+        manager.install("perm_sdk", "Target.create", lambda w, i, a, k: w(*a, **k))
+
+        class Doomed:
+            pass
+
+        doomed = Doomed()
+        manager.journal[0].owner_ref = weakref.ref(doomed)
+        del doomed
+
+        tidewall_otel._residual_managers.append(manager)
+        tidewall_otel.deactivate()
+
+        assert tidewall_otel._permanent_residuals, "the record was never captured"
+        first = list(tidewall_otel._permanent_residuals)
+        assert any(event.reason == "unrecoverable"
+                   for event in tidewall_otel.state().events), (
+            "the permanent residual was not reported to the caller")
+
+        # A SECOND deactivation must still report it.
+        tidewall_otel.deactivate()
+
+        assert tidewall_otel._permanent_residuals == first, (
+            "the durable record did not survive a second deactivation")
+        assert any(event.reason == "unrecoverable"
+                   for event in tidewall_otel.state().events), (
+            "a second deactivation reported a clean state over a permanent "
+            "residual")
+    finally:
+        tidewall_otel._permanent_residuals.clear()
+        tidewall_otel._residual_managers.clear()
+        sys.modules.pop("perm_sdk", None)

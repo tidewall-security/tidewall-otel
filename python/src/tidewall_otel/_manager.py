@@ -31,11 +31,16 @@ import importlib.abc
 import importlib.machinery
 import inspect
 import sys
+import weakref
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable
 
 
 logger = logging.getLogger("tidewall.otel.manager")
+
+
+#: Sentinel for "no such attribute", distinguishable from a stored None.
+_MISSING = object()
 
 
 class RemovalOutcome(enum.Enum):
@@ -64,13 +69,17 @@ class JournalEntry:
     pre_install_identity: Any = None
     installed: Any = None
     finder: Any = None
-    #: The object we patched -- the class or module itself, held directly.
-    #: Removal used to re-resolve it from `module`/`attribute`, which imports
-    #: the module if it has left `sys.modules`; that can yield a DIFFERENT
-    #: module instance whose attribute can never match `installed`, so the
-    #: entry looked foreign forever. Holding the owner removes both the
-    #: re-import and the ambiguity.
-    owner: Any = None
+    #: A WEAK reference to the object we patched. Removal used to re-resolve
+    #: it from `module`/`attribute`, which imports the module if it has left
+    #: `sys.modules` and can yield a DIFFERENT instance whose attribute can
+    #: never match `installed` -- so the entry looked foreign forever.
+    #:
+    #: Weak, not strong: a strong reference would keep the class or module
+    #: alive for the life of the process, and it is also what makes
+    #: irrecoverability PROVABLE. An attribute can always be recreated, so a
+    #: missing one proves nothing; an owner that has been collected can never
+    #: carry anything again, and nobody else can reach it either.
+    owner_ref: Any = None
     #: Stable identity, assigned once at append. Discharge is by THIS, never
     #: by position: resolving or writing an attribute can run arbitrary
     #: import, descriptor or metaclass code that re-enters the manager and
@@ -79,6 +88,29 @@ class JournalEntry:
     #: making it unremovable. Positions are valid only under a no-reentrancy
     #: invariant these operations do not satisfy.
     seq: int = -1
+
+
+def _weak(owner: Any) -> Any:
+    """A weak reference to `owner`, or the object itself if it cannot take one.
+
+    Some objects (a few C types) do not support weak references. Holding them
+    strongly is the safe fallback: it costs a reference for the life of the
+    process, and it means `_owner_of` can never report them collected, so
+    their entries stay retryable rather than being classified permanent on a
+    technicality.
+    """
+    try:
+        return weakref.ref(owner)
+    except TypeError:
+        return owner
+
+
+def _owner_of(entry: "JournalEntry") -> Any:
+    """The live owner, or None if it has been collected."""
+    ref = entry.owner_ref
+    if ref is None:
+        return None
+    return ref() if isinstance(ref, weakref.ref) else ref
 
 
 def _resolve_owner(module_name: str, attribute: str) -> tuple[Any, str]:
@@ -180,7 +212,8 @@ class PatchManager:
         self._write(owner, name, installed)
         self._journal(JournalEntry(
             kind="patch", module=module, attribute=attribute,
-            pre_install_identity=before, installed=installed, owner=owner,
+            pre_install_identity=before, installed=installed,
+            owner_ref=_weak(owner),
         ))
         return installed
 
@@ -255,19 +288,29 @@ class PatchManager:
     # -- removal ----------------------------------------------------------
 
     def _restore(self, entry: JournalEntry) -> RemovalOutcome:
-        owner = entry.owner
         name = entry.attribute.split(".")[-1]
+        owner = _owner_of(entry)
 
-        if owner is None:                       # pre-`owner` entry, or a finder
-            owner, name = _resolve_owner(entry.module, entry.attribute)
-
-        # UNRECOVERABLE, not errored. If the attribute is no longer present on
-        # the owner at all, there is nothing to compare and nothing to restore
-        # onto. No later call can change that, so retrying is pure cost.
-        if not hasattr(owner, name):
+        if owner is None and entry.owner_ref is not None:
+            # PROVABLY irrecoverable: the class or module we patched has been
+            # collected, so nothing can ever carry the attribute again and
+            # nobody else can reach it either.
             return RemovalOutcome.UNRECOVERABLE
 
-        current = self._identity(owner, name)
+        if owner is None:                       # pre-`owner_ref` entry
+            owner, name = _resolve_owner(entry.module, entry.attribute)
+
+        # A MISSING attribute is NOT irrecoverable. `hasattr` was used here
+        # and is wrong twice over: it invokes descriptor and metaclass code
+        # and turns any `AttributeError` into False, so a foreign descriptor
+        # that raises on class access while still delegating to our wrapper on
+        # instances was classified permanent and stopped being retried -- with
+        # the wrapper still live. A module reload makes an attribute briefly
+        # absent for the same false positive. Attributes can always be
+        # recreated, so absence proves nothing; retaining is the safe answer.
+        current = inspect.getattr_static(owner, name, _MISSING)
+        if current is _MISSING:
+            return RemovalOutcome.ERRORED
 
         if current is not entry.installed:
             # Something replaced our wrapper. Restoring would delete it.
