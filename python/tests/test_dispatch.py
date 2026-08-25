@@ -20,10 +20,15 @@ from tidewall_otel._execution import BoundedExecutor, ExecutorSaturated
 from tidewall_otel._http import GuardSchemaInvalid, GuardTimeout, GuardUnreachable
 from tidewall_otel._manifest import ANTHROPIC_MESSAGES_SYNC, OPENAI_CHAT_SYNC
 from tidewall_otel._response import Outcome
+import tidewall_otel._dispatch as _dispatch_module
+from tidewall_otel._dispatch import _EXCEPTION_OUTCOMES, _FAILURES
 from tidewall_otel._state import State
 
-FAILURE_KINDS = ["unreachable", "timeout", "saturated", "schema_invalid",
-                 "invariant_violated"]
+#: DERIVED from production, not retyped. The hand-written copy had ALREADY
+#: drifted -- it omitted "incomplete", so removing that kind from `_FAILURES`
+#: left both dispatch suites green. A second copy of a set is a copy that can
+#: disagree, and this one did.
+FAILURE_KINDS = sorted(_FAILURES)
 
 
 @pytest.fixture
@@ -403,3 +408,28 @@ def test_a_transform_is_NOT_APPLIED_outside_enforce(monkeypatch, executor, mode)
     assert kwargs["messages"][0]["content"] == "ORIGINAL", (
         f"{mode} rewrote the request it was only meant to observe"
     )
+
+
+def test_every_FAILURE_KIND_can_actually_be_produced():
+    """A failure kind nothing emits is a protection that is not operating.
+
+    `_FAILURES` carried "incomplete", which no code path constructs. The
+    dispatch tests retyped the set by hand and omitted it, so the dead entry
+    was invisible from both sides -- the test list looked like it had drifted
+    from production when production had drifted from reality.
+
+    Derived by scanning the source for constructed kinds, so a kind added to
+    `_FAILURES` without a producer fails here rather than sitting inert.
+    """
+    import pathlib
+    import re
+
+    src = pathlib.Path(_dispatch_module.__file__).parent
+    produced = set()
+    for path in src.glob("*.py"):
+        produced |= set(re.findall(r'kind=["\']([a-z_]+)["\']', path.read_text()))
+    produced |= set(_EXCEPTION_OUTCOMES.values())
+
+    unproducible = _FAILURES - produced
+    assert not unproducible, (
+        f"failure kinds nothing can emit: {sorted(unproducible)}")

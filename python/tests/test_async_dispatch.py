@@ -183,9 +183,52 @@ def test_all_four_factories_accept_the_executor():
         make_openai_sync_wrapper,
     )
 
-    for factory in (make_openai_sync_wrapper, make_openai_async_wrapper,
-                    make_anthropic_sync_wrapper, make_anthropic_async_wrapper):
-        assert "executor" in inspect.signature(factory).parameters, factory.__name__
+    factories = {
+        "openai_sync": (make_openai_sync_wrapper, "_openai_wrapper", "dispatch_sync"),
+        "openai_async": (make_openai_async_wrapper, "_openai_wrapper", "dispatch_async"),
+        "anthropic_sync": (make_anthropic_sync_wrapper, "_anthropic_wrapper", "dispatch_sync"),
+        "anthropic_async": (make_anthropic_async_wrapper, "_anthropic_wrapper", "dispatch_async"),
+    }
+
+    for name, (factory, _module, _dispatch) in factories.items():
+        assert "executor" in inspect.signature(factory).parameters, name
+
+    # The signature check above is SPELLING. This is WIRING: keeping the
+    # parameter and passing `None` to dispatch left the old assertion green --
+    # the executor accepted and discarded, which is exactly the defect that
+    # made every enforce call an invariant violation in round 1.
+    import asyncio
+    import importlib
+
+    sentinel = object()
+    for name, (factory, module_name, dispatch_name) in factories.items():
+        module = importlib.import_module(f"tidewall_otel.{module_name}")
+        original = getattr(module, dispatch_name)
+        received = []
+
+        def record(*args, **kwargs):
+            # positional: surface, wrapped, instance, args, kwargs, config,
+            #             guard, executor
+            received.append(args[7] if len(args) > 7 else kwargs.get("executor"))
+            return None
+
+        async def record_async(*args, **kwargs):
+            record(*args, **kwargs)
+            return None
+
+        setattr(module, dispatch_name,
+                record_async if dispatch_name.endswith("async") else record)
+        try:
+            wrapper = factory(object(), object(), sentinel, object())
+            result = wrapper(lambda **kw: None, None, (), {})
+            if inspect.iscoroutine(result):
+                asyncio.run(result)
+        finally:
+            setattr(module, dispatch_name, original)
+
+        assert received == [sentinel], (
+            f"{name} did not pass its executor through to {dispatch_name}: "
+            f"{received}")
 
 
 def test_the_SYNC_wrappers_route_through_dispatch(monkeypatch, config, executor):

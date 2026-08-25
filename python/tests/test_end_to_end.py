@@ -349,3 +349,35 @@ def test_deactivation_that_could_NOT_remove_reports_residual_not_removed(monkeyp
     tidewall_otel.activate()
     tidewall_otel.deactivate()
     assert tidewall_otel.state().lifecycle == "removed"
+
+
+def test_DRY_RUN_reaches_the_provider_and_NEVER_contacts_the_guard(
+        monkeypatch, guard_says, provider):
+    """Round 10's most serious finding: there was no activated dry-run test.
+
+    Changing `config.mode` from `dry-run` to `monitor` immediately before
+    dispatch -- which makes an activated dry-run call contact the guard, in
+    direct violation of the documented mode contract -- left 139 tests green
+    across end-to-end, activation, mode-policy, both dispatch suites and state.
+
+    The monitor path had such a test; the mode whose entire promise is "no
+    guard call" did not. A mode contract nothing exercises is a comment.
+    """
+    monkeypatch.setenv("TIDEWALL_MODE", "dry-run")
+    asked = guard_says(CLEAN)
+    client, reached = provider
+
+    tidewall_otel.activate()
+    result = client.chat.completions.create(
+        model="gpt-4o", messages=[{"role": "user", "content": "hi"}])
+
+    assert asked == [], (
+        f"dry-run contacted the guard {len(asked)} time(s); its whole "
+        f"contract is that it does not")
+    assert len(reached) == 1, "dry-run did not reach the provider"
+    assert result.choices[0].message.content == "ok"
+
+    state = tidewall_otel.state()
+    assert state.mode == "dry-run"
+    assert state.is_active() is False, (
+        "dry-run must not claim to be enforcing -- it never asks the guard")

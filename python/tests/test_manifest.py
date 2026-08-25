@@ -44,11 +44,35 @@ def test_every_currently_patched_method_is_in_the_manifest():
     """Anything patched and unlisted is a boundary with no contract."""
     from tidewall_otel._instrumentor import _ANTHROPIC_MODULE, _OPENAI_MODULE
 
-    listed = {(s.module, s.attribute) for s in SURFACES}
-    assert (_OPENAI_MODULE, "Completions.create") in listed
-    assert (_OPENAI_MODULE, "AsyncCompletions.create") in listed
-    assert (_ANTHROPIC_MODULE, "Messages.create") in listed
-    assert (_ANTHROPIC_MODULE, "AsyncMessages.create") in listed
+    # DERIVE what activation actually patches and compare the whole set.
+    # Naming four members cannot detect a FIFTH: adding
+    # `(_OPENAI_MODULE, "Completions.stream", ...)` to the install specs left
+    # this test green while a boundary with no contract was patched -- which
+    # is exactly what its docstring says it prevents.
+    import tidewall_otel._instrumentor as instrumentor_module
+    from tidewall_otel._config import TidewallConfig
+    from tidewall_otel._manager import PatchManager
+
+    installed: list[tuple[str, str]] = []
+    real_install_all = PatchManager.install_all
+
+    def record(self, specs, *args, **kwargs):
+        installed.extend((module, attribute) for module, attribute, _ in specs)
+        return real_install_all(self, specs, *args, **kwargs)
+
+    instrumentor = instrumentor_module.TidewallInstrumentor()
+    PatchManager.install_all = record
+    try:
+        instrumentor._instrument(config=TidewallConfig(
+            base_url="https://guard.example", token="t"))
+    finally:
+        PatchManager.install_all = real_install_all
+        instrumentor._uninstrument()
+
+    listed = {(surface.module, surface.attribute) for surface in SURFACES}
+    assert installed, "activation patched nothing, so this proves nothing"
+    assert set(installed) <= listed, (
+        f"patched but unlisted: {sorted(set(installed) - listed)}")
 
 
 def test_every_entry_declares_a_complete_contract():
@@ -498,7 +522,11 @@ def test_the_anthropic_write_back_tolerates_an_empty_list():
 def test_the_openai_write_back_replaces_only_messages():
     kwargs = {"messages": [{"role": "user", "content": "old"}],
               "model": "gpt-4o", "temperature": 0.2, "seed": 7}
-    out = OPENAI_CHAT_SYNC.transform_into(
-        kwargs, [{"role": "user", "content": "clean"}])
-    assert out["messages"][0]["content"] == "clean"
-    assert out["temperature"] == 0.2 and out["seed"] == 7 and out["model"] == "gpt-4o"
+    guard_messages = [{"role": "user", "content": "clean"}]
+    out = OPENAI_CHAT_SYNC.transform_into(kwargs, guard_messages)
+
+    # WHOLE OBJECT. Checking `messages[0]` plus three named kwargs let a
+    # write-back that APPENDED a fabricated assistant message pass -- the
+    # first message was right and every named kwarg survived, and the test
+    # never looked at what else was in the list.
+    assert out == {**kwargs, "messages": guard_messages}

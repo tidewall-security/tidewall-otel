@@ -123,9 +123,19 @@ class Refuse:
 Decision = Proceed | Transform | Refuse
 
 #: Outcomes that are guard FAILURES rather than verdicts.
+#: NO "incomplete". Nothing in this package ever constructs an Outcome with
+#: that kind -- the producible set is blocked/clean/degraded/transformed/lossy
+#: /schema_invalid/invariant_violated plus unreachable/timeout/saturated from
+#: `_EXCEPTION_OUTCOMES`. A member that cannot occur implies a protection that
+#: is not operating, which is the same reasoning that removed the dead
+#: bool-masquerading-as-int guard from `_response.py`.
+#:
+#: Its presence was invisible because the dispatch tests retyped this set by
+#: hand and omitted it. Deriving the test cases from here surfaced it
+#: immediately: four tests failed on a kind no code can emit.
 _FAILURES = frozenset({
     "unreachable", "timeout", "saturated", "schema_invalid",
-    "invariant_violated", "incomplete",
+    "invariant_violated",
 })
 
 
