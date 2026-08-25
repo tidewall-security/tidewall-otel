@@ -321,6 +321,16 @@ def test_the_README_exception_name_is_REACHABLE():
     assert not unreachable, (
         f"README documents unreachable names: {unreachable}")
 
+    # `hasattr` is NOT the whole claim, and a mutation proved it: dropping the
+    # name from `__all__` while leaving the module-level import still satisfies
+    # it. But `__all__` IS the declared public API -- it is what
+    # `from tidewall_otel import *` honours and what type checkers and doc
+    # tools read -- so a documented name absent from it is documented as
+    # public while declared private.
+    undeclared = sorted(n for n in documented if n not in tidewall_otel.__all__)
+    assert not undeclared, (
+        f"README documents names missing from __all__: {undeclared}")
+
 
 def test_every_public_exception_is_a_TidewallError():
     """One `except` clause must cover every way Tidewall declines a call.
