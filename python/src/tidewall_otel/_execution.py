@@ -22,7 +22,6 @@ from __future__ import annotations
 import asyncio
 import os
 import threading
-import weakref
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Callable
 
@@ -45,7 +44,6 @@ class BoundedExecutor:
         self._inflight = 0
         # Admitted futures, for `outstanding()`. Held weakly so a completed
         # future is not kept alive by this set alone.
-        self._admitted: weakref.WeakSet[Future] = weakref.WeakSet()
         self._shutdown = False
         self._pool: ThreadPoolExecutor | None = ThreadPoolExecutor(
             max_workers=max_workers
@@ -60,7 +58,6 @@ class BoundedExecutor:
         # A lock held by a thread that does not exist in the child would
         # deadlock the first acquire. Re-create it, do not inherit it.
         self._lock = threading.Lock()
-        self._admitted = weakref.WeakSet()   # the parent's futures are gone
         self._inflight = 0
         if self._shutdown:
             # DO NOT REVIVE. Rebuilding unconditionally would give the child a
@@ -126,9 +123,18 @@ class BoundedExecutor:
         Exists so a test can prove cancelled work stays bounded and drains,
         which is the achievable property: a future that has started running
         cannot be cancelled, so it cannot reach zero immediately.
+
+        Reads `_inflight`, NOT the admitted set. `_inflight` is incremented
+        inside `_acquire`'s lock BEFORE the job is submitted and decremented by
+        the future's done-callback, so it is exactly "admitted and not
+        finished" at every instant. The admitted set was populated AFTER
+        `pool.submit()` returned, leaving a window in which a job was holding
+        capacity and already running while `outstanding()` reported zero --
+        a false drain, in the one observable used to prove that cancelled and
+        timed-out work stays bounded.
         """
         with self._lock:
-            return sum(1 for future in self._admitted if not future.done())
+            return self._inflight
 
     # -- submission --------------------------------------------------------
 
@@ -145,9 +151,6 @@ class BoundedExecutor:
         self._acquire()
         try:
             future = pool.submit(fn, *args, **kwargs)
-            # REQUIRED by `outstanding()`: without this the count is always
-            # zero and every bounded/drains assertion observes nothing.
-            self._admitted.add(future)
         except BaseException:
             # The releasing callback is attached below, so a raising submit
             # would otherwise consume this slot permanently.

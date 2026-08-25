@@ -268,3 +268,64 @@ def test_a_refused_post_shutdown_submit_does_NOT_leak_capacity():
 
     assert executor.outstanding() == 0
     assert executor._inflight == 0, "a refused submit consumed a slot"
+
+
+def test_outstanding_NEVER_reports_zero_while_a_job_holds_capacity():
+    """Round 11's P1. A false drain in the one observable that proves draining.
+
+    `submit_nowait` incremented `_inflight` under the admission lock and then
+    added the future to a separate admitted-set AFTER `pool.submit()` returned.
+    `outstanding()` counted that set, so between those two points a job was
+    holding capacity and already running while `outstanding()` reported zero.
+
+    Every "cancelled work stays bounded and drains" assertion rests on this
+    number, so a false zero makes those tests pass over exactly the state they
+    exist to reject.
+
+    Driven deterministically: the worker blocks, so the job is unambiguously
+    admitted and running when the count is taken.
+    """
+    executor = BoundedExecutor(max_workers=1, queue_size=0)
+    running = threading.Event()
+    release = threading.Event()
+
+    def job():
+        running.set()
+        assert release.wait(5), "the job was never released"
+        return "done"
+
+    future = executor.submit_nowait(job)
+    try:
+        assert running.wait(5), "the job never started"
+        assert executor.outstanding() == 1, (
+            "a running job that holds capacity was reported as no work")
+    finally:
+        release.set()
+        future.result(timeout=5)
+        executor.shutdown()
+
+    assert executor.outstanding() == 0, "a finished job still counts"
+
+
+def test_outstanding_AGREES_with_capacity_at_saturation():
+    """The counter and the admission gate must be the same number.
+
+    Two sources of truth for "how much work is in flight" is how one of them
+    reports zero while the other refuses new work.
+    """
+    executor = BoundedExecutor(max_workers=1, queue_size=0)
+    release = threading.Event()
+
+    submitted = executor.submit_nowait(release.wait, 5)
+    try:
+        assert executor.outstanding() == executor._inflight == 1
+
+        with pytest.raises(ExecutorSaturated):
+            executor.submit_nowait(lambda: None)
+
+        assert executor.outstanding() == 1, (
+            "a refused submission changed the outstanding count")
+    finally:
+        release.set()
+        submitted.result(timeout=5)
+        executor.shutdown()
