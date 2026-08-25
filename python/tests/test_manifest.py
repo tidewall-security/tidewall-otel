@@ -481,8 +481,13 @@ def test_the_anthropic_write_back_KEEPS_every_message_when_there_is_no_system():
 
     out = ANTHROPIC_MESSAGES_SYNC.transform_into(kwargs, guard_messages)
     assert "system" not in out
-    assert len(out["messages"]) == 2, "a message was dropped"
-    assert out["messages"][0]["content"] == "first"
+
+    # DERIVED from what was supplied. Asserting `len(...) == 2` and then
+    # member [0] checks cardinality and one element -- a write-back that
+    # corrupted every message after the first passed exactly that pair of
+    # assertions under a name promising EVERY message.
+    assert out["messages"] == guard_messages, (
+        f"the write-back did not preserve every message: {out['messages']}")
 
 
 def test_the_anthropic_write_back_tolerates_an_empty_list():

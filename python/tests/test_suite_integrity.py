@@ -482,18 +482,46 @@ def _universal_claims_without_universal_bodies(tree):
                                ast.GeneratorExp))
             for inner in ast.walk(node)
         )
+        # SUBSET comparisons only. `in` / `not in` test ONE element's
+        # membership, which is not a universal -- treating them as one
+        # exempted `assert "system" not in out` and so walked past a test that
+        # checked `len(...) == 2` and then asserted member [0].
         compares_collections = any(
             isinstance(inner, ast.Compare)
-            and any(isinstance(op, (ast.LtE, ast.GtE, ast.In, ast.NotIn))
-                    for op in inner.ops)
+            and any(isinstance(op, (ast.LtE, ast.GtE)) for op in inner.ops)
+            for inner in ast.walk(node)
+        )
+        # Wholesale equality between two NON-CONSTANT operands compares the
+        # objects entire: `out["messages"] == guard_messages` is the strongest
+        # universal available and contains no loop at all. Distinguished from
+        # `out["model"] == "claude-x"` -- a single member against a literal --
+        # by requiring neither side to be a constant.
+        compares_objects = any(
+            isinstance(inner, ast.Compare)
+            and any(isinstance(op, ast.Eq) for op in inner.ops)
+            and not isinstance(inner.left, ast.Constant)
+            and not any(isinstance(c, ast.Constant) for c in inner.comparators)
+            for inner in ast.walk(node)
+        )
+        # Set arithmetic derives a set: `accepted - documented` is the whole
+        # claim, and reads nothing like a loop.
+        derives_a_set = any(
+            isinstance(inner, ast.BinOp)
+            and isinstance(inner.op, (ast.Sub, ast.BitAnd, ast.BitOr, ast.BitXor))
             for inner in ast.walk(node)
         )
         calls_any_or_all = any(
             isinstance(inner, ast.Call) and isinstance(inner.func, ast.Name)
-            and inner.func.id in {"all", "any", "set", "sorted", "len"}
+            # NOT `len` and NOT `sorted`. "assert len(x) == 2" followed by
+            # "assert x[0] == ..." is the defect, not a defence against it --
+            # round 9 found exactly that shape, and this exemption is why the
+            # first version of this detector walked straight past it. Checking
+            # cardinality is not checking members.
+            and inner.func.id in {"all", "any", "set", "frozenset"}
             for inner in ast.walk(node)
         )
-        if not (iterates or compares_collections or calls_any_or_all):
+        if not (iterates or compares_collections or compares_objects
+                or derives_a_set or calls_any_or_all):
             yield node.lineno, node.name
 
 
