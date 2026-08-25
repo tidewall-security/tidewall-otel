@@ -169,10 +169,34 @@ def test_the_token_is_absent_from_EVERY_public_rendering(monkeypatch):
         "deepcopy-dict": repr(copy.deepcopy(config).__dict__),
         "token-repr": repr(config.token),
         "token-str": str(config.token),
+        # NON-EMPTY format specs, on the field and on the container. The
+        # previous version used only `f"{config}"` and `"{}".format(config)`,
+        # both of which are the EMPTY spec -- so a `__format__` honouring a
+        # spec by returning the raw value would have passed a test calling
+        # itself EVERY rendering. Seventh quantifier defect of the session.
+        "token-format-align": format(config.token, ">40"),
+        "token-format-width": format(config.token, "50"),
+        "token-format-fill": format(config.token, "*^60"),
+        "token-fstring-spec": f"{config.token:>40}",
+        "token-fstring-str": f"{config.token!s}",
+        "token-fstring-repr": f"{config.token!r}",
     }
     leaked = sorted(name for name, text in renderings.items()
                     if "SUPERSECRET" in text)
     assert not leaked, f"the token leaked through: {leaked}"
+
+    # Routes that RAISE are covered too, because an exception is a rendering:
+    # its message and traceback are exactly what gets logged. `TidewallConfig`
+    # has no `__format__`, so a non-empty spec raises -- standard behaviour for
+    # any object, and not a leak, but only if the message stays clean.
+    for spec in (">200", "50", "*^60"):
+        for subject, label in ((config, "config"), (config.token, "token")):
+            try:
+                rendered = format(subject, spec)
+            except Exception as exc:              # noqa: BLE001 -- the point
+                rendered = f"{type(exc).__name__}: {exc}"
+            assert "SUPERSECRET" not in rendered, (
+                f"{label} leaked through format(..., {spec!r}): {rendered}")
 
     assert config.token.reveal() == "sk-SUPERSECRET-do-not-print", (
         "the value must still be retrievable by name")

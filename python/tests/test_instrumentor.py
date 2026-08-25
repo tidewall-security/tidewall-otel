@@ -331,7 +331,29 @@ def test_a_FAILED_finder_install_is_reported_as_uncovered(monkeypatch):
     tidewall_otel.activate()
     state = tidewall_otel.state()
 
-    assert state.surfaces.get("Messages.create") == "uncovered", state.surfaces
+    # DERIVE the expectation, do not name one surface. Anthropic contributes
+    # two boundaries here; asserting only `Messages.create` let a mutation
+    # narrowing the production loop to `attributes[:1]` pass, so the test
+    # named as the finder-failure guarantee did not hold the universal
+    # requirement in its own docstring. Eighth quantifier defect of the
+    # session, and the second in a test I wrote to close one.
+    from tidewall_otel._manifest import SURFACES
+
+    deferred = {surface.attribute for surface in SURFACES
+                if "anthropic" in surface.module}
+    assert len(deferred) > 1, (
+        "this test needs a provider with MORE than one surface to be able to "
+        "distinguish 'all' from 'the first'")
+
+    uncovered = {name for name, disposition in state.surfaces.items()
+                 if disposition == "uncovered"}
+    assert deferred <= uncovered, (
+        f"deferred surfaces not marked uncovered: {sorted(deferred - uncovered)}")
+
+    reported = {event.surface for event in state.events
+                if event.reason == "finder_not_installed"}
+    assert deferred <= reported, (
+        f"deferred surfaces with no event: {sorted(deferred - reported)}")
+
     assert state.is_active() is False, (
         "reported active while knowing a boundary can never be patched")
-    assert any(event.reason == "finder_not_installed" for event in state.events)

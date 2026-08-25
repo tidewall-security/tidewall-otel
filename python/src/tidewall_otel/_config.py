@@ -93,6 +93,18 @@ class Secret:
 
     __str__ = __repr__
 
+    def __format__(self, spec: str) -> str:
+        """Redacted for EVERY format spec, not just the empty one.
+
+        Without this, `object.__format__` raises `TypeError` on any non-empty
+        spec -- so `f"{config.token:>20}"` in a log line crashes instead of
+        redacting, and any future `__format__` that honoured the spec by
+        returning the raw value would disclose the credential through a route
+        nothing tested. Formatting the REDACTED text closes both: the spec is
+        honoured, and there is no branch in which the value can be reached.
+        """
+        return format(str(self), spec)
+
 
 @dataclass
 class TidewallConfig:
