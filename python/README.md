@@ -105,6 +105,20 @@ For each instrumented call, the agent:
    - `transformed` → swaps the messages with the guard's redacted
      version before passing them to the provider.
    - clean → no change.
+
+   Two cases never reach step 3 at all, and both raise
+   `tidewall_otel.TidewallRefusedError` in `enforce` mode before either the
+   guard or the provider is contacted:
+
+   - the call carries something the agent cannot represent losslessly for
+     the guard — `extra_body`, or an argument shape outside the manifest.
+     The guard is not asked about a body it was not shown.
+   - the guard could not be reached, timed out, or answered with something
+     that does not match its response schema.
+
+   Every exception above is a `tidewall_otel.TidewallError`, so one
+   `except tidewall_otel.TidewallError` covers every way the agent can
+   decline a call.
 5. Opens a `gen_ai.chat` OTel span with `gen_ai.*` attributes, runs
    the (possibly transformed) call inside the span, and records the
    response.

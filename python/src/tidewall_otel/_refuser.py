@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from ._exceptions import TidewallError
 from ._manifest import Surface
 
 #: Marks a callable as one of ours. The patch manager may remove its own
@@ -28,8 +29,16 @@ from ._manifest import Surface
 _REFUSER_MARKER = "__tidewall_refuser__"
 
 
-class TidewallActivationRefusedError(RuntimeError):
-    """Raised in place of a provider call the agent cannot vouch for."""
+class TidewallActivationRefusedError(TidewallError):
+    """Raised in place of a provider call the agent cannot vouch for.
+
+    A `TidewallError`, NOT a bare `RuntimeError`. Under
+    ``TIDEWALL_ON_ACTIVATION_FAILURE=block`` this is raised for EVERY call, so
+    an application that carefully wraps its AI calls in `except TidewallError`
+    would have missed all of them and crashed on an exception it had no reason
+    to expect -- the failure mode the block policy exists to prevent, arriving
+    in a shape the caller cannot handle.
+    """
 
 
 def _message(surface: Surface, reason: str) -> str:

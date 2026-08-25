@@ -38,10 +38,34 @@ from tidewall_otel._exceptions import TidewallConfigError
 from tidewall_otel._manifest import SURFACES
 from typing import Any
 
+from tidewall_otel._exceptions import (
+    TidewallBlockedError,
+    TidewallConfigError,
+    TidewallError,
+    TidewallRefusedError,
+)
+from tidewall_otel._refuser import TidewallActivationRefusedError
 from tidewall_otel._state import State
 
 __version__ = "0.1.0"
-__all__ = ["activate", "deactivate", "is_active", "TidewallConfig"]
+__all__ = [
+    "activate",
+    "deactivate",
+    "is_active",
+    "state",
+    "TidewallConfig",
+    # The exception surface. Documented in the README as
+    # `tidewall_otel.TidewallBlockedError`, and reachable at no public name at
+    # all until 2026-08-25: an application following the README got an
+    # AttributeError, and the only way to catch a block was to import from a
+    # PRIVATE module. A library whose primary exception has no public name has
+    # no usable error contract.
+    "TidewallError",
+    "TidewallBlockedError",
+    "TidewallRefusedError",
+    "TidewallConfigError",
+    "TidewallActivationRefusedError",
+]
 
 logger = logging.getLogger("tidewall.otel")
 

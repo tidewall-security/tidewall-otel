@@ -23,25 +23,10 @@ from typing import Any, Callable, Protocol
 from ._bound import bound_nodes
 from ._coverage import classify_input
 from ._execution import DeadlineExceeded, ExecutorSaturated
-from ._exceptions import TidewallBlockedError, TidewallError
+from ._exceptions import TidewallRefusedError, TidewallBlockedError, TidewallError
 from ._http import GuardSchemaInvalid, GuardTimeout, GuardUnreachable
 from ._manifest import Surface, client_escapes
 from ._response import Outcome, classify_response
-
-
-class TidewallRefusedError(TidewallError):
-    """A call dispatch refused: guard failure, or input it cannot represent.
-
-    Subclasses the EXISTING TidewallError from ``_exceptions`` rather than
-    introducing a second base. A caller wants one ``except`` clause covering
-    every way Tidewall can decline a call -- a blocked verdict and a refused
-    one are the same event to the application -- and two unrelated hierarchies
-    would silently let one escape a handler written for the other.
-    """
-
-    def __init__(self, message: str, outcome_kind: str = "") -> None:
-        super().__init__(message)
-        self.outcome_kind = outcome_kind
 
 
 class LossyInputError(TidewallRefusedError):

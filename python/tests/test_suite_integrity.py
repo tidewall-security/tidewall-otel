@@ -282,3 +282,61 @@ def test_every_ACCEPTED_env_var_is_documented():
     documented, accepted, _removed = _env_var_sets()
     missing = sorted(accepted - documented)
     assert not missing, "accepted but undocumented: " + ", ".join(missing)
+
+
+def test_every_public_name_in_ALL_actually_resolves():
+    """`from tidewall_otel import *` must not raise.
+
+    An `__all__` entry with nothing behind it is the same defect as any other
+    unevidenced claim, in one line: the package advertises a name it does not
+    have. Caught here on the very commit that added the exception exports --
+    `TidewallRefusedError` was listed before it was imported.
+    """
+    import tidewall_otel
+
+    missing = [n for n in tidewall_otel.__all__ if not hasattr(tidewall_otel, n)]
+    assert not missing, f"__all__ advertises names that do not exist: {missing}"
+
+
+def test_the_README_exception_name_is_REACHABLE():
+    """The README documents `tidewall_otel.TidewallBlockedError`.
+
+    It resolved at no public name at all until 2026-08-25: an application
+    following the README got an `AttributeError`, and the only way to catch a
+    block was to import from the private `_exceptions` module. A library whose
+    primary exception has no public name has no usable error contract.
+    """
+    import re
+
+    import tidewall_otel
+
+    root = Path(__file__).resolve().parents[2]
+    documented = set()
+    for readme in (root / "README.md", root / "python" / "README.md"):
+        documented |= set(
+            re.findall(r"`tidewall_otel\.(Tidewall\w+)`", readme.read_text()))
+    assert documented, "no exception documented in either README -- did it move?"
+
+    unreachable = sorted(n for n in documented if not hasattr(tidewall_otel, n))
+    assert not unreachable, (
+        f"README documents unreachable names: {unreachable}")
+
+
+def test_every_public_exception_is_a_TidewallError():
+    """One `except` clause must cover every way Tidewall declines a call.
+
+    `TidewallActivationRefusedError` subclassed a bare `RuntimeError`. Under
+    `TIDEWALL_ON_ACTIVATION_FAILURE=block` it is raised for EVERY call, so an
+    application wrapping its AI calls in `except TidewallError` missed all of
+    them and crashed on an exception it had no reason to expect.
+    """
+    import tidewall_otel
+
+    outsiders = []
+    for name in tidewall_otel.__all__:
+        obj = getattr(tidewall_otel, name)
+        if isinstance(obj, type) and issubclass(obj, BaseException):
+            if not issubclass(obj, tidewall_otel.TidewallError):
+                outsiders.append(name)
+    assert not outsiders, (
+        f"public exceptions outside the TidewallError hierarchy: {outsiders}")

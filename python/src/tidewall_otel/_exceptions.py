@@ -32,6 +32,27 @@ class TidewallBlockedError(TidewallError):
 class TidewallConfigError(TidewallError):
     """Raised when configuration is invalid or incomplete.
 
-    Currently only used by callers that opt into hard-fail behaviour.
-    The default activation flow logs config errors and fails open instead.
+    Raised BY DEFAULT: ``TIDEWALL_ON_ACTIVATION_FAILURE`` defaults to ``exit``,
+    so invalid configuration stops the process rather than letting it continue
+    believing it is guarded. The other policies are ``disable`` (run unguarded,
+    with `state()` saying so) and ``block`` (install refusers, so calls fail
+    rather than pass unchecked).
+
+    This docstring previously said the default "logs config errors and fails
+    open instead" -- describing the exact behaviour this programme removed.
     """
+
+
+class TidewallRefusedError(TidewallError):
+    """A call dispatch refused: guard failure, or input it cannot represent.
+
+    Subclasses the EXISTING TidewallError from ``_exceptions`` rather than
+    introducing a second base. A caller wants one ``except`` clause covering
+    every way Tidewall can decline a call -- a blocked verdict and a refused
+    one are the same event to the application -- and two unrelated hierarchies
+    would silently let one escape a handler written for the other.
+    """
+
+    def __init__(self, message: str, outcome_kind: str = "") -> None:
+        super().__init__(message)
+        self.outcome_kind = outcome_kind
