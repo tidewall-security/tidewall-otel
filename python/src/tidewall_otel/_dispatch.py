@@ -27,7 +27,7 @@ from ._execution import DeadlineExceeded, ExecutorSaturated
 from ._span_helper import gen_ai_span, record_response_in_span
 from ._exceptions import LossyInputError, TidewallBlockedError, TidewallRefusedError
 from ._http import GuardSchemaInvalid, GuardTimeout, GuardUnreachable
-from ._manifest import Surface, client_escapes
+from ._manifest import Surface, client_escapes, content_fingerprint
 from ._response import Outcome, classify_response
 
 
@@ -296,6 +296,27 @@ def _finish_reason(response):
         return None
 
 
+def _refuse_if_mutated(surface, call, before, span) -> None:
+    """Refuse if what we inspected is no longer what we would send.
+
+    The guard is asked about a snapshot; the provider is invoked with the
+    caller's own mutable kwargs afterwards. Anything running in between can
+    swap the content, and enforce would then approve one prompt and send
+    another -- the P0-11 shape again, arriving through time rather than
+    through a parameter.
+
+    This does not lock the caller's data, which the agent does not own. It
+    declines to proceed when the two no longer match.
+    """
+    if content_fingerprint(surface, call.kwargs) == before:
+        return
+    _annotate(span, "tidewall.refused", "mutated_during_guard")
+    raise TidewallRefusedError(
+        "refusing: the request changed while the guard was inspecting it",
+        outcome_kind="mutated_during_guard",
+    )
+
+
 def dispatch_sync(surface, wrapped, instance, args, kwargs, config, guard, executor,
                   state=None):
     call = _prepare(surface, wrapped, instance, args, kwargs, config, state)
@@ -326,6 +347,8 @@ def dispatch_sync(surface, wrapped, instance, args, kwargs, config, guard, execu
             _annotate(span, "tidewall.guard.skipped", pre.reason)
             return _invoke_and_record(wrapped, args, kwargs, span, surface)
 
+        before = content_fingerprint(surface, call.kwargs)
+
         try:
             # submit BLOCKS and returns the value; `deadline` is keyword-only.
             raw = executor.submit(guard.check_raw,
@@ -336,6 +359,7 @@ def dispatch_sync(surface, wrapped, instance, args, kwargs, config, guard, execu
             outcome = dispatch_outcome_for(exc)
 
         _annotate(span, "tidewall.guard.outcome", outcome.kind)
+        _refuse_if_mutated(surface, call, before, span)
         decision = decide_outcome(surface, call, pre, outcome, config)
 
         if isinstance(decision, Refuse):
@@ -371,6 +395,8 @@ async def dispatch_async(surface, wrapped, instance, args, kwargs, config, guard
             _record_outcome(span, response, kwargs, surface)
             return response
 
+        before = content_fingerprint(surface, call.kwargs)
+
         try:
             # The SAME bounded pool, awaited. run_in_executor(None, ...) would
             # add the loop's default executor: a second, unbounded queue
@@ -386,6 +412,7 @@ async def dispatch_async(surface, wrapped, instance, args, kwargs, config, guard
             outcome = dispatch_outcome_for(exc)
 
         _annotate(span, "tidewall.guard.outcome", outcome.kind)
+        _refuse_if_mutated(surface, call, before, span)
         decision = decide_outcome(surface, call, pre, outcome, config)
 
         if isinstance(decision, Refuse):

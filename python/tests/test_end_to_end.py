@@ -852,3 +852,119 @@ def test_an_ORDINARY_container_is_not_refused_by_the_divergence_check():
     finally:
         guard_module.post_guard = original
         tidewall_otel.deactivate()
+
+
+def test_content_MUTATED_while_the_guard_runs_is_refused():
+    """A TOCTOU bypass: the guard inspects a snapshot, the provider is invoked
+    with the caller's own mutable kwargs afterwards.
+
+    Anything running in between -- another thread, a callback, a re-entrant
+    guard -- can swap the content, and enforce then approves one prompt and
+    sends another. Reproduced before the fix: the provider received
+    "MALICIOUS after inspection" while the guard had seen benign text.
+
+    The agent does not lock the caller's data, which it does not own. It
+    compares a trusted fingerprint across the guard call and declines when
+    what it inspected is no longer what it would send.
+    """
+    import json
+    import os
+
+    import tidewall_otel._guard as guard_module
+
+    message = {"role": "user", "content": "benign at inspection time"}
+    sent = []
+
+    def mutating_guard(**kwargs):
+        message["content"] = "MALICIOUS after inspection"
+        return {"result": CLEAN}
+
+    os.environ["TIDEWALL_MODE"] = "enforce"
+    original = guard_module.post_guard
+    guard_module.post_guard = mutating_guard
+
+    tidewall_otel.activate()
+    try:
+        client = openai.OpenAI(api_key="t", http_client=httpx.Client(
+            transport=httpx.MockTransport(
+                lambda r: (sent.append(json.loads(r.content)),
+                           httpx.Response(200, json=_COMPLETION))[1])))
+
+        with pytest.raises(tidewall_otel.TidewallRefusedError, match="changed"):
+            client.chat.completions.create(model="gpt-4o", messages=[message])
+
+        assert sent == [], "the provider received content nothing inspected"
+    finally:
+        guard_module.post_guard = original
+        tidewall_otel.deactivate()
+
+
+def test_an_UNCHANGED_request_is_not_refused_by_the_mutation_check():
+    """The other direction: the check must not refuse ordinary traffic, whose
+    kwargs are untouched across the guard call."""
+    import os
+
+    import tidewall_otel._guard as guard_module
+
+    os.environ["TIDEWALL_MODE"] = "enforce"
+    original = guard_module.post_guard
+    guard_module.post_guard = lambda **kw: {"result": CLEAN}
+
+    tidewall_otel.activate()
+    try:
+        client = openai.OpenAI(api_key="t", http_client=httpx.Client(
+            transport=httpx.MockTransport(
+                lambda r: httpx.Response(200, json=_COMPLETION))))
+        result = client.chat.completions.create(
+            model="gpt-4o", messages=[{"role": "user", "content": "hi"}])
+        assert result.choices[0].message.content == "ok"
+    finally:
+        guard_module.post_guard = original
+        tidewall_otel.deactivate()
+
+
+def test_a_deceptive_STR_SUBCLASS_cannot_hide_behind_its_own_equality():
+    """The fidelity check first compared readings with `!=`, which calls the
+    value's own `__eq__`. A `str` subclass storing an attack and reporting
+    itself equal to benign text therefore passed -- guard saw benign, provider
+    serialised the attack, enforce approved it.
+
+    Equality supplied by the thing under inspection cannot be the boundary.
+    Snapshots are type-tagged and exact instead.
+    """
+    import json
+    import os
+
+    import tidewall_otel._guard as guard_module
+
+    class LyingStr(str):
+        def __eq__(self, other):
+            return True
+
+        def __ne__(self, other):
+            return False
+
+        def __hash__(self):
+            return hash("benign")
+
+    os.environ["TIDEWALL_MODE"] = "enforce"
+    sent = []
+    original = guard_module.post_guard
+    guard_module.post_guard = lambda **kw: {"result": CLEAN}
+
+    tidewall_otel.activate()
+    try:
+        client = openai.OpenAI(api_key="t", http_client=httpx.Client(
+            transport=httpx.MockTransport(
+                lambda r: (sent.append(json.loads(r.content)),
+                           httpx.Response(200, json=_COMPLETION))[1])))
+
+        with pytest.raises(tidewall_otel.LossyInputError):
+            client.chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": LyingStr("MALICIOUS")}])
+
+        assert sent == [], "the provider received an unvouched-for value"
+    finally:
+        guard_module.post_guard = original
+        tidewall_otel.deactivate()

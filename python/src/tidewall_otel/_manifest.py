@@ -436,6 +436,69 @@ def _is_non_prompt_bearing(surface: Surface, path: str) -> bool:
     return any(matches(pattern, path) for pattern in surface.non_prompt_bearing)
 
 
+#: Types whose value the agent can compare and the provider will serialise
+#: predictably. EXACT types only: a subclass can override `__eq__`, `__str__`
+#: or `__reduce__` and make the value it compares as differ from the value it
+#: serialises as.
+_EXACT_SCALARS = (str, int, float, bool)
+
+
+def _trusted(value: Any) -> Any:
+    """A snapshot comparable with BUILT-IN operations only.
+
+    The divergence check first compared readings with `!=`, which calls the
+    value's own `__eq__`. A `str` subclass storing an attack and reporting
+    itself equal to a benign string therefore passed: the guard saw the
+    benign reading, the provider serialised the attack, and enforce approved
+    it. Equality supplied by the thing under inspection cannot be the
+    boundary.
+
+    Types are tagged and exact, so `LyingStr("attack")` snapshots as
+    `("?", "LyingStr")` rather than as a string, and nothing it overrides can
+    make that match `("str", "benign text")`.
+    """
+    if value is None:
+        return ("none", None)
+    if type(value) in _EXACT_SCALARS:
+        return (type(value).__name__, value)
+    if type(value) is list:
+        return ("list", tuple(_trusted(item) for item in value))
+    if type(value) is tuple:
+        return ("list", tuple(_trusted(item) for item in value))
+    if type(value) is dict:
+        return ("dict", tuple(sorted(
+            (str(key), _trusted(item)) for key, item in value.items())))
+    # Anything else is not something this agent can vouch for.
+    return ("?", type(value).__name__)
+
+
+def _is_untrusted(snapshot: Any) -> bool:
+    """Whether a snapshot contains a value the agent cannot vouch for."""
+    if isinstance(snapshot, tuple) and snapshot and snapshot[0] == "?":
+        return True
+    if isinstance(snapshot, tuple):
+        return any(_is_untrusted(part) for part in snapshot)
+    return False
+
+
+def content_fingerprint(surface: "Surface", kwargs: dict) -> Any:
+    """A trusted snapshot of everything the guard was shown.
+
+    Classification happens BEFORE the guard call and the provider is invoked
+    with the caller's own mutable kwargs AFTER it. Anything that runs in
+    between -- another thread, a callback, a re-entrant guard -- can replace
+    message content once inspection is finished, and the provider then
+    receives text nothing examined. The async path holds that window open for
+    the whole await.
+
+    Comparing fingerprints across the guard call closes it: not by locking
+    the caller's data, which this agent does not own, but by refusing to
+    proceed when what it inspected is no longer what it would send.
+    """
+    return tuple((field, _trusted(kwargs.get(field)))
+                 for field in surface.provider_fields)
+
+
 def _divergent_containers(nodes: dict[str, Any]) -> list[str]:
     """Paths whose container reads differently through `get()` than it stores.
 
@@ -455,7 +518,14 @@ def _divergent_containers(nodes: dict[str, Any]) -> list[str]:
             except Exception:               # pragma: no cover - defensive
                 divergent.append(f"{path}.{key}")
                 continue
-            if stored is not read and stored != read:
+            # Compare SNAPSHOTS, never the values themselves: `!=` calls
+            # the value's own `__eq__`, which the caller controls.
+            if _trusted(stored) != _trusted(read):
+                divergent.append(f"{path}.{key}")
+            elif _is_untrusted(_trusted(stored)):
+                # Both readings agree and neither can be vouched for -- a
+                # scalar subclass can serialise differently from how it
+                # compares, so the agent cannot say what the provider sends.
                 divergent.append(f"{path}.{key}")
     return divergent
 
