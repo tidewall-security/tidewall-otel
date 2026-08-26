@@ -660,3 +660,63 @@ def test_a_PERMANENT_residual_survives_repeated_deactivation():
         tidewall_otel._permanent_residuals.clear()
         tidewall_otel._residual_managers.clear()
         sys.modules.pop("perm_sdk", None)
+
+
+def test_a_PERMANENT_record_does_not_taint_a_later_module_of_the_same_NAME():
+    """Sixth-pass finding: records are strings keyed by `module.attribute`.
+
+    Generation A is patched, its owner collected, and the entry recorded
+    permanently. Generation B is then imported under the SAME module path,
+    patched, and removed cleanly -- a different object entirely. Replaying A's
+    record through `record_unverified` downgraded B's surface forever, so a
+    reload or plugin system saw every later generation reported unrecoverable
+    on the strength of an earlier one's history.
+
+    The record is history and must be reported as history: an event, never a
+    disposition.
+    """
+    import gc
+    import sys
+    import types
+    import weakref
+
+    from tidewall_otel._manager import PatchManager, RemovalOutcome
+
+    try:
+        gen_a = types.ModuleType("gen_sdk")
+        gen_a.Target = type("Target", (), {"create": staticmethod(lambda: "A")})
+        sys.modules["gen_sdk"] = gen_a
+        manager_a = PatchManager()
+        manager_a.install("gen_sdk", "Target.create", lambda w, i, a, k: w(*a, **k))
+        watch = weakref.ref(gen_a.Target)
+
+        del gen_a.Target, sys.modules["gen_sdk"], gen_a
+        gc.collect()
+        assert watch() is None, "generation A survived; this proves nothing"
+
+        tidewall_otel._residual_managers.append(manager_a)
+        tidewall_otel.deactivate()
+        assert tidewall_otel._permanent_residuals, "A was not recorded"
+
+        gen_b = types.ModuleType("gen_sdk")
+        gen_b.Target = type("Target", (), {"create": staticmethod(lambda: "B")})
+        sys.modules["gen_sdk"] = gen_b
+        manager_b = PatchManager()
+        manager_b.install("gen_sdk", "Target.create", lambda w, i, a, k: w(*a, **k))
+        outcomes = manager_b.remove()
+
+        assert outcomes[("gen_sdk", "Target.create")] is RemovalOutcome.REMOVED
+        assert gen_b.Target.create() == "B", "generation B was not restored"
+
+        tidewall_otel.deactivate()
+        state = tidewall_otel.state()
+
+        assert any(event.reason == "unrecoverable" for event in state.events), (
+            "the durable record was lost")
+        assert "gen_sdk.Target.create" not in state.surfaces, (
+            f"a collected generation's record downgraded a later one: "
+            f"{state.surfaces}")
+    finally:
+        tidewall_otel._permanent_residuals.clear()
+        tidewall_otel._residual_managers.clear()
+        sys.modules.pop("gen_sdk", None)

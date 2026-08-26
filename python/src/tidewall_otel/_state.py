@@ -86,6 +86,21 @@ class State:
         self.surfaces[surface] = "unverified"
         self.events.append(StateEvent("unverified", surface, reason, detail))
 
+    def record_history(self, subject: str, reason: str, detail: Any = None) -> None:
+        """Record something that HAPPENED, without claiming anything current.
+
+        `record_unverified` downgrades a surface, which is right for a live
+        boundary the agent cannot vouch for and wrong for a fact about a past
+        one. Permanent residuals are history: the class they name has been
+        collected, so it is not a boundary any more -- and a NEW class
+        imported under the same module path is a different object that may
+        well have been patched and removed cleanly. Replaying the old record
+        as a downgrade marked that replacement `unverified` forever.
+
+        So: an event, never a disposition.
+        """
+        self.events.append(StateEvent("unrecoverable", subject, reason, detail))
+
     def record_skip(self, surface: str, reason: str, detail: Any = None) -> None:
         """Record a guard call that was deliberately not made.
 

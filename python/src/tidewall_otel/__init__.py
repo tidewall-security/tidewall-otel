@@ -343,9 +343,16 @@ def deactivate() -> None:
         surface, _, reason = residual.partition(": ")
         _state.record_unverified(surface, reason="not_removed", detail=reason)
 
+    # HISTORY, not current state. These name owners that have been collected,
+    # so they are not boundaries any more -- and a new class imported under
+    # the same module path is a DIFFERENT object, which may well have been
+    # patched and removed cleanly. Replaying them as `record_unverified`
+    # downgraded that replacement's surface forever, so a reload or plugin
+    # system saw every later generation reported unrecoverable on the strength
+    # of an earlier one's record.
     for record in _permanent_residuals:
-        surface, _, reason = record.partition(": ")
-        _state.record_unverified(surface, reason="unrecoverable", detail=reason)
+        subject, _, reason = record.partition(": ")
+        _state.record_history(subject, reason="unrecoverable", detail=reason)
 
 
 def is_active() -> bool:
