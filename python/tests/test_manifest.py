@@ -584,3 +584,66 @@ def test_the_path_map_never_claims_a_path_the_NORMALIZER_cannot_produce():
     assert not unbacked, (
         "the path map claims targets the normalizer never emits: "
         f"{unbacked}")
+
+
+@pytest.mark.parametrize("surface", SURFACES, ids=lambda s: s.attribute)
+def test_normalization_preserves_message_VALUES_not_just_paths(surface):
+    """Coverage certifies path membership; this certifies the values.
+
+    `classify_input` delegates to `lossy_paths`, which checks that every
+    provider path is mapped -- membership and coarse shape. `canonicalise`
+    exists to compare structures and was called by nothing. So a normalizer
+    regression that TRUNCATED, coerced, reordered or substituted content kept
+    every expected path, stayed classified lossless, and would have let
+    `enforce` guard one representation while sending the original kwargs to
+    the provider.
+
+    Value comparison belongs here rather than on the hot path: doing it per
+    call means normalising and walking every request twice to catch a defect
+    that can only be introduced by editing this repository.
+
+    Parametrised over SURFACES, so a provider added later is covered without
+    anyone remembering to extend a list.
+    """
+    from tidewall_otel._coverage import canonicalise
+    from tidewall_otel._normalizer import normalize
+
+    if surface.provider == "anthropic":
+        kwargs = {
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 16,
+            "system": "you are careful",
+            "messages": [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "second"},
+                {"role": "user", "content": "third — with unicode"},
+            ],
+        }
+    else:
+        kwargs = {
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "system", "content": "you are careful"},
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "second"},
+                {"role": "user", "content": "third — with unicode"},
+            ],
+        }
+
+    guard_input = normalize(surface, kwargs)
+    shown = [canonicalise({"role": m.get("role"), "content": m.get("content")})
+             for m in guard_input["messages"]]
+
+    for message in kwargs["messages"]:
+        wanted = canonicalise({"role": message["role"],
+                               "content": message["content"]})
+        assert wanted in shown, (
+            f"{surface.attribute}: the guard was shown a different value for "
+            f"{message['role']!r}: {guard_input['messages']}")
+
+    # And the ORDER survives: a guard that sees a conversation reordered sees
+    # a different conversation.
+    provider_contents = [m["content"] for m in kwargs["messages"]]
+    shown_contents = [m.get("content") for m in guard_input["messages"]]
+    assert [c for c in shown_contents if c in provider_contents] == provider_contents, (
+        f"{surface.attribute}: message order changed: {shown_contents}")

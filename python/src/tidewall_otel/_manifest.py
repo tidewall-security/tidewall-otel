@@ -319,7 +319,12 @@ OPENAI_CHAT_SYNC = Surface(
     lossless_shapes=_OPENAI_SHAPES,
     opaque_subtrees=("tools[*].function.parameters",),
     unset_sentinel_refs=_OPENAI_SENTINELS,
-    lossless_for=("string content", "tool calls", "tool definitions"),
+    # NO "tool calls". The executable contract refuses them: the paths are
+    # unmapped, therefore lossy, so `enforce` declines the call rather than
+    # showing the guard a body without them. Leaving the prose claim beside
+    # the map that no longer backs it is how a reader learns the wrong
+    # contract from the friendlier of the two.
+    lossless_for=("string content", "tool definitions"),
     transform_into=_openai_write_back,
 )
 
