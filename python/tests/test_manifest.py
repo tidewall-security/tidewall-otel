@@ -824,12 +824,27 @@ def test_a_DEEPLY_NESTED_schema_does_not_crash_the_walk():
         "exhausting the budget waved the value through as vouched-for"
 
 
-def test_a_SELF_REFERENCING_container_terminates():
+def test_a_SELF_REFERENCING_container_is_marked_as_a_CYCLE():
+    """Mutation-testing killed the first version of this test.
+
+    It asserted only that the walk terminated, which the depth bound alone
+    satisfies -- so deleting cycle detection entirely left it green. That is
+    the quantifier defect this codebase keeps producing: the name claimed
+    cycle detection, the body proved termination.
+
+    The cycle must be caught WHERE IT CLOSES, at depth 1, not fifty levels
+    later once the depth budget runs out -- otherwise every cycle burns the
+    budget that real nesting needs.
+    """
     from tidewall_otel._manifest import _trusted
 
     cycle = {}
     cycle["self"] = cycle
-    assert _trusted(cycle)                  # must not raise or hang
+    assert _trusted(cycle) == ("dict", "dict", (("self", ("?", "cycle")),))
+
+    circular = [1]
+    circular.append(circular)
+    assert _trusted(circular) == ("list", (("int", 1), ("?", "cycle")))
 
 
 def test_a_value_shared_between_siblings_is_still_snapshotted():
