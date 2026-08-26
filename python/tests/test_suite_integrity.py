@@ -512,12 +512,16 @@ def test_the_README_names_every_outcome_kind_ENFORCE_can_RAISE():
     source = Path(__file__).resolve().parents[1] / "src" / "tidewall_otel"
     dispatch = (source / "_dispatch.py").read_text()
 
-    from tidewall_otel._dispatch import _FAILURES
+    from tidewall_otel._dispatch import _FAILURES, TIME_REFUSALS
 
-    # Literal kinds at the raise sites, plus the failure kinds `decide_outcome`
-    # re-raises under their own name, plus the verdict the product exists for.
+    # Mutation-testing killed the first version of this test. It collected
+    # `outcome_kind="..."` LITERALS, and both time-based refusals are raised
+    # through a variable -- so the regex matched nothing and the test passed
+    # vacuously on the exact kinds it was written to police.
     raised = set(re.findall(r'outcome_kind="([a-z_]+)"', dispatch))
-    raised |= set(_FAILURES) | {"blocked"}
+    raised |= set(_FAILURES) | set(TIME_REFUSALS) | {"blocked"}
+    assert TIME_REFUSALS <= raised and len(raised) > len(_FAILURES) + 1, \
+        "the set under test collapsed; this would pass vacuously"
 
     undocumented = sorted(k for k in raised if k not in readme)
     assert not undocumented, \

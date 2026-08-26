@@ -136,6 +136,14 @@ Decision = Proceed | Transform | Refuse
 #: Its presence was invisible because the dispatch tests retyped this set by
 #: hand and omitted it. Deriving the test cases from here surfaced it
 #: immediately: four tests failed on a kind no code can emit.
+# Refusals that are about TIME rather than shape: the guard was asked about a
+# snapshot, and these say the snapshot cannot be trusted to describe what will
+# actually be sent. Named rather than inline so the README drift test can read
+# them -- it previously scanned for `outcome_kind="..."` literals and found
+# none, because both are raised through a variable, so it passed vacuously on
+# exactly the two kinds it was written to cover.
+TIME_REFUSALS = frozenset({"mutated_during_guard", "unverifiable_payload"})
+
 _FAILURES = frozenset({
     "unreachable", "timeout", "saturated", "schema_invalid",
     "invariant_violated",
