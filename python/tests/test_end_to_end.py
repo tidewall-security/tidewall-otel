@@ -1107,3 +1107,164 @@ async def test_ENFORCE_still_refuses_a_mutation_on_the_ASYNC_path(monkeypatch):
         await client.chat.completions.create(model="gpt-4o", messages=[message])
 
     assert reached == [], "async enforce sent content nothing inspected"
+
+
+# -- a bound that closed a crash must not open a bypass --------------------
+#
+# `_trusted` replaces anything past its depth or node budget with a CONSTANT
+# sentinel, and two identical sentinels compare equal. So a value changed
+# below the boundary produced matching before/after fingerprints, and the
+# mutation check -- which only compared them -- saw nothing. The bound
+# closed a `RecursionError` and opened a bypass in the check it protected.
+#
+# Reachability, stated honestly: with the shipped budgets, classification
+# refuses a deeply nested tool schema as LOSSY before the guard is ever
+# called, so the depth boundary is not reachable that way. Exhausting the
+# node budget through fully-declared content needs a conversation of tens of
+# thousands of messages. The fix is defence in depth, and these tests shrink
+# the budget so the mechanism itself is exercised rather than the constant.
+#
+# An earlier version of these tests buried the value under an undeclared key
+# and went green without the fingerprint check ever running, because
+# `LossyInputError` subclasses `TidewallRefusedError`. Each test now asserts
+# the guard WAS called and names the exact `outcome_kind`.
+
+def _tiny_budget(monkeypatch, nodes=3):
+    """Make the node budget reachable with an ordinary payload."""
+    import tidewall_otel._manifest as manifest
+    monkeypatch.setattr(manifest, "_MAX_NODES", nodes)
+
+
+def test_a_mutation_BELOW_THE_BUDGET_BOUNDARY_never_reaches_the_provider(monkeypatch):
+    """Enforce refuses on an INCOMPLETE fingerprint alone, without waiting
+    for a difference the fingerprint is incapable of showing."""
+    import tidewall_otel._guard as guard_module
+
+    _tiny_budget(monkeypatch)
+    monkeypatch.setenv("TIDEWALL_MODE", "enforce")
+    message = {"role": "user", "content": "benign"}
+    asked, sent = [], []
+
+    def mutating_guard(**kwargs):
+        asked.append(1)
+        message["content"] = "MALICIOUS"
+        return {"result": CLEAN}
+
+    monkeypatch.setattr(guard_module, "post_guard", mutating_guard)
+
+    tidewall_otel.activate()
+    client = openai.OpenAI(api_key="t", http_client=httpx.Client(
+        transport=httpx.MockTransport(
+            lambda r: (sent.append(json.loads(r.content)),
+                       httpx.Response(200, json=_COMPLETION))[1])))
+
+    with pytest.raises(tidewall_otel.TidewallRefusedError) as raised:
+        client.chat.completions.create(model="gpt-4o", messages=[message])
+
+    assert asked, "the payload never reached the guard, so this proves nothing"
+    assert raised.value.outcome_kind in ("unverifiable_payload",
+                                         "mutated_during_guard"), \
+        f"refused for the wrong reason: {raised.value.outcome_kind}"
+    assert sent == [], "content the guard never inspected was sent"
+
+
+def test_an_UNCHANGED_but_unverifiable_payload_is_also_refused(monkeypatch):
+    """The sentinel case specifically: nothing mutated, but the fingerprint
+    could not capture the payload, so it cannot testify that nothing did."""
+    import tidewall_otel._guard as guard_module
+
+    _tiny_budget(monkeypatch)
+    monkeypatch.setenv("TIDEWALL_MODE", "enforce")
+    asked, sent = [], []
+
+    def clean_guard(**kwargs):
+        asked.append(1)
+        return {"result": CLEAN}
+
+    monkeypatch.setattr(guard_module, "post_guard", clean_guard)
+
+    tidewall_otel.activate()
+    client = openai.OpenAI(api_key="t", http_client=httpx.Client(
+        transport=httpx.MockTransport(
+            lambda r: (sent.append(json.loads(r.content)),
+                       httpx.Response(200, json=_COMPLETION))[1])))
+
+    with pytest.raises(tidewall_otel.TidewallRefusedError) as raised:
+        client.chat.completions.create(
+            model="gpt-4o", messages=[{"role": "user", "content": "benign"}])
+
+    assert asked
+    assert raised.value.outcome_kind == "unverifiable_payload"
+    assert sent == []
+
+
+async def test_the_same_hole_is_closed_on_the_ASYNC_path(monkeypatch):
+    import tidewall_otel._guard as guard_module
+
+    _tiny_budget(monkeypatch)
+    monkeypatch.setenv("TIDEWALL_MODE", "enforce")
+    asked, reached = [], []
+
+    def clean_guard(**kwargs):
+        asked.append(1)
+        return {"result": CLEAN}
+
+    monkeypatch.setattr(guard_module, "post_guard", clean_guard)
+
+    tidewall_otel.activate()
+    client = openai.AsyncOpenAI(api_key="t", http_client=httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda r: (reached.append(json.loads(r.content)),
+                       httpx.Response(200, json=_COMPLETION))[1])))
+
+    with pytest.raises(tidewall_otel.TidewallRefusedError) as raised:
+        await client.chat.completions.create(
+            model="gpt-4o", messages=[{"role": "user", "content": "benign"}])
+
+    assert asked, "the async payload never reached the guard"
+    assert raised.value.outcome_kind == "unverifiable_payload"
+    assert reached == [], "async sent a payload it could not verify"
+
+
+def test_MONITOR_records_an_unverifiable_payload_instead_of_blocking(monkeypatch):
+    """Failing closed is an enforce behaviour. Monitor still proceeds, and
+    still refuses to claim the surface it could not verify."""
+    import tidewall_otel._guard as guard_module
+
+    _tiny_budget(monkeypatch)
+    monkeypatch.setenv("TIDEWALL_MODE", "monitor")
+    monkeypatch.setattr(guard_module, "post_guard",
+                        lambda **kw: {"result": CLEAN})
+    reached = []
+
+    tidewall_otel.activate()
+    client = openai.OpenAI(api_key="t", http_client=httpx.Client(
+        transport=httpx.MockTransport(
+            lambda r: (reached.append(json.loads(r.content)),
+                       httpx.Response(200, json=_COMPLETION))[1])))
+
+    client.chat.completions.create(
+        model="gpt-4o", messages=[{"role": "user", "content": "benign"}])
+
+    assert len(reached) == 1, "monitor blocked on an unverifiable payload"
+    state = tidewall_otel.state()
+    assert state.surfaces["Completions.create"] == "unverified"
+    assert any(e.reason == "unverifiable_payload" for e in state.events)
+
+
+def test_a_REALISTIC_large_payload_is_still_verifiable():
+    """Failing closed must not refuse ordinary large traffic, which is what
+    sets the budget: 100 tools of 100 fields is ~61k nodes, and a 100-message
+    conversation is ~500."""
+    from tidewall_otel._manifest import _trusted, fingerprint_is_incomplete
+
+    tools = [{"type": "function", "function": {
+        "name": f"tool_{i}", "description": "d" * 80,
+        "parameters": {"type": "object", "properties": {
+            f"field_{j}": {"type": "string", "description": "x" * 40}
+            for j in range(100)}}}} for i in range(100)]
+    conversation = [{"role": "user", "content": "hello " * 200} for _ in range(100)]
+
+    assert not fingerprint_is_incomplete(_trusted(tools)), \
+        "a realistic tool payload became unverifiable"
+    assert not fingerprint_is_incomplete(_trusted(conversation))

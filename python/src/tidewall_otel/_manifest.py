@@ -452,10 +452,14 @@ _MEMBER_DESCRIPTOR = type(type("_S", (), {"__slots__": ("x",)}).x)
 # verdict. Exhausting a budget is not a licence to wave the value through:
 # it snapshots as unvouchable, which is what the agent actually knows.
 #
-# 50 is far past real JSON Schema nesting (a 2000-field schema walks in
-# under 2ms and is 2 deep); the budget exists for the pathological case.
+# Sized from measurement, not guesswork. A 100-message conversation is ~500
+# nodes and 0.2ms; tool schemas dominate, and 100 tools of 100 fields each is
+# ~61k nodes and 14ms. 250k covers 200x200 at ~70ms, which the guard's own
+# network round-trip dwarfs. Exceeding it is not a licence to proceed: an
+# incomplete fingerprint refuses in enforce, because a constant sentinel
+# cannot show a change beneath it.
 _MAX_DEPTH = 50
-_MAX_NODES = 20_000
+_MAX_NODES = 250_000
 
 
 def _slot_state(value: Any, depth: int, path: frozenset, budget: list) -> tuple:
@@ -580,6 +584,22 @@ def _trusted(value: Any, depth: int = 0, path: frozenset = frozenset(),
 
     # Anything else is not something this agent can vouch for.
     return ("?", type(value).__name__)
+
+
+def fingerprint_is_incomplete(snapshot: Any) -> bool:
+    """Whether a snapshot OMITS content, so a change beneath it is invisible.
+
+    Distinct from `_is_untrusted`, which also covers values that were fully
+    read but cannot be vouched for. This asks the narrower question the
+    mutation check needs: did the walk stop early? Two identical sentinels
+    compare equal, so anything they replaced could have changed silently.
+    """
+    if isinstance(snapshot, tuple):
+        if snapshot[:1] == ("?",) and snapshot[1:] in (
+                ("too-deep",), ("budget-exhausted",), ("cycle",), ("unreadable",)):
+            return True
+        return any(fingerprint_is_incomplete(part) for part in snapshot)
+    return False
 
 
 def _is_untrusted(snapshot: Any) -> bool:

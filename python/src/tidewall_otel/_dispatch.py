@@ -27,7 +27,8 @@ from ._execution import DeadlineExceeded, ExecutorSaturated
 from ._span_helper import gen_ai_span, record_response_in_span
 from ._exceptions import LossyInputError, TidewallBlockedError, TidewallRefusedError
 from ._http import GuardSchemaInvalid, GuardTimeout, GuardUnreachable
-from ._manifest import Surface, client_escapes, content_fingerprint
+from ._manifest import (Surface, client_escapes, content_fingerprint,
+                        fingerprint_is_incomplete)
 from ._response import Outcome, classify_response
 
 
@@ -297,7 +298,8 @@ def _finish_reason(response):
 
 
 def _handle_mutation(surface, call, before, span, config, state) -> None:
-    """Refuse if what we inspected is no longer what we would send.
+    """Refuse if what we inspected is no longer what we would send -- or if
+    we cannot tell.
 
     The guard is asked about a snapshot; the provider is invoked with the
     caller's own mutable kwargs afterwards. Anything running in between can
@@ -305,29 +307,37 @@ def _handle_mutation(surface, call, before, span, config, state) -> None:
     another -- the P0-11 shape again, arriving through time rather than
     through a parameter.
 
-    This does not lock the caller's data, which the agent does not own. It
-    declines to proceed when the two no longer match.
+    Comparing fingerprints is only sound while the fingerprint is COMPLETE.
+    Bounding the walk introduced constant sentinels for exhausted depth and
+    budget, and two identical sentinels compare equal -- so a value changed
+    below the boundary produced matching fingerprints and enforce sent
+    content the guard never saw. The bound closed a crash and opened a
+    bypass. An incomplete fingerprint therefore refuses on its own, without
+    waiting for a difference it is incapable of showing.
 
     Outside enforce it must not decline at all. Monitor's promise is that it
-    does not affect users, and every other refusal path here honours that:
-    blocked, transformed, and every failure kind fall through to Proceed.
-    This one raised unconditionally, so a caller mutating its own kwargs had
-    its request killed by the mode that exists to kill nothing. Monitor still
-    cannot vouch for the surface, so it says so durably instead -- out of the
-    threat model is not the same as unnoticed.
+    does not affect users, and every other refusal path here honours that.
+    Monitor still cannot vouch for the surface, so it says so durably
+    instead: out of the threat model is not the same as unnoticed.
     """
-    if content_fingerprint(surface, call.kwargs) == before:
+    after = content_fingerprint(surface, call.kwargs)
+    if after == before and not fingerprint_is_incomplete(before):
         return
-    _annotate(span, "tidewall.refused", "mutated_during_guard")
+
+    if after != before:
+        reason = "mutated_during_guard"
+        message = "refusing: the request changed while the guard was inspecting it"
+    else:
+        reason = "unverifiable_payload"
+        message = ("refusing: the request is too deeply nested or too large to "
+                   "verify unchanged across the guard call")
+
+    _annotate(span, "tidewall.refused", reason)
     if config.mode != "enforce":
         if state is not None:
-            state.record_unverified(surface.attribute,
-                                    reason="mutated_during_guard")
+            state.record_unverified(surface.attribute, reason=reason)
         return
-    raise TidewallRefusedError(
-        "refusing: the request changed while the guard was inspecting it",
-        outcome_kind="mutated_during_guard",
-    )
+    raise TidewallRefusedError(message, outcome_kind=reason)
 
 
 def dispatch_sync(surface, wrapped, instance, args, kwargs, config, guard, executor,
