@@ -461,13 +461,42 @@ def _trusted(value: Any) -> Any:
         return ("none", None)
     if type(value) in _EXACT_SCALARS:
         return (type(value).__name__, value)
-    if type(value) is list:
+    if type(value) in (list, tuple):
         return ("list", tuple(_trusted(item) for item in value))
-    if type(value) is tuple:
-        return ("list", tuple(_trusted(item) for item in value))
-    if type(value) is dict:
-        return ("dict", tuple(sorted(
-            (str(key), _trusted(item)) for key, item in value.items())))
+
+    if isinstance(value, dict):
+        # SUBCLASSES INCLUDED, read through `dict.items` rather than the
+        # instance's own method. Snapshotting a subclass as just its type name
+        # made in-place mutation invisible: the type does not change, so the
+        # before/after fingerprints matched and content swapped during the
+        # guard call reached the provider uninspected. Reading the stored
+        # items is also what makes the snapshot immune to an overridden
+        # `items()` or `get()`.
+        return ("dict", type(value).__name__, tuple(sorted(
+            (str(key), _trusted(item)) for key, item in dict.items(value))))
+
+    # SCALAR SUBCLASSES ARE NEVER TRUSTED, and this must come before the
+    # object branch below: a `str` subclass has a `__dict__` like any other
+    # object, so snapshotting instance state turned `LyingStr("MALICIOUS")`
+    # into ("obj", "LyingStr", ()) -- a stable, comparable, entirely
+    # content-free snapshot that re-opened the very bypass the exact-type
+    # rule closed. A value that serialises as text must be exactly text.
+    if isinstance(value, (str, bytes, int, float, bool)):
+        return ("?", type(value).__name__)
+
+    # Objects with instance state -- pydantic message and tool models are the
+    # ordinary case, and the SDKs hand them to callers routinely. Snapshot
+    # their `__dict__` through `object.__getattribute__`, so a descriptor or
+    # `__getattr__` cannot dress up what is actually stored. Refusing these
+    # outright would be a denial of service on legitimate applications.
+    try:
+        state = object.__getattribute__(value, "__dict__")
+    except Exception:
+        return ("?", type(value).__name__)
+    if type(state) is dict:
+        return ("obj", type(value).__name__, tuple(sorted(
+            (str(key), _trusted(item)) for key, item in dict.items(state))))
+
     # Anything else is not something this agent can vouch for.
     return ("?", type(value).__name__)
 

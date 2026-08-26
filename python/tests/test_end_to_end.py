@@ -968,3 +968,48 @@ def test_a_deceptive_STR_SUBCLASS_cannot_hide_behind_its_own_equality():
     finally:
         guard_module.post_guard = original
         tidewall_otel.deactivate()
+
+
+def test_a_MUTATED_dict_subclass_is_caught_by_the_fingerprint():
+    """The fingerprint reduced any non-exact container to its TYPE NAME, so a
+    dict subclass or pydantic model mutated in place kept an identical
+    fingerprint -- the type had not changed -- and the provider received
+    content the guard never saw.
+
+    Containers now snapshot their stored contents, read through
+    `dict.items` and `object.__getattribute__` so an overridden accessor
+    cannot dress up what is actually there.
+    """
+    import json
+    import os
+
+    import tidewall_otel._guard as guard_module
+
+    class Benign(dict):
+        pass
+
+    message = Benign(role="user", content="benign at inspection")
+    sent = []
+
+    def mutating_guard(**kwargs):
+        message["content"] = "MALICIOUS via subclass"
+        return {"result": CLEAN}
+
+    os.environ["TIDEWALL_MODE"] = "enforce"
+    original = guard_module.post_guard
+    guard_module.post_guard = mutating_guard
+
+    tidewall_otel.activate()
+    try:
+        client = openai.OpenAI(api_key="t", http_client=httpx.Client(
+            transport=httpx.MockTransport(
+                lambda r: (sent.append(json.loads(r.content)),
+                           httpx.Response(200, json=_COMPLETION))[1])))
+
+        with pytest.raises(tidewall_otel.TidewallRefusedError, match="changed"):
+            client.chat.completions.create(model="gpt-4o", messages=[message])
+
+        assert sent == [], "mutated subclass content reached the provider"
+    finally:
+        guard_module.post_guard = original
+        tidewall_otel.deactivate()
