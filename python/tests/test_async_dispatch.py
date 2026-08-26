@@ -7,7 +7,7 @@ import pytest
 from tests._fixtures import MAX_WORKERS, QUEUE_SIZE, wait_until
 from tidewall_otel._config import TidewallConfig
 from tidewall_otel._dispatch import LossyInputError, dispatch_async
-from tidewall_otel._exceptions import TidewallError
+from tidewall_otel._exceptions import TidewallBlockedError, TidewallError
 from tidewall_otel._execution import BoundedExecutor
 from tidewall_otel._manifest import OPENAI_CHAT_ASYNC
 from tidewall_otel._state import State
@@ -54,11 +54,16 @@ class AsyncRecordingProvider:
 async def test_enforce_never_invokes_the_ASYNC_provider_on_any_failure(
         config, executor, kind):
     provider = AsyncRecordingProvider()
-    with pytest.raises(TidewallError):
+    guard = GuardRaising(kind)
+    with pytest.raises(TidewallError) as raised:
         await dispatch_async(OPENAI_CHAT_ASYNC, provider, FakeInstance(), (),
-                             minimal(OPENAI_CHAT_ASYNC), config,
-                             GuardRaising(kind), executor)
+                             minimal(OPENAI_CHAT_ASYNC), config, guard, executor)
     assert provider.calls == [], f"contacted the provider on {kind}"
+    # See the sync twin: catching the base class alone is a false green,
+    # because `LossyInputError` satisfies it without the guard being called.
+    assert guard.calls, f"the guard was never called on {kind}"
+    assert raised.value.outcome_kind == kind, \
+        f"refused as {raised.value.outcome_kind}, not {kind}"
 
 
 async def test_the_async_adapter_actually_AWAITS_the_provider(config, executor):
@@ -132,11 +137,12 @@ async def test_cancelling_the_caller_propagates_CancelledError(config, executor)
 async def test_a_BLOCKED_verdict_in_enforce_never_reaches_the_async_provider(
         config, executor):
     provider = AsyncRecordingProvider()
-    with pytest.raises(TidewallError):
+    guard = GuardReturning(blocked_body())
+    with pytest.raises(TidewallBlockedError):
         await dispatch_async(OPENAI_CHAT_ASYNC, provider, FakeInstance(), (),
-                             minimal(OPENAI_CHAT_ASYNC), config,
-                             GuardReturning(blocked_body()), executor)
+                             minimal(OPENAI_CHAT_ASYNC), config, guard, executor)
     assert provider.calls == []
+    assert guard.calls, "nothing was blocked -- the guard was never called"
 
 
 async def test_a_typed_call_in_enforce_reaches_NEITHER_side(config, executor):

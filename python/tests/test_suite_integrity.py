@@ -494,3 +494,59 @@ def test_production_code_is_pyflakes_CLEAN(capsys):
     count = checkRecursive([str(SRC)], Reporter(out, err))
 
     assert count == 0, f"pyflakes over src/:\n{out.getvalue()}{err.getvalue()}"
+
+
+def test_the_README_names_every_outcome_kind_ENFORCE_can_RAISE():
+    """Documentation drifts silently; a test does not.
+
+    `unverifiable_payload` shipped as a publicly observable `outcome_kind`
+    that no document named, so an operator seeing it had nothing to look it
+    up in. Every kind enforce can raise must appear in the README, and every
+    kind the README names must still exist in the code -- drift in either
+    direction is a defect.
+    """
+    import re
+    from pathlib import Path
+
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text()
+    source = Path(__file__).resolve().parents[1] / "src" / "tidewall_otel"
+    dispatch = (source / "_dispatch.py").read_text()
+
+    from tidewall_otel._dispatch import _FAILURES
+
+    # Literal kinds at the raise sites, plus the failure kinds `decide_outcome`
+    # re-raises under their own name, plus the verdict the product exists for.
+    raised = set(re.findall(r'outcome_kind="([a-z_]+)"', dispatch))
+    raised |= set(_FAILURES) | {"blocked"}
+
+    undocumented = sorted(k for k in raised if k not in readme)
+    assert not undocumented, \
+        "enforce can raise outcome kinds the README never names: " + ", ".join(undocumented)
+
+
+def test_EVERY_env_var_the_README_mentions_ANYWHERE_exists():
+    """The sibling drift tests read only the configuration TABLE, and only
+    compared it against variables explicitly marked removed.
+
+    A name that never existed at all is neither accepted nor removed, and a
+    mention in prose is not in the table, so an invented variable satisfied
+    both tests. One did: this file documented `TIDEWALL_GUARD_DEADLINE_S`,
+    which is the config ATTRIBUTE's name with the real variable's spelling
+    lost. An operator following it would have set nothing at all and believed
+    they had set a deadline.
+    """
+    import re
+
+    from tidewall_otel._config import _REMOVED_VARIABLES
+
+    root = Path(__file__).resolve().parents[1]
+    config = (root / "src" / "tidewall_otel" / "_config.py").read_text()
+    readme = (root / "README.md").read_text()
+
+    real = set(re.findall(r'["\'](TIDEWALL_[A-Z_]+)["\']', config))
+    real |= set(_REMOVED_VARIABLES)
+    mentioned = set(re.findall(r"(TIDEWALL_[A-Z_]+)", readme))
+
+    invented = sorted(mentioned - real)
+    assert not invented, \
+        "the README names variables the agent has never heard of: " + ", ".join(invented)

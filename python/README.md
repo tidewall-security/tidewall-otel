@@ -91,10 +91,41 @@ are refused rather than guarded:
 | **Multi-part content blocks** (vision, Anthropic block lists) | **refused** | proceeds, recorded as a `lossy` skip |
 | **Assistant `tool_calls`** | **refused** | proceeds, recorded as a `lossy` skip |
 | `extra_body` | **refused** | proceeds, recorded as a `lossy` skip |
+| **A payload too deep or too large to verify** | **refused** (`unverifiable_payload`) | proceeds, recorded as `unverified` |
+| **A request mutated during the guard call** | **refused** (`mutated_during_guard`) | proceeds, recorded as `unverified` |
 
 Multimodal calls are refused because the guard cannot read an image. Flattening
 the blocks to their text and reporting the call covered would claim an
 inspection that never happened.
+
+The last two rows are about time rather than shape. The guard is asked about a
+snapshot and the provider is invoked with your own mutable arguments
+afterwards, so anything running in between can swap the content. `enforce`
+compares a fingerprint across the guard call and declines when the two no
+longer match — and equally when the payload was too deeply nested or too large
+to fingerprint completely, because a snapshot that omits content cannot testify
+that the content did not change. Both raise `TidewallRefusedError`, whose
+`outcome_kind` carries the reason above.
+
+### When the guard itself fails
+
+The rows above are about calls the agent will not show the guard. This is the
+other direction: the guard was asked and did not answer usefully. In `enforce`
+each raises `TidewallRefusedError` with the `outcome_kind` named here, and the
+provider is never contacted. In `monitor` and `dry-run` the call proceeds and
+the reason is recorded instead.
+
+| `outcome_kind` | Meaning |
+| --- | --- |
+| `blocked` | The guard answered, and its verdict was no. This is the product working, not failing — it raises `TidewallBlockedError`. |
+| `unreachable` | The guard could not be contacted. |
+| `timeout` | The guard did not answer within `TIDEWALL_GUARD_DEADLINE`. |
+| `saturated` | Too many guard calls were already in flight; the bounded pool refused another rather than growing without limit. |
+| `schema_invalid` | The guard answered with something this agent cannot parse, so it will not guess what the verdict was. |
+| `invariant_violated` | An unmapped error inside the agent. Fail-closed by construction: an exception nothing anticipated refuses rather than passing the call through. |
+
+Choosing `enforce` means accepting that an outage of the guard is an outage of
+the calls it guards. `monitor` is the setting that does not make that trade.
 
 `state()` reports every one of these: the surface is not `covered`, the skip
 carries its reason, and `is_active()` is False. If your application makes these

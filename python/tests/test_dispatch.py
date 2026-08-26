@@ -15,7 +15,7 @@ from tidewall_otel._dispatch import (
     dispatch_outcome_for,
     dispatch_sync,
 )
-from tidewall_otel._exceptions import TidewallError
+from tidewall_otel._exceptions import TidewallBlockedError, TidewallError
 from tidewall_otel._execution import BoundedExecutor, ExecutorSaturated
 from tidewall_otel._http import GuardSchemaInvalid, GuardTimeout, GuardUnreachable
 from tidewall_otel._manifest import ANTHROPIC_MESSAGES_SYNC, OPENAI_CHAT_SYNC
@@ -185,11 +185,18 @@ def test_enforce_NEVER_INVOKES_the_provider_on_any_failure(config, executor, kin
     guard checking returns no decision, so a test reading the return value
     cannot see the bug."""
     provider = RecordingProvider()
-    with pytest.raises(TidewallError):
+    guard = GuardRaising(kind)
+    with pytest.raises(TidewallError) as raised:
         dispatch_sync(OPENAI_CHAT_SYNC, provider, FakeInstance(), (),
-                      minimal(OPENAI_CHAT_SYNC), config, GuardRaising(kind),
-                      executor)
+                      minimal(OPENAI_CHAT_SYNC), config, guard, executor)
     assert provider.calls == [], f"contacted the provider on {kind}"
+    # `TidewallError` alone is a FALSE GREEN: `LossyInputError` is one, so a
+    # regression classifying this fixture as lossy before the guard is ever
+    # called would satisfy both assertions while none of the failure mapping
+    # under test runs. Name the reason, and prove the guard was reached.
+    assert guard.calls, f"the guard was never called on {kind}"
+    assert raised.value.outcome_kind == kind, \
+        f"refused as {raised.value.outcome_kind}, not {kind}"
 
 
 @pytest.mark.parametrize("mode", ["monitor", "dry-run"])
@@ -312,11 +319,12 @@ def test_a_BLOCKED_verdict_in_enforce_never_reaches_the_provider(config, executo
     was not.
     """
     provider = RecordingProvider()
-    with pytest.raises(TidewallError):
+    guard = GuardReturning(blocked_body())
+    with pytest.raises(TidewallBlockedError):
         dispatch_sync(OPENAI_CHAT_SYNC, provider, FakeInstance(), (),
-                      minimal(OPENAI_CHAT_SYNC), config,
-                      GuardReturning(blocked_body()), executor)
+                      minimal(OPENAI_CHAT_SYNC), config, guard, executor)
     assert provider.calls == [], "a blocked call reached the provider"
+    assert guard.calls, "nothing was blocked -- the guard was never called"
 
 
 @pytest.mark.parametrize("mode", ["monitor", "dry-run"])
