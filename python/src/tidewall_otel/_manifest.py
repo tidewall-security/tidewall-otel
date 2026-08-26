@@ -611,7 +611,8 @@ def _is_untrusted(snapshot: Any) -> bool:
     return False
 
 
-def content_fingerprint(surface: "Surface", kwargs: dict) -> Any:
+def content_fingerprint(surface: "Surface", kwargs: dict,
+                        args: tuple = ()) -> Any:
     """A trusted snapshot of everything the guard was shown.
 
     Classification happens BEFORE the guard call and the provider is invoked
@@ -638,9 +639,16 @@ def content_fingerprint(surface: "Surface", kwargs: dict) -> Any:
     anything able to change what the provider sends must be inside the
     comparison, including arguments whose CLASSIFICATION changes when they
     are mutated. That is every argument, so this takes every argument.
+
+    Positional arguments too. Every declared surface is keyword-only today,
+    so `args` is empty in practice -- but that is a property of the SDK
+    versions in front of us, not a guarantee, and a parameter that became
+    positional later would have been silently outside the comparison.
+    `test_every_declared_surface_is_KEYWORD_ONLY` says so if that changes.
     """
-    return tuple(sorted((str(field), _trusted(value))
-                        for field, value in kwargs.items()))
+    return (tuple(_trusted(value) for value in args),
+            tuple(sorted((str(field), _trusted(value))
+                         for field, value in kwargs.items())))
 
 
 def _divergent_containers(nodes: dict[str, Any]) -> list[str]:

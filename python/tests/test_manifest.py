@@ -873,3 +873,53 @@ def test_a_LARGE_tool_schema_stays_cheap():
     _trusted(schema)
     elapsed = time.perf_counter() - started
     assert elapsed < 0.5, f"walking a 2000-field schema took {elapsed:.3f}s"
+
+
+def test_every_declared_surface_is_KEYWORD_ONLY():
+    """The fingerprint covers positional arguments, and `args` is empty for
+    every surface we patch -- today.
+
+    That is a property of the SDK versions in front of us, not a guarantee.
+    If a provider ever makes a parameter positional, this says so rather than
+    letting it sit silently outside the comparison.
+    """
+    import inspect
+
+    from tidewall_otel._manifest import SURFACES
+
+    positional, resolved = {}, 0
+    for surface in SURFACES:
+        target = _resolve_surface_callable(surface)
+        if target is None:
+            continue
+        resolved += 1
+        names = [p.name for p in inspect.signature(target).parameters.values()
+                 if p.name != "self"
+                 and p.kind in (inspect.Parameter.POSITIONAL_ONLY,
+                                inspect.Parameter.POSITIONAL_OR_KEYWORD)]
+        if names:
+            positional[surface.attribute] = names
+
+    # Not vacuous: a resolver that silently returned None for everything
+    # would report a clean result forever.
+    assert resolved == len(SURFACES), \
+        f"only resolved {resolved} of {len(SURFACES)} surfaces"
+    assert not positional, (
+        "these surfaces accept positional payload, which the fingerprint "
+        f"covers but no test exercises: {positional}")
+
+
+def _resolve_surface_callable(surface):
+    """The unpatched method a surface names, or None if its SDK is absent."""
+    import importlib
+
+    try:
+        module = importlib.import_module(surface.module)
+    except ImportError:                     # pragma: no cover - SDK absent
+        return None
+    target = module
+    for part in surface.attribute.split("."):
+        target = getattr(target, part, None)
+        if target is None:
+            return None
+    return target

@@ -107,6 +107,33 @@ to fingerprint completely, because a snapshot that omits content cannot testify
 that the content did not change. Both raise `TidewallRefusedError`, whose
 `outcome_kind` carries the reason above.
 
+### What the mutation check does and does not claim
+
+The guard is asked about a snapshot and the provider is invoked with your own
+arguments afterwards, so Tidewall fingerprints every argument before
+inspection and compares it after. That closes the cases that matter in a
+cooperative application: a callback, a re-entrant guard, an OTel span
+processor, or a container whose `__eq__` or `get()` reports something other
+than what it stores. Between the final comparison and the SDK serialising the
+request, Tidewall runs only its own code — no application callback is invoked
+in that window.
+
+It does not claim to defeat an attacker who is already executing arbitrary
+code in your process. Another thread can mutate a shared object in that last
+window, and nothing an in-process agent does can prevent it: code that can do
+that can equally re-patch the SDK, patch Tidewall, or call the provider
+directly. Closing it would mean sending the provider a rebuilt payload rather
+than your own arguments, which would drop streaming and stream options,
+sampling and token controls, `stop`, `seed`, `logprobs`, `response_format`,
+`tool_choice`, parallel tool calls, metadata, service tier, per-request
+timeouts and extra headers — and, for Anthropic, the required `max_tokens`
+along with thinking, output config and cache controls. That is a worse
+product for a threat this agent is not the right layer to address.
+
+The threat Tidewall exists to address is content reaching the model that
+should not — prompt injection, sensitive data, policy violations — in an
+application that is not itself hostile.
+
 ### When the guard itself fails
 
 The rows above are about calls the agent will not show the guard. This is the

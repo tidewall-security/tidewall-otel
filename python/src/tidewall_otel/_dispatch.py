@@ -336,7 +336,7 @@ def _handle_mutation(surface, call, before, span, config, state) -> None:
     Monitor still cannot vouch for the surface, so it says so durably
     instead: out of the threat model is not the same as unnoticed.
     """
-    after = content_fingerprint(surface, call.kwargs)
+    after = content_fingerprint(surface, call.kwargs, call.args)
     if after == before and not fingerprint_is_incomplete(before):
         return
 
@@ -369,7 +369,7 @@ def dispatch_sync(surface, wrapped, instance, args, kwargs, config, guard, execu
     #
     # Taken here, any change from this point on shows up in the comparison
     # after the guard call, whatever ran in between.
-    before = content_fingerprint(surface, call.kwargs)
+    before = content_fingerprint(surface, call.kwargs, call.args)
     pre = decide_input(surface, call, config)
 
     # THE SPAN WRAPS EVERY EXIT, including the ones that never reach the
@@ -435,7 +435,7 @@ async def dispatch_async(surface, wrapped, instance, args, kwargs, config, guard
     #
     # Taken here, any change from this point on shows up in the comparison
     # after the guard call, whatever ran in between.
-    before = content_fingerprint(surface, call.kwargs)
+    before = content_fingerprint(surface, call.kwargs, call.args)
     pre = decide_input(surface, call, config)
 
     # Same span discipline as the sync path, and it has to be duplicated
