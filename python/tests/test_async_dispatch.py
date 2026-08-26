@@ -317,8 +317,10 @@ async def test_the_ASYNC_arm_orders_health_observations_too(config, executor):
     assert state.guard_health == "ok", "premise: the newer call saw recovery"
 
     released.set()
-    with pytest.raises(TidewallError):
+    with pytest.raises(TidewallError) as raised:
         await old
+    assert raised.value.outcome_kind == "unreachable", \
+        f"the stalled call failed as {raised.value.outcome_kind}, not the outage"
 
     assert state.guard_health == "ok", \
         "a stalled older async call republished a recovered outage"

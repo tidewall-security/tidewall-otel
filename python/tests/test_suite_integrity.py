@@ -554,3 +554,53 @@ def test_EVERY_env_var_the_README_mentions_ANYWHERE_exists():
     invented = sorted(mentioned - real)
     assert not invented, \
         "the README names variables the agent has never heard of: " + ", ".join(invented)
+
+
+def test_no_test_accepts_a_BASE_refusal_without_naming_the_REASON():
+    """Dispatch converts every unexpected `BaseException` to
+    `invariant_violated` -- deliberately, so nothing is swallowed. The cost
+    is that `pytest.raises(TidewallError)` is satisfied by ANY defect in the
+    guard path, including a `NameError` from a missing import. That happened
+    in this branch: an async test moved modules without its import and stayed
+    green, because the wrong failure satisfied the assertion.
+
+    So a test that catches a BASE class must also name the `outcome_kind` it
+    expects. Catching a concrete subclass -- `TidewallBlockedError`,
+    `LossyInputError` -- is already specific and needs nothing more.
+    """
+    import ast
+
+    #: Its whole subject is that ONE `except` clause covers every declination,
+    #: so catching the base class is the contract under test, not a weak
+    #: assertion about a particular path.
+    exempt = {"test_exception_contract.py"}
+    bases = {"TidewallError", "TidewallRefusedError"}
+
+    offenders, scanned, detectable = [], 0, 0
+    for path in sorted((Path(__file__).resolve().parent).rglob("test_*.py")):
+        scanned += 1
+        if path.name in exempt:
+            continue
+        tree = ast.parse(path.read_text())
+        for fn in (n for n in ast.walk(tree)
+                   if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))):
+            catches_base = any(
+                (getattr(node.func, "attr", None) or getattr(node.func, "id", None)) == "raises"
+                and node.args
+                and (getattr(node.args[0], "attr", None)
+                     or getattr(node.args[0], "id", None)) in bases
+                for node in ast.walk(fn) if isinstance(node, ast.Call))
+            detectable += catches_base
+            if catches_base and "outcome_kind" not in ast.dump(fn):
+                offenders.append(f"{path.name}:{fn.lineno} {fn.name}")
+
+    # This test polices a pattern, so it must prove it can still SEE the
+    # pattern. An AST walk that silently matches nothing -- a renamed helper,
+    # a changed call shape -- would otherwise report a clean suite forever.
+    assert scanned > 10, f"the scan found only {scanned} test modules"
+    assert detectable > 0, \
+        "the detector matched no base-class assertion anywhere; it has gone blind"
+
+    assert not offenders, (
+        "these accept any failure the catch-all produces, including a defect "
+        "in the code under test:\n  " + "\n  ".join(offenders))

@@ -98,3 +98,79 @@ def test_the_summary_names_every_dimension():
     summary = state.summary()
     for expected in ("installed", "enforce", "ok", "unverified", "openai.chat"):
         assert expected in summary, summary
+
+
+# -- caller code must not run under the lock -------------------------------
+
+def test_a_REENTRANT_detail_does_not_deadlock_the_recorder():
+    """`detail` is `Any`, so comparing samples runs the CALLER's `__eq__`.
+
+    Doing that inside the critical section deadlocked the thread outright
+    when the method recorded anything -- a non-reentrant lock reacquired by
+    the same thread. An application whose diagnostic objects touch state
+    would hang on an LLM call, permanently, with no error.
+
+    Timed rather than asserted directly: a deadlock has no exception to
+    catch, so the only evidence is that the work never finishes.
+    """
+    import threading
+
+    from tidewall_otel._state import State
+
+    state = State()
+
+    class RecordsWhileComparing:
+        def __eq__(self, other):
+            state.record_skip("s", reason="recorded from inside __eq__")
+            return False
+
+        def __hash__(self):
+            return 0
+
+    state.record_skip("s", reason="lossy", detail=("an earlier sample",))
+
+    finished = threading.Event()
+
+    def record():
+        state.record_skip("s", reason="lossy", detail=RecordsWhileComparing())
+        finished.set()
+
+    worker = threading.Thread(target=record, daemon=True)
+    worker.start()
+
+    assert finished.wait(timeout=5), \
+        "recording deadlocked on a caller-defined __eq__"
+
+
+def test_a_SLOW_detail_comparison_does_not_block_health_publication():
+    """The same fix, for the non-fatal case: caller equality that merely
+    takes time must not serialise every other call's state publication."""
+    import threading
+    import time
+
+    from tidewall_otel._state import State
+
+    state = State()
+    entered = threading.Event()
+
+    class SlowEquality:
+        def __eq__(self, other):
+            entered.set()
+            time.sleep(2)
+            return False
+
+        def __hash__(self):
+            return 0
+
+    state.record_skip("s", reason="lossy", detail=("an earlier sample",))
+    threading.Thread(
+        target=lambda: state.record_skip("s", reason="lossy",
+                                         detail=SlowEquality()),
+        daemon=True).start()
+
+    assert entered.wait(timeout=5), "the comparison never ran"
+    started = time.perf_counter()
+    state.record_guard_health("clean")
+    assert time.perf_counter() - started < 1.0, \
+        "health publication waited on a caller's slow __eq__"
+    assert state.guard_health == "ok"

@@ -271,9 +271,14 @@ def test_a_GUARD_error_body_never_reaches_the_span(monkeypatch, exporter):
     monkeypatch.setattr(guard_module, "post_guard", leaky_guard)
 
     tidewall_otel.activate()
-    with pytest.raises(tidewall_otel.TidewallError):
+    with pytest.raises(tidewall_otel.TidewallError) as raised:
         _client().chat.completions.create(
             model="gpt-4o", messages=[{"role": "user", "content": "hi"}])
+
+    # Name the reason: dispatch converts any unexpected error to
+    # `invariant_violated`, so a defect in the guard path would otherwise
+    # satisfy this and the leak under test would never have been exercised.
+    assert raised.value.outcome_kind == "schema_invalid"
 
     span = exporter.get_finished_spans()[0]
     rendered = json.dumps(

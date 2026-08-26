@@ -88,7 +88,12 @@ class State:
     #: The last observation published to `guard_health`, so a stalled call
     #: finishing late cannot republish an outage that has already recovered.
     _health_seq: int = 0
-    _lock: Any = field(default_factory=threading.Lock, repr=False, compare=False)
+    #: Re-entrant, because a caller's own code can end up back here: `detail`
+    #: is `Any`, and a value whose `__eq__` or `__repr__` records something
+    #: would otherwise block forever reacquiring a plain `Lock`. The real
+    #: defence is not running caller code under the lock at all -- see
+    #: `_record_once` -- and this is the second line.
+    _lock: Any = field(default_factory=threading.RLock, repr=False, compare=False)
 
     def is_active(self) -> bool:
         """Whether the agent is enforcing across every boundary present.
@@ -184,9 +189,23 @@ class State:
                 self.events.append(event)
                 return
             existing.count += 1
-            if (event.detail is not None
-                    and len(existing.samples) < _MAX_SAMPLES
-                    and not any(sample == event.detail
+            if event.detail is None or len(existing.samples) >= _MAX_SAMPLES:
+                return
+            known = list(existing.samples)
+
+        # CALLER CODE MUST NOT RUN UNDER THE LOCK. `detail` is `Any`, so this
+        # `==` is the caller's own `__eq__`; running it inside the critical
+        # section deadlocked the thread outright when that method recorded
+        # anything, and serialised all state publication when it was merely
+        # slow. Reproduced before the fix with a re-entrant `__eq__`.
+        if any(sample == event.detail for sample in known):
+            return
+
+        with self._lock:
+            # Re-check by IDENTITY, which cannot run caller code. A racing
+            # duplicate is possible and harmless; the cap still holds.
+            if (len(existing.samples) < _MAX_SAMPLES
+                    and not any(sample is event.detail
                                 for sample in existing.samples)):
                 existing.samples.append(event.detail)
 

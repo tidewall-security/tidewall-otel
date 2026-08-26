@@ -123,7 +123,7 @@ def test_a_BLOCKED_verdict_stops_an_activated_call(guard_says, provider):
     client, reached = provider
 
     tidewall_otel.activate()
-    with pytest.raises(TidewallError):
+    with pytest.raises(tidewall_otel.TidewallBlockedError):
         client.chat.completions.create(
             model="gpt-4o", messages=[{"role": "user", "content": "hi"}])
 
@@ -149,7 +149,7 @@ def test_extra_body_is_REFUSED_through_an_activated_client(guard_says, provider)
     client, reached = provider
 
     tidewall_otel.activate()
-    with pytest.raises(TidewallError):
+    with pytest.raises(tidewall_otel.LossyInputError):
         client.chat.completions.create(
             model="gpt-4o", messages=[{"role": "user", "content": "SAFE"}],
             extra_body={"messages": [{"role": "user", "content": "EVIL"}]})
@@ -890,9 +890,10 @@ def test_content_MUTATED_while_the_guard_runs_is_refused():
                 lambda r: (sent.append(json.loads(r.content)),
                            httpx.Response(200, json=_COMPLETION))[1])))
 
-        with pytest.raises(tidewall_otel.TidewallRefusedError, match="changed"):
+        with pytest.raises(tidewall_otel.TidewallRefusedError) as raised:
             client.chat.completions.create(model="gpt-4o", messages=[message])
 
+        assert raised.value.outcome_kind == "mutated_during_guard"
         assert sent == [], "the provider received content nothing inspected"
     finally:
         guard_module.post_guard = original
@@ -1006,9 +1007,10 @@ def test_a_MUTATED_dict_subclass_is_caught_by_the_fingerprint():
                 lambda r: (sent.append(json.loads(r.content)),
                            httpx.Response(200, json=_COMPLETION))[1])))
 
-        with pytest.raises(tidewall_otel.TidewallRefusedError, match="changed"):
+        with pytest.raises(tidewall_otel.TidewallRefusedError) as raised:
             client.chat.completions.create(model="gpt-4o", messages=[message])
 
+        assert raised.value.outcome_kind == "mutated_during_guard"
         assert sent == [], "mutated subclass content reached the provider"
     finally:
         guard_module.post_guard = original
@@ -1103,9 +1105,10 @@ async def test_ENFORCE_still_refuses_a_mutation_on_the_ASYNC_path(monkeypatch):
                        httpx.Response(200, json=_COMPLETION))[1])))
 
     tidewall_otel.activate()
-    with pytest.raises(tidewall_otel.TidewallRefusedError, match="changed"):
+    with pytest.raises(tidewall_otel.TidewallRefusedError) as raised:
         await client.chat.completions.create(model="gpt-4o", messages=[message])
 
+    assert raised.value.outcome_kind == "mutated_during_guard"
     assert reached == [], "async enforce sent content nothing inspected"
 
 
@@ -1300,10 +1303,15 @@ def test_a_guard_OUTAGE_is_visible_in_state(monkeypatch, provider):
     assert tidewall_otel.state().guard_health == "unknown", \
         "health claimed before any evidence existed"
 
-    with pytest.raises(tidewall_otel.TidewallRefusedError):
+    with pytest.raises(tidewall_otel.TidewallRefusedError) as raised:
         client.chat.completions.create(
             model="gpt-4o", messages=[{"role": "user", "content": "hi"}])
 
+    # Dispatch converts every unexpected BaseException to `invariant_violated`,
+    # which is still a TidewallRefusedError -- so asserting the exception TYPE
+    # alone lets an unrelated defect satisfy the test. Name the reason.
+    assert raised.value.outcome_kind == "unreachable", \
+        f"refused as {raised.value.outcome_kind}, not the outage under test"
     assert tidewall_otel.state().guard_health == "unreachable", \
         "an operator polling state() saw nothing wrong during an outage"
     assert reached == []
@@ -1333,10 +1341,11 @@ def test_health_names_the_ACTUAL_failure_not_a_flattened_one(monkeypatch, provid
     client, _reached = provider
 
     tidewall_otel.activate()
-    with pytest.raises(tidewall_otel.TidewallRefusedError):
+    with pytest.raises(tidewall_otel.TidewallRefusedError) as raised:
         client.chat.completions.create(
             model="gpt-4o", messages=[{"role": "user", "content": "hi"}])
 
+    assert raised.value.outcome_kind == "schema_invalid"
     assert tidewall_otel.state().guard_health == "schema_invalid"
 
 
@@ -1364,9 +1373,11 @@ def test_an_outage_does_NOT_flip_is_active(monkeypatch, provider):
     # on its own. Comparing across it would credit the outage with a change it
     # did not cause, so the comparison spans the second call instead.
     for _ in range(2):
-        with pytest.raises(tidewall_otel.TidewallRefusedError):
+        with pytest.raises(tidewall_otel.TidewallRefusedError) as raised:
             client.chat.completions.create(
                 model="gpt-4o", messages=[{"role": "user", "content": "hi"}])
+        assert raised.value.outcome_kind == "unreachable", \
+            f"refused as {raised.value.outcome_kind}, not the outage under test"
         if _ == 0:
             before = tidewall_otel.state()
             surfaces, active = dict(before.surfaces), before.is_active()
@@ -1392,9 +1403,12 @@ def test_a_SUSTAINED_outage_does_not_grow_the_event_log(monkeypatch, provider):
 
     tidewall_otel.activate()
     for _ in range(50):
-        with pytest.raises(tidewall_otel.TidewallRefusedError):
+        with pytest.raises(tidewall_otel.TidewallRefusedError) as raised:
             client.chat.completions.create(
                 model="gpt-4o", messages=[{"role": "user", "content": "hi"}])
+        # EVERY iteration: checking only the final state would miss a wrong
+        # failure on any subset of the fifty.
+        assert raised.value.outcome_kind == "unreachable"
 
     state = tidewall_otel.state()
     assert state.guard_health == "unreachable"
@@ -1416,10 +1430,11 @@ async def test_the_ASYNC_arm_reports_health_too(monkeypatch):
             lambda r: httpx.Response(200, json=_COMPLETION))))
 
     tidewall_otel.activate()
-    with pytest.raises(tidewall_otel.TidewallRefusedError):
+    with pytest.raises(tidewall_otel.TidewallRefusedError) as raised:
         await client.chat.completions.create(
             model="gpt-4o", messages=[{"role": "user", "content": "hi"}])
 
+    assert raised.value.outcome_kind == "unreachable"
     assert tidewall_otel.state().guard_health == "unreachable"
 
 
