@@ -127,10 +127,26 @@ the reason is recorded instead.
 Choosing `enforce` means accepting that an outage of the guard is an outage of
 the calls it guards. `monitor` is the setting that does not make that trade.
 
-`state()` reports every one of these: the surface is not `covered`, the skip
-carries its reason, and `is_active()` is False. If your application makes these
-calls and you need it running today, `monitor` observes without blocking — and
-tells you plainly which calls it could not check.
+The two tables report differently, because they are about different things.
+
+A call the agent **cannot represent** is about a boundary: `state()` shows the
+surface as something other than `covered`, the skip carries its reason, and
+`is_active()` is False. If your application makes these calls and you need it
+running today, `monitor` observes without blocking — and tells you plainly
+which calls it could not check.
+
+A **guard failure** is about the guard, not the boundary, and appears in
+`state().guard_health` — `ok`, `degraded`, or the failing kind itself, so
+`saturated` (this agent's own pool declining work) is not reported as
+`unreachable` (the guard being unreachable). It deliberately does **not** flip
+`is_active()`, which is a claim about whether every surface present is covered;
+an unreachable guard is a runtime condition the mode contract handles per call,
+and it does not retroactively mean the boundaries are unwrapped. Poll both:
+`is_active()` for wiring, `guard_health` for the guard.
+
+Health is a single current value rather than a log, so a sustained outage does
+not grow the process's memory. Individual failures raise, and their spans carry
+the per-call detail.
 
 ## Activation
 
@@ -185,15 +201,22 @@ For each instrumented call, the agent:
      version before passing them to the provider.
    - clean → no change.
 
-   Two cases never reach step 3 at all, and both raise
-   `tidewall_otel.TidewallRefusedError` in `enforce` mode before either the
-   guard or the provider is contacted:
+   Other cases raise `tidewall_otel.TidewallRefusedError` in `enforce` mode.
+   In all of them the AI provider is never contacted, but they happen at
+   different points, which matters when you are diagnosing one:
 
-   - the call carries something the agent cannot represent losslessly for
-     the guard — `extra_body`, or an argument shape outside the manifest.
-     The guard is not asked about a body it was not shown.
-   - the guard could not be reached, timed out, or answered with something
-     that does not match its response schema.
+   - **Before the guard is asked**: the call carries something the agent
+     cannot represent losslessly — `extra_body`, or an argument shape outside
+     the manifest. The guard is not asked about a body it was not shown, so
+     no guard request is made at all.
+   - **While asking**: the guard could not be reached, or did not answer
+     within `TIDEWALL_GUARD_DEADLINE`. A request was attempted, so this
+     traffic is visible to the guard's own network.
+   - **After it answers**: the guard replied with something that does not
+     match its response schema. A response was received and rejected.
+   - **After it answers, on the way to the provider**: the request changed
+     while the guard was inspecting it, or was too deep or too large to
+     fingerprint completely. See the refusal table above.
 
    Every exception above is a `tidewall_otel.TidewallError`, so one
    `except tidewall_otel.TidewallError` covers every way the agent can

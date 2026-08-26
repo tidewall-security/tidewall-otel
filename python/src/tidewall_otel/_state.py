@@ -6,7 +6,9 @@ Four separate facts, deliberately not collapsed into one boolean:
 ``mode``        enforce / monitor / dry-run
 ``surfaces``    per-surface disposition: covered / unverified / uncovered /
                 refusing
-``guard_health`` unknown / ok / unreachable
+``guard_health`` unknown / ok / degraded / or the failing outcome kind
+                (`unreachable`, `timeout`, `saturated`, `schema_invalid`,
+                `invariant_violated`)
 
 ``residual`` is deactivation that could not fully undo itself: another agent
 wrapped a boundary after us, so removal correctly declined to write and a
@@ -29,6 +31,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 _COVERED = "covered"
+#: Outcomes that mean the guard answered and this agent understood it. Every
+#: other kind is reported under its own name.
+_GUARD_HEALTH = {"clean": "ok", "blocked": "ok", "transformed": "ok"}
 _ENFORCING_MODES = frozenset({"enforce", "monitor"})
 
 
@@ -57,6 +62,13 @@ class State:
     #: behind it.
     guard_health: str = "unknown"
     events: list[StateEvent] = field(default_factory=list)
+    #: Keys of events already recorded. An operator needs to know WHICH
+    #: conditions occurred, not how many times: a process using a custom
+    #: httpx client recorded one `client_escapes` event per LLM call and grew
+    #: this list forever, and monitor mode did the same with one `skip` per
+    #: lossy call. Both are steady-state conditions that repeat on every call
+    #: by their nature, so the log they produced was unbounded by design.
+    _recorded: set = field(default_factory=set, repr=False, compare=False)
 
     def is_active(self) -> bool:
         """Whether the agent is enforcing across every boundary present.
@@ -84,7 +96,28 @@ class State:
         needs the reason to decide whether they care.
         """
         self.surfaces[surface] = "unverified"
-        self.events.append(StateEvent("unverified", surface, reason, detail))
+        self._record_once(StateEvent("unverified", surface, reason, detail))
+
+    def record_guard_health(self, outcome_kind: str) -> None:
+        """What the last guard call says about the guard.
+
+        The dimension existed, was documented, and was tested by direct
+        construction -- and no production code ever wrote to it. An operator
+        polling `state()` through a total guard outage saw `unknown` from
+        activation onwards while every enforce-mode call failed.
+
+        A SCALAR, deliberately: recording an event per failed call would grow
+        without bound during exactly the outage an operator most needs to
+        survive. The current value answers "is the guard working", which is
+        what the dimension is for; the failing calls raise, and their spans
+        carry the per-call detail.
+
+        The vocabulary is the outcome kind itself rather than a flattened
+        `unreachable`, because `saturated` is this agent's own pool declining
+        work and `schema_invalid` is the guard answering badly -- calling
+        either "unreachable" would misdirect whoever is paging.
+        """
+        self.guard_health = _GUARD_HEALTH.get(outcome_kind, outcome_kind)
 
     def record_history(self, subject: str, reason: str, detail: Any = None) -> None:
         """Record something that HAPPENED, without claiming anything current.
@@ -107,7 +140,20 @@ class State:
         Monitor mode exists to produce evidence, so the one call worth
         recording must not be the one that records nothing.
         """
-        self.events.append(StateEvent("skip", surface, reason, detail))
+        self._record_once(StateEvent("skip", surface, reason, detail))
+
+    def _record_once(self, event: StateEvent) -> None:
+        """Append an event the first time its exact condition occurs.
+
+        Deduplicated on every field, so a NEW reason or a new detail is still
+        recorded -- what is dropped is the hundredth identical report of a
+        condition already visible in the log.
+        """
+        key = (event.kind, event.surface, event.reason, repr(event.detail))
+        if key in self._recorded:
+            return
+        self._recorded.add(key)
+        self.events.append(event)
 
     def summary(self) -> str:
         """One line naming every dimension.

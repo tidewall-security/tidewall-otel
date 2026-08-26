@@ -390,6 +390,8 @@ def dispatch_sync(surface, wrapped, instance, args, kwargs, config, guard, execu
             outcome = dispatch_outcome_for(exc)
 
         _annotate(span, "tidewall.guard.outcome", outcome.kind)
+        if state is not None:
+            state.record_guard_health(outcome.kind)
         _handle_mutation(surface, call, before, span, config, state)
         decision = decide_outcome(surface, call, pre, outcome, config)
 
@@ -443,6 +445,8 @@ async def dispatch_async(surface, wrapped, instance, args, kwargs, config, guard
             outcome = dispatch_outcome_for(exc)
 
         _annotate(span, "tidewall.guard.outcome", outcome.kind)
+        if state is not None:
+            state.record_guard_health(outcome.kind)
         _handle_mutation(surface, call, before, span, config, state)
         decision = decide_outcome(surface, call, pre, outcome, config)
 

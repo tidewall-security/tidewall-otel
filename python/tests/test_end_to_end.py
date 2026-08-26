@@ -1268,3 +1268,201 @@ def test_a_REALISTIC_large_payload_is_still_verifiable():
     assert not fingerprint_is_incomplete(_trusted(tools)), \
         "a realistic tool payload became unverifiable"
     assert not fingerprint_is_incomplete(_trusted(conversation))
+
+
+# -- the guard-health dimension -------------------------------------------
+#
+# `guard_health` was declared in `State`, documented as a first-class
+# dimension, and tested by constructing `State(guard_health=...)` directly --
+# and NO production code ever wrote to it. An operator polling `state()`
+# through a total guard outage saw `unknown` from activation onwards while
+# every enforce-mode call was failing. Fifth instance in this programme of
+# something built, tested, and wired to nothing; the tests all passed because
+# every one of them supplied the value it then asserted.
+
+def _guard_raising(exc):
+    def raiser(**kwargs):
+        raise exc
+    return raiser
+
+
+def test_a_guard_OUTAGE_is_visible_in_state(monkeypatch, provider):
+    from tidewall_otel._http import GuardUnreachable
+
+    import tidewall_otel._guard as guard_module
+
+    monkeypatch.setenv("TIDEWALL_MODE", "enforce")
+    monkeypatch.setattr(guard_module, "post_guard",
+                        _guard_raising(GuardUnreachable("connection refused")))
+    client, reached = provider
+
+    tidewall_otel.activate()
+    assert tidewall_otel.state().guard_health == "unknown", \
+        "health claimed before any evidence existed"
+
+    with pytest.raises(tidewall_otel.TidewallRefusedError):
+        client.chat.completions.create(
+            model="gpt-4o", messages=[{"role": "user", "content": "hi"}])
+
+    assert tidewall_otel.state().guard_health == "unreachable", \
+        "an operator polling state() saw nothing wrong during an outage"
+    assert reached == []
+
+
+def test_a_WORKING_guard_reports_ok(monkeypatch, guard_says, provider):
+    monkeypatch.setenv("TIDEWALL_MODE", "enforce")
+    guard_says(CLEAN)
+    client, _reached = provider
+
+    tidewall_otel.activate()
+    client.chat.completions.create(
+        model="gpt-4o", messages=[{"role": "user", "content": "hi"}])
+
+    assert tidewall_otel.state().guard_health == "ok"
+
+
+def test_health_names_the_ACTUAL_failure_not_a_flattened_one(monkeypatch, provider):
+    """`saturated` is this agent's own pool declining work and
+    `schema_invalid` is the guard answering badly. Reporting either as
+    `unreachable` would misdirect whoever is paging."""
+    import tidewall_otel._guard as guard_module
+
+    monkeypatch.setenv("TIDEWALL_MODE", "enforce")
+    monkeypatch.setattr(guard_module, "post_guard",
+                        lambda **kw: {"nonsense": True})
+    client, _reached = provider
+
+    tidewall_otel.activate()
+    with pytest.raises(tidewall_otel.TidewallRefusedError):
+        client.chat.completions.create(
+            model="gpt-4o", messages=[{"role": "user", "content": "hi"}])
+
+    assert tidewall_otel.state().guard_health == "schema_invalid"
+
+
+def test_an_outage_does_NOT_flip_is_active(monkeypatch, provider):
+    """Deliberate, and worth a test so it cannot be changed by accident.
+
+    `is_active()` is a claim about BOUNDARIES -- whether every surface
+    present is covered. An unreachable guard is a runtime condition the mode
+    contract already handles per call; it does not retroactively mean the
+    boundaries are unguarded. The health dimension is where an operator looks
+    for that, which is why it had to be wired rather than folded in here.
+    """
+    from tidewall_otel._http import GuardUnreachable
+
+    import tidewall_otel._guard as guard_module
+
+    monkeypatch.setenv("TIDEWALL_MODE", "enforce")
+    monkeypatch.setattr(guard_module, "post_guard",
+                        _guard_raising(GuardUnreachable("down")))
+    client, _reached = provider
+
+    tidewall_otel.activate()
+    # The FIRST call settles conditions unrelated to guard health -- this
+    # fixture's custom httpx client is an escape, which downgrades the surface
+    # on its own. Comparing across it would credit the outage with a change it
+    # did not cause, so the comparison spans the second call instead.
+    for _ in range(2):
+        with pytest.raises(tidewall_otel.TidewallRefusedError):
+            client.chat.completions.create(
+                model="gpt-4o", messages=[{"role": "user", "content": "hi"}])
+        if _ == 0:
+            before = tidewall_otel.state()
+            surfaces, active = dict(before.surfaces), before.is_active()
+
+    after = tidewall_otel.state()
+    assert after.guard_health == "unreachable", "premise: the guard is down"
+    assert after.surfaces == surfaces, "the outage downgraded a BOUNDARY"
+    assert after.is_active() == active
+
+
+def test_a_SUSTAINED_outage_does_not_grow_the_event_log(monkeypatch, provider):
+    """The reason health is a scalar. Appending an event per failed call
+    would grow without bound during exactly the outage an operator most needs
+    the process to survive."""
+    from tidewall_otel._http import GuardUnreachable
+
+    import tidewall_otel._guard as guard_module
+
+    monkeypatch.setenv("TIDEWALL_MODE", "enforce")
+    monkeypatch.setattr(guard_module, "post_guard",
+                        _guard_raising(GuardUnreachable("down")))
+    client, _reached = provider
+
+    tidewall_otel.activate()
+    for _ in range(50):
+        with pytest.raises(tidewall_otel.TidewallRefusedError):
+            client.chat.completions.create(
+                model="gpt-4o", messages=[{"role": "user", "content": "hi"}])
+
+    state = tidewall_otel.state()
+    assert state.guard_health == "unreachable"
+    assert len(state.events) < 10, \
+        f"50 failed calls left {len(state.events)} events; this grows unbounded"
+
+
+async def test_the_ASYNC_arm_reports_health_too(monkeypatch):
+    from tidewall_otel._http import GuardUnreachable
+
+    import tidewall_otel._guard as guard_module
+
+    monkeypatch.setenv("TIDEWALL_MODE", "enforce")
+    monkeypatch.setattr(guard_module, "post_guard",
+                        _guard_raising(GuardUnreachable("down")))
+
+    client = openai.AsyncOpenAI(api_key="t", http_client=httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda r: httpx.Response(200, json=_COMPLETION))))
+
+    tidewall_otel.activate()
+    with pytest.raises(tidewall_otel.TidewallRefusedError):
+        await client.chat.completions.create(
+            model="gpt-4o", messages=[{"role": "user", "content": "hi"}])
+
+    assert tidewall_otel.state().guard_health == "unreachable"
+
+
+def test_MONITOR_does_not_grow_the_event_log_on_repeated_skips(monkeypatch, guard_says):
+    """`record_skip` had the same unbounded shape as `record_unverified`.
+
+    Monitor exists to be left running in production, and a lossy call shape
+    is a steady-state property of an application, not an incident -- so the
+    mode designed for long deployments logged one event per call, forever.
+    """
+    monkeypatch.setenv("TIDEWALL_MODE", "monitor")
+    guard_says(CLEAN)
+    reached = []
+    client = openai.OpenAI(api_key="t", http_client=httpx.Client(
+        transport=httpx.MockTransport(
+            lambda r: (reached.append(1),
+                       httpx.Response(200, json=_COMPLETION))[1])))
+
+    tidewall_otel.activate()
+    for _ in range(50):
+        client.chat.completions.create(
+            model="gpt-4o", messages=[{"role": "user", "content": "hi"}],
+            extra_body={"unrepresentable": True})
+
+    assert len(reached) == 50, "monitor blocked calls it promised to watch"
+    events = tidewall_otel.state().events
+    assert any(e.reason == "lossy" for e in events), "the skip went unrecorded"
+    assert len(events) < 10, \
+        f"50 lossy calls left {len(events)} events; this grows unbounded"
+
+
+def test_a_DIFFERENT_reason_is_still_recorded(monkeypatch, guard_says):
+    """Deduplication must not become suppression: the second distinct
+    condition is exactly what an operator needs to see."""
+    from tidewall_otel._state import State
+
+    state = State()
+    state.record_unverified("s", reason="client_escapes", detail=("transport",))
+    state.record_unverified("s", reason="client_escapes", detail=("transport",))
+    assert len(state.events) == 1
+
+    state.record_unverified("s", reason="client_escapes", detail=("mount",))
+    state.record_unverified("s", reason="late_import")
+    state.record_skip("s", reason="lossy")
+    assert len(state.events) == 4, \
+        "a new reason or detail was swallowed as a duplicate"
