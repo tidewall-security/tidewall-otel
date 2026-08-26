@@ -720,3 +720,54 @@ def test_a_PERMANENT_record_does_not_taint_a_later_module_of_the_same_NAME():
         tidewall_otel._permanent_residuals.clear()
         tidewall_otel._residual_managers.clear()
         sys.modules.pop("gen_sdk", None)
+
+
+def test_a_TOOL_CALL_message_is_refused_in_enforce_and_declared_in_monitor():
+    """Guard/provider divergence, checked in both modes.
+
+    An assistant message can carry attacker-controlled
+    `tool_calls[].function.arguments`. The normalizer emits only `role` and
+    `content`, so the guard would never see them -- which would be a bypass
+    of exactly the P0-11 shape if the agent proceeded anyway.
+
+    It does not. The path is unmapped, therefore lossy: `enforce` refuses
+    before either the guard or the provider is contacted, and `monitor`
+    proceeds by its own contract while recording a `lossy` skip and dropping
+    `is_active()` to False. The agent declines to certify what it cannot
+    show the guard.
+    """
+    import json
+    import os
+
+    messages = [
+        {"role": "user", "content": "benign"},
+        {"role": "assistant", "content": "calling a tool", "tool_calls": [
+            {"id": "c1", "type": "function", "function": {
+                "name": "exfiltrate",
+                "arguments": '{"payload": "LEAK-ME"}'}}]},
+    ]
+
+    # --- enforce: refused, nothing contacted -------------------------------
+    os.environ["TIDEWALL_MODE"] = "enforce"
+    asked, sent = [], []
+    tidewall_otel.activate()
+    try:
+        import tidewall_otel._guard as guard_module
+
+        original = guard_module.post_guard
+        guard_module.post_guard = lambda **kw: (
+            asked.append(kw["payload"]), CLEAN)[1]
+
+        client = openai.OpenAI(api_key="t", http_client=httpx.Client(
+            transport=httpx.MockTransport(
+                lambda r: (sent.append(json.loads(r.content)),
+                           httpx.Response(200, json=_COMPLETION))[1])))
+
+        with pytest.raises(tidewall_otel.LossyInputError):
+            client.chat.completions.create(model="gpt-4o", messages=messages)
+
+        assert asked == [], "the guard was asked about a body it was not shown"
+        assert sent == [], "the provider received an uninspected tool call"
+    finally:
+        guard_module.post_guard = original
+        tidewall_otel.deactivate()

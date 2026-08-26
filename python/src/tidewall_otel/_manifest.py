@@ -251,10 +251,21 @@ _OPENAI_PATH_MAP = {
     "messages[*]":                                  "guard_input.messages[*]",
     "messages[*].role":                             "guard_input.messages[*].role",
     "messages[*].content":                          "guard_input.messages[*].content",
-    "messages[*].tool_calls":                       "guard_input.messages[*].tool_calls",
-    "messages[*].tool_calls[*]":                    "guard_input.messages[*].tool_calls[*]",
-    "messages[*].tool_calls[*].function.name":      "guard_input.messages[*].tool_calls[*].function.name",
-    "messages[*].tool_calls[*].function.arguments": "guard_input.messages[*].tool_calls[*].function.arguments",
+    # NO `messages[*].tool_calls` ENTRIES. They claimed the agent carries
+    # tool-call names and arguments to the guard; `normalize_openai_messages`
+    # emits only `role` and `content`, so it never did. The map was asserting
+    # a coverage nothing provided.
+    #
+    # Removed rather than implemented, because the guard server reads only
+    # `content` (`app/routes/guard.py` joins `m.get("content", "")`). Sending
+    # tool calls it ignores would MOVE the defect: the path would look
+    # mapped, the payload would look inspected, and nothing would examine it.
+    #
+    # The consequence is deliberate and fail-closed. An unmapped path is
+    # LOSSY, so a message carrying `tool_calls` is refused in `enforce`
+    # before either the guard or the provider is contacted, and in `monitor`
+    # it proceeds with a recorded `lossy` skip and `is_active()` False. The
+    # agent declines to certify what it cannot show the guard.
     "tools":                                        "guard_input.tools",
     "tools[*]":                                     "guard_input.tools[*]",
     "tools[*].function":                            "guard_input.tools[*].function",

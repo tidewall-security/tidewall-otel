@@ -530,3 +530,57 @@ def test_the_openai_write_back_replaces_only_messages():
     # first message was right and every named kwarg survived, and the test
     # never looked at what else was in the list.
     assert out == {**kwargs, "messages": guard_messages}
+
+
+def test_the_path_map_never_claims_a_path_the_NORMALIZER_cannot_produce():
+    """The map is a claim about what the agent carries to the guard.
+
+    It listed `messages[*].tool_calls[*].function.arguments` while
+    `normalize_openai_messages` emits only `role` and `content`, so the map
+    asserted a coverage nothing provided. Harmless in effect -- an unmapped
+    path is lossy, so such a call is refused before the guard or the provider
+    -- but a map that lies is the defect class this programme exists to
+    remove, and the next reader would have trusted it.
+
+    DERIVED from the normalizer's actual output rather than a list of known
+    offenders, so a future map entry with no producer fails here.
+    """
+    from tidewall_otel._normalizer import normalize
+
+    kwargs = {
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi", "tool_calls": [
+                {"id": "c1", "type": "function",
+                 "function": {"name": "f", "arguments": "{}"}}]},
+        ],
+        "tools": [{"type": "function", "function": {
+            "name": "f", "description": "d", "parameters": {}}}],
+    }
+    produced = normalize(OPENAI_CHAT_SYNC, kwargs)
+
+    def emitted_paths(value, prefix=""):
+        if isinstance(value, dict):
+            for key, sub in value.items():
+                path = f"{prefix}.{key}" if prefix else key
+                yield path
+                yield from emitted_paths(sub, path)
+        elif isinstance(value, list):
+            for item in value:
+                # Yield the ELEMENT path itself, not only its children. The
+                # first version walked into items and never emitted
+                # `messages[*]`, so the map's legitimate element entries
+                # looked unbacked -- the walker was wrong, not the map.
+                yield f"{prefix}[*]"
+                yield from emitted_paths(item, f"{prefix}[*]")
+
+    emitted = set(emitted_paths({"guard_input": produced}))
+
+    unbacked = sorted(
+        target for target in OPENAI_CHAT_SYNC.path_map.values()
+        if target not in emitted
+    )
+    assert not unbacked, (
+        "the path map claims targets the normalizer never emits: "
+        f"{unbacked}")
