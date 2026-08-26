@@ -30,7 +30,9 @@ import importlib
 import importlib.abc
 import importlib.machinery
 import inspect
+import itertools
 import sys
+import threading
 import weakref
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable
@@ -80,6 +82,13 @@ class JournalEntry:
     #: missing one proves nothing; an owner that has been collected can never
     #: carry anything again, and nobody else can reach it either.
     owner_ref: Any = None
+    #: Which install transaction created this entry. Rollback was scoped by
+    #: POSITION -- a mark into the journal, then a slice from it -- and Python
+    #: serialises imports per module, not across them, so a second provider
+    #: module importing on another thread appended into that window and one
+    #: module's failure restored ANOTHER module's attributes. Identity, not
+    #: position, decides what a transaction may undo.
+    txn: int = 0
     #: Stable identity, assigned once at append. Discharge is by THIS, never
     #: by position: resolving or writing an attribute can run arbitrary
     #: import, descriptor or metaclass code that re-enters the manager and
@@ -143,6 +152,13 @@ class PatchManager:
         self._surfaces: dict[str, list[tuple[str, Callable]]] = {}
         self._finder: Any = None
         self._next_seq = 0
+        self._txn_ids = itertools.count(1)
+        #: Re-entrant: undo resolves and writes attributes, which can run
+        #: import, descriptor or metaclass code that re-enters the manager.
+        self._lock = threading.RLock()
+        #: The transaction this THREAD is inside, if any. Per-thread because
+        #: concurrent late imports are the case that broke positional scoping.
+        self._active = threading.local()
 
     def _journal(self, entry: JournalEntry) -> JournalEntry:
         """Stamp an entry with its stable identity and append it.
@@ -150,9 +166,11 @@ class PatchManager:
         One append path, so no entry reaches the journal without a `seq` and
         is silently unmatchable at discharge.
         """
-        entry.seq = self._next_seq
-        self._next_seq += 1
-        self.journal.append(entry)
+        with self._lock:
+            entry.seq = self._next_seq
+            self._next_seq += 1
+            entry.txn = getattr(self._active, "txn", 0)
+            self.journal.append(entry)
         return entry
 
     # -- identity ---------------------------------------------------------
@@ -263,12 +281,20 @@ class PatchManager:
         earlier journal entries are other modules' live coverage (and the
         finder), not ours to undo.
         """
-        mark = len(self.journal)
+        transaction = next(self._txn_ids)
+        outer = getattr(self._active, "txn", 0)
+        self._active.txn = transaction
         try:
             for attribute, wrapper in self._surfaces.get(module, []):
                 self.install(module, attribute, wrapper)
         except BaseException:
-            added = self.journal[mark:]
+            # By TRANSACTION, never by position. A slice from a mark taken
+            # before the loop contains whatever another thread appended in
+            # between, and undoing that restores a module this call never
+            # touched -- leaving a live boundary unguarded while the module
+            # that installed it reports itself covered.
+            added = [entry for entry in self.journal
+                     if entry.txn == transaction]
             discharged: set[int] = set()
             try:
                 self._undo_entries(added, discharged)
@@ -276,8 +302,9 @@ class PatchManager:
                 # By seq, over the LIVE journal -- never a slice assignment
                 # from the stale `added` snapshot, which would drop anything
                 # appended re-entrantly while this rollback ran.
-                self.journal[:] = [entry for entry in self.journal
-                                   if entry.seq not in discharged]
+                with self._lock:
+                    self.journal[:] = [entry for entry in self.journal
+                                       if entry.seq not in discharged]
                 # WHAT SURVIVED decides the disposition, not the fact that
                 # this call failed. The scoped rollback undoes only THIS
                 # call's entries, so an earlier successful install for the
@@ -295,6 +322,8 @@ class PatchManager:
                                for entry in self.journal)
                 self.dispositions[module] = "unverified" if survives else "uncovered"
             raise
+        finally:
+            self._active.txn = outer
 
     # -- removal ----------------------------------------------------------
 
@@ -434,15 +463,22 @@ class PatchManager:
         well as stuck.
         """
         discharged: set[int] = set()
+        # Iterate a SNAPSHOT: a late import on another thread appends while
+        # this runs, and iterating the live list either raises or silently
+        # skips. Anything appended during the undo keeps its entry, exactly
+        # as a re-entrant append does.
+        with self._lock:
+            snapshot = list(self.journal)
         try:
-            return self._undo_entries(self.journal, discharged)
+            return self._undo_entries(snapshot, discharged)
         finally:
             # Filter the LIVE journal by seq. Slicing it against positions
             # computed before the undo deleted any entry appended
             # re-entrantly during it -- while that entry's wrapper was
             # installed, so nothing could ever remove it.
-            self.journal[:] = [entry for entry in self.journal
-                               if entry.seq not in discharged]
+            with self._lock:
+                self.journal[:] = [entry for entry in self.journal
+                                   if entry.seq not in discharged]
             if not any(entry.kind == "finder" for entry in self.journal):
                 self._finder = None
 

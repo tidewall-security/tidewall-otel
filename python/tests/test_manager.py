@@ -881,3 +881,127 @@ def test_a_vanished_MODULE_no_longer_breaks_removal_at_all(module, monkeypatch):
 
     assert outcomes[(module.__name__, "Target.create")] is RemovalOutcome.REMOVED
     assert module.Target().create() == "original"
+
+
+# -- concurrent late imports ----------------------------------------------
+
+def test_a_FAILING_install_does_not_roll_back_ANOTHER_modules_patches(monkeypatch):
+    """`install_for_module` scoped its rollback by POSITION -- `mark =
+    len(self.journal)`, then `self.journal[mark:]`.
+
+    Python serialises imports per module, not across modules, so two deferred
+    provider modules genuinely execute these callbacks at the same time: an
+    application importing `openai` and `anthropic` from two threads is
+    ordinary. When B appends between A's mark and A's failure, A's slice
+    contains B's entries, and A's rollback restores B's attribute and
+    discharges B's journal records -- while B, having succeeded, marks itself
+    covered. An unguarded boundary reported as covered is the exact defect
+    this agent exists to prevent.
+
+    Interleaved deterministically rather than by racing threads: B completes
+    entirely inside A's transaction, which is the ordering that corrupts it.
+    """
+    class OtherTarget:
+        def create(self, *args, **kwargs):
+            return "other original"
+
+    a_module = types.ModuleType("sdk_a")
+    a_module.Target = Target
+    b_module = types.ModuleType("sdk_b")
+    b_module.Target = OtherTarget
+    monkeypatch.setitem(sys.modules, "sdk_a", a_module)
+    monkeypatch.setitem(sys.modules, "sdk_b", b_module)
+    pristine, b_pristine = Target.create, OtherTarget.create
+
+    manager = PatchManager()
+    manager.register_surface("sdk_a", "Target.create", wrapper_factory("a"))
+    manager.register_surface("sdk_a", "Target.create", wrapper_factory("a2"))
+    manager.register_surface("sdk_b", "Target.create", wrapper_factory("b"))
+
+    real_install = manager.install
+    seen = []
+
+    def interleaving_install(module, attribute, wrapper, **kwargs):
+        seen.append(module)
+        if len(seen) == 2:              # A's second surface
+            manager.install_for_module("sdk_b")   # B succeeds, inside A's window
+            raise RuntimeError("this surface could not be patched")
+        return real_install(module, attribute, wrapper, **kwargs)
+
+    manager.install = interleaving_install
+    try:
+        with pytest.raises(RuntimeError):
+            manager.install_for_module("sdk_a")
+
+        assert "sdk_b" in seen or any(e.module == "sdk_b" for e in manager.journal), \
+            "the interleaving never happened"
+        assert OtherTarget.create is not b_pristine, \
+            "A's rollback restored B's attribute; B's boundary is now unguarded"
+        assert any(e.module == "sdk_b" and e.kind == "patch"
+                   for e in manager.journal), \
+            "A's rollback discharged B's journal entries"
+        # A's own transaction is fully undone, which is what transactional
+        # means -- its one successful surface does not survive its failure.
+        assert manager.dispositions.get("sdk_a") == "uncovered"
+        assert all(entry.module != "sdk_a" for entry in manager.journal), \
+            "A left entries behind after rolling itself back"
+    finally:
+        manager.install = real_install
+        Target.create = pristine
+        OtherTarget.create = b_pristine
+
+
+def test_TWO_THREADS_importing_different_modules_keep_their_own_patches(monkeypatch):
+    """The same defect under real concurrency rather than a staged
+    interleaving, because the staged version can only prove the ordering it
+    stages. Many rounds, because a race that reproduces once in ten runs is
+    still a race."""
+    import threading
+
+    for _round in range(25):
+        class TargetA:
+            def create(self, *a, **k):
+                return "a"
+
+        class TargetB:
+            def create(self, *a, **k):
+                return "b"
+
+        b_pristine = TargetB.create
+        a_mod, b_mod = types.ModuleType("race_a"), types.ModuleType("race_b")
+        a_mod.Target, b_mod.Target = TargetA, TargetB
+        monkeypatch.setitem(sys.modules, "race_a", a_mod)
+        monkeypatch.setitem(sys.modules, "race_b", b_mod)
+
+        manager = PatchManager()
+        manager.register_surface("race_a", "Target.create", wrapper_factory("a"))
+        manager.register_surface("race_a", "Target.absent", wrapper_factory("a2"))
+        manager.register_surface("race_b", "Target.create", wrapper_factory("b"))
+
+        start = threading.Barrier(2)
+
+        def install_a():
+            start.wait()
+            try:
+                manager.install_for_module("race_a")   # fails on the 2nd surface
+            except BaseException:
+                pass
+
+        def install_b():
+            start.wait()
+            manager.install_for_module("race_b")       # succeeds
+
+        threads = [threading.Thread(target=install_a),
+                   threading.Thread(target=install_b)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+            assert not thread.is_alive(), "install deadlocked"
+
+        assert TargetB.create is not b_pristine, \
+            f"round {_round}: A's rollback restored B's attribute"
+        assert any(e.module == "race_b" and e.kind == "patch"
+                   for e in manager.journal), \
+            f"round {_round}: A's rollback discharged B's journal entry"
+        manager.remove()
