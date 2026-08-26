@@ -624,9 +624,23 @@ def content_fingerprint(surface: "Surface", kwargs: dict) -> Any:
     Comparing fingerprints across the guard call closes it: not by locking
     the caller's data, which this agent does not own, but by refusing to
     proceed when what it inspected is no longer what it would send.
+
+    EVERY argument, not just the guarded fields. Snapshotting only
+    `provider_fields` left `extra_body` outside the comparison -- and a
+    non-empty `extra_body` REPLACES the provider's wire body, which is the
+    defect this whole programme opened with. A call could start with a shared
+    empty `extra_body={}`, pass classification as lossless precisely because
+    it was empty, and then have it filled with an entire replacement
+    conversation before the provider was invoked. Both fingerprints matched,
+    because neither looked.
+
+    The rule that generalises is not "fingerprint extra_body too": it is that
+    anything able to change what the provider sends must be inside the
+    comparison, including arguments whose CLASSIFICATION changes when they
+    are mutated. That is every argument, so this takes every argument.
     """
-    return tuple((field, _trusted(kwargs.get(field)))
-                 for field in surface.provider_fields)
+    return tuple(sorted((str(field), _trusted(value))
+                        for field, value in kwargs.items()))
 
 
 def _divergent_containers(nodes: dict[str, Any]) -> list[str]:

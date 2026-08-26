@@ -165,3 +165,61 @@ def test_EVERY_anthropic_surface_has_an_end_to_end_test_here():
 
     assert declared <= exercised, (
         f"Anthropic surfaces with no end-to-end test: {sorted(declared - exercised)}")
+
+
+# -- extra_body, on the other provider ------------------------------------
+#
+# The fingerprint omitted `extra_body` for every surface, so the bypass was
+# never OpenAI-specific. Anthropic gets its own proof rather than inheriting
+# the assumption -- which is the reason this whole module exists.
+
+def _fill_during_span(monkeypatch, payload):
+    import tidewall_otel._dispatch as dispatch
+
+    real_span = dispatch.gen_ai_span
+
+    def mutating_span(*args, **kwargs):
+        payload["messages"] = [{"role": "user", "content": "MALICIOUS override"}]
+        return real_span(*args, **kwargs)
+
+    monkeypatch.setattr(dispatch, "gen_ai_span", mutating_span)
+
+
+def test_an_extra_body_FILLED_after_inspection_is_refused(monkeypatch, guard_says):
+    monkeypatch.setenv("TIDEWALL_BASE_URL", "https://guard.example")
+    monkeypatch.setenv("TIDEWALL_TOKEN", "t")
+    monkeypatch.setenv("TIDEWALL_MODE", "enforce")
+    guard_says(_CLEAN)
+    escape = {}
+    _fill_during_span(monkeypatch, escape)
+    reached = []
+
+    tidewall_otel.activate()
+    with pytest.raises(tidewall_otel.TidewallRefusedError) as raised:
+        _client(reached).messages.create(
+            model="claude-3-5-sonnet-20241022", max_tokens=16,
+            messages=[{"role": "user", "content": "benign"}],
+            extra_body=escape)
+
+    assert raised.value.outcome_kind == "mutated_during_guard"
+    assert reached == [], "an uninspected override reached Anthropic"
+
+
+async def test_an_extra_body_FILLED_after_inspection_is_refused_ASYNC(monkeypatch, guard_says):
+    monkeypatch.setenv("TIDEWALL_BASE_URL", "https://guard.example")
+    monkeypatch.setenv("TIDEWALL_TOKEN", "t")
+    monkeypatch.setenv("TIDEWALL_MODE", "enforce")
+    guard_says(_CLEAN)
+    escape = {}
+    _fill_during_span(monkeypatch, escape)
+    reached = []
+
+    tidewall_otel.activate()
+    with pytest.raises(tidewall_otel.TidewallRefusedError) as raised:
+        await _async_client(reached).messages.create(
+            model="claude-3-5-sonnet-20241022", max_tokens=16,
+            messages=[{"role": "user", "content": "benign"}],
+            extra_body=escape)
+
+    assert raised.value.outcome_kind == "mutated_during_guard"
+    assert reached == []

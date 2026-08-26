@@ -1735,3 +1735,70 @@ async def test_the_pre_baseline_window_is_closed_on_the_ASYNC_path(monkeypatch, 
     assert raised.value.outcome_kind == "mutated_during_guard"
     assert reached == [], "the async provider received content the guard never saw"
     assert asked and "benign" in json.dumps(asked[0])
+
+
+# -- extra_body: the opening P0, arriving through time ---------------------
+#
+# `content_fingerprint` snapshotted only `provider_fields`, and `extra_body`
+# is not one of them -- so a call could start with a SHARED, EMPTY
+# `extra_body={}`, pass classification as lossless precisely because it was
+# empty, and then have an entire replacement conversation written into it
+# before the provider was invoked. Both fingerprints matched, because neither
+# looked. Enforce sent an override the guard never inspected.
+
+def _fill_extra_body_during(monkeypatch, payload):
+    """Fill `payload` from inside span construction -- after normalisation,
+    before the guard call, on the caller's own thread."""
+    import tidewall_otel._dispatch as dispatch
+
+    real_span = dispatch.gen_ai_span
+
+    def mutating_span(*args, **kwargs):
+        payload["messages"] = [{"role": "user", "content": "MALICIOUS override"}]
+        return real_span(*args, **kwargs)
+
+    monkeypatch.setattr(dispatch, "gen_ai_span", mutating_span)
+
+
+def test_an_extra_body_FILLED_after_inspection_is_refused(monkeypatch, guard_says):
+    monkeypatch.setenv("TIDEWALL_MODE", "enforce")
+    guard_says(CLEAN)
+    escape = {}
+    _fill_extra_body_during(monkeypatch, escape)
+    sent = []
+
+    client = openai.OpenAI(api_key="t", http_client=httpx.Client(
+        transport=httpx.MockTransport(
+            lambda r: (sent.append(json.loads(r.content)),
+                       httpx.Response(200, json=_COMPLETION))[1])))
+
+    tidewall_otel.activate()
+    with pytest.raises(tidewall_otel.TidewallRefusedError) as raised:
+        client.chat.completions.create(
+            model="gpt-4o", messages=[{"role": "user", "content": "benign"}],
+            extra_body=escape)
+
+    assert raised.value.outcome_kind == "mutated_during_guard"
+    assert sent == [], "an uninspected extra_body override reached the provider"
+
+
+async def test_an_extra_body_FILLED_after_inspection_is_refused_ASYNC(monkeypatch, guard_says):
+    monkeypatch.setenv("TIDEWALL_MODE", "enforce")
+    guard_says(CLEAN)
+    escape = {}
+    _fill_extra_body_during(monkeypatch, escape)
+    reached = []
+
+    client = openai.AsyncOpenAI(api_key="t", http_client=httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda r: (reached.append(json.loads(r.content)),
+                       httpx.Response(200, json=_COMPLETION))[1])))
+
+    tidewall_otel.activate()
+    with pytest.raises(tidewall_otel.TidewallRefusedError) as raised:
+        await client.chat.completions.create(
+            model="gpt-4o", messages=[{"role": "user", "content": "benign"}],
+            extra_body=escape)
+
+    assert raised.value.outcome_kind == "mutated_during_guard"
+    assert reached == []
