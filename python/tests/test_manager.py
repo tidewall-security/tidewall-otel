@@ -1005,3 +1005,48 @@ def test_TWO_THREADS_importing_different_modules_keep_their_own_patches(monkeypa
                    for e in manager.journal), \
             f"round {_round}: A's rollback discharged B's journal entry"
         manager.remove()
+
+
+def test_a_LATE_IMPORT_during_removal_does_not_break_the_undo(module, monkeypatch):
+    """`_discharge` iterated the LIVE journal.
+
+    A deferred provider module importing on another thread appends while
+    removal walks it -- the reviewer's second ownership race -- and mutating
+    a list under iteration either raises or silently skips an entry, leaving
+    a wrapper installed with nothing left to remove it.
+
+    Staged deterministically: the append happens from inside the undo, which
+    is the same mutation-during-iteration a second thread produces, and is
+    the only version that reproduces on every run.
+    """
+    class LateTarget:
+        def create(self, *a, **k):
+            return "late"
+
+    late_mod = types.ModuleType("late_sdk")
+    late_mod.Target = LateTarget
+    monkeypatch.setitem(sys.modules, "late_sdk", late_mod)
+
+    manager = PatchManager()
+    manager.install("fake_sdk", "Target.create", wrapper_factory("first"))
+
+    appended = []
+    original_undo = manager._undo_entries
+
+    def undo_that_appends(entries, discharged):
+        if not appended:
+            appended.append(1)
+            manager.install("late_sdk", "Target.create", wrapper_factory("late"))
+        return original_undo(entries, discharged)
+
+    manager._undo_entries = undo_that_appends
+    try:
+        manager.remove()            # must not raise
+        assert appended, "the interleaving never happened"
+        # The entry appended during the undo is still journalled, so it can
+        # still be removed -- rather than orphaned with its wrapper live.
+        assert any(e.module == "late_sdk" for e in manager.journal), \
+            "the late entry was lost; its wrapper can never be removed"
+    finally:
+        manager._undo_entries = original_undo
+        manager.remove()
