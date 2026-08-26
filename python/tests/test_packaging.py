@@ -281,3 +281,54 @@ def test_the_agent_WORKS_without_the_otel_extra_installed(tmp_path):
         f"{out}{result.stderr[-400:]}")
     assert "active=True" in out, out
     assert "after=removed" in out, out
+
+
+def test_the_CI_MATRIX_covers_every_python_the_package_CLAIMS():
+    """Classifiers and the CI matrix are two statements of the same fact.
+
+    Drift either way is a lie of a different kind: a classifier without a
+    matrix entry claims support nothing verifies, and a matrix entry without a
+    classifier means the interpreter with the most tests passing is one users
+    are never told about. Both were true here -- the classifiers stopped at
+    3.13 while 3.14 was verified on every commit, and CI ran neither.
+
+    Read from both sources rather than restated, so this cannot agree with
+    itself while disagreeing with the package.
+    """
+    import re
+    import tomllib
+
+    with PYPROJECT.open("rb") as handle:
+        classifiers = tomllib.load(handle)["project"]["classifiers"]
+    claimed = {c.rsplit(" :: ", 1)[-1] for c in classifiers
+               if c.startswith("Programming Language :: Python :: 3.")}
+
+    workflow = (PYPROJECT.resolve().parents[1] / ".github" / "workflows" / "ci.yml").read_text()
+    matrix_line = re.search(r"python-version:\s*\[(.+?)\]", workflow)
+    assert matrix_line, "no python-version matrix in the CI workflow"
+    tested = set(re.findall(r'"([\d.]+)"', matrix_line.group(1)))
+
+    assert claimed, "the package claims no Python versions at all"
+    assert claimed == tested, (
+        f"classifiers claim {sorted(claimed)}, CI runs {sorted(tested)}"
+    )
+
+
+def test_a_CI_JOB_makes_the_response_schema_pin_RUNNABLE():
+    """The pin skips unless the server package is importable.
+
+    Without a job that supplies it, the pin skips in every environment --
+    local, CI, everywhere -- and a guard that never runs is not a guard. This
+    asserts the arrangement exists, not that it passed: that is the job's own
+    business.
+    """
+    workflow = (PYPROJECT.resolve().parents[1] / ".github" / "workflows" / "ci.yml").read_text()
+
+    assert "tidewall-server" in workflow, (
+        "no CI job checks out the guard server, so the response-schema pin "
+        "skips everywhere it runs"
+    )
+    assert "PYTHONPATH" in workflow, (
+        "the server is checked out but never put on the path, so the pin "
+        "still skips"
+    )
