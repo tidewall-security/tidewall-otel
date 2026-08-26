@@ -25,6 +25,23 @@ def normalize_openai_messages(
 
     - Multi-part content (vision: ``[{type: "text", text: "..."}, ...]``)
       is reduced to a space-joined plain string of the text parts.
+
+      THIS FLATTENING DOES NOT MAKE SUCH A CALL INSPECTABLE. The manifest
+      declares no ``content[*]`` paths, so a block list is LOSSY: ``enforce``
+      refuses it before contacting the guard, and ``monitor``/``dry-run``
+      proceed with a recorded skip. This function is reached in those modes
+      and for the string case.
+
+      Declaring the block paths was tried and reverted. Three provider paths
+      (``content``, ``content[*].text``, ``content[*]``) would collapse onto
+      one guard path, breaking the map's bijection -- an invariant that
+      exists so a value cannot be inspected under another's name -- and the
+      write-back cannot rebuild a block list from a redacted string, so a
+      transform verdict would silently change the request's shape.
+
+      The deeper reason is not mechanical: an image block carries
+      instructions the guard cannot read. Flattening it away and reporting
+      the call covered would claim an inspection that never happened.
     - Pydantic model instances are unwrapped via attribute access.
     - ``role`` defaults to ``"user"`` if missing.
     """

@@ -77,6 +77,30 @@ it can submit prompts as your application and read the verdicts.
   plaintext connection or follow a redirect that would carry it to another
   origin.
 
+### What is refused in `enforce`
+
+`enforce` declines any call it cannot show the guard faithfully, before
+contacting either the guard or the provider. That is the point — the guard is
+never asked about a body it was not shown — but it means some ordinary calls
+are refused rather than guarded:
+
+| Call shape | `enforce` | `monitor` / `dry-run` |
+| --- | --- | --- |
+| String message content | guarded | guarded / skipped |
+| `tools` definitions | guarded | guarded / skipped |
+| **Multi-part content blocks** (vision, Anthropic block lists) | **refused** | proceeds, recorded as a `lossy` skip |
+| **Assistant `tool_calls`** | **refused** | proceeds, recorded as a `lossy` skip |
+| `extra_body` | **refused** | proceeds, recorded as a `lossy` skip |
+
+Multimodal calls are refused because the guard cannot read an image. Flattening
+the blocks to their text and reporting the call covered would claim an
+inspection that never happened.
+
+`state()` reports every one of these: the surface is not `covered`, the skip
+carries its reason, and `is_active()` is False. If your application makes these
+calls and you need it running today, `monitor` observes without blocking — and
+tells you plainly which calls it could not check.
+
 ## Activation
 
 There are three ways to turn the agent on. Pick whichever fits your

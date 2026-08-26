@@ -647,3 +647,39 @@ def test_normalization_preserves_message_VALUES_not_just_paths(surface):
     shown_contents = [m.get("content") for m in guard_input["messages"]]
     assert [c for c in shown_contents if c in provider_contents] == provider_contents, (
         f"{surface.attribute}: message order changed: {shown_contents}")
+
+
+@pytest.mark.parametrize("surface", SURFACES, ids=lambda s: s.attribute)
+def test_MULTIPART_content_is_lossy_deliberately(surface):
+    """Pinned so the refusal is a decision rather than an accident.
+
+    The normalizer flattens text blocks to a joined string, which reads like
+    support -- and it is, for `monitor` and `dry-run`. In `enforce` the call
+    is refused, because the manifest declares no `content[*]` paths.
+
+    Declaring them was tried and reverted: three provider paths would collapse
+    onto one guard path, breaking the bijection that stops a value being
+    inspected under another's name, and the write-back cannot rebuild a block
+    list from a redacted string.
+
+    The substantive reason is that an image block carries instructions the
+    guard cannot read. Documented in python/README.md under "What is refused
+    in enforce", and this test is what keeps that table true.
+    """
+    from tidewall_otel._manifest import lossy_paths
+    from tidewall_otel._bound import bound_nodes
+
+    def target(**kwargs):
+        return kwargs
+
+    kwargs = {"model": "m", "messages": [
+        {"role": "user", "content": [{"type": "text", "text": "describe"}]}]}
+    if surface.provider == "anthropic":
+        kwargs["max_tokens"] = 16
+
+    nodes = bound_nodes(target, (), kwargs, stop=surface.opaque_subtrees, unset=())
+    lossy = lossy_paths(surface, nodes)
+
+    assert any("content" in path for path in lossy), (
+        f"{surface.attribute}: a block list was classified inspectable, so "
+        f"enforce would guard a flattened string and send the blocks")
