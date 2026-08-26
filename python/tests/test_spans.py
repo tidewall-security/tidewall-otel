@@ -315,3 +315,72 @@ def test_the_ASYNC_path_sanitises_exceptions_the_same_way(
         default=str)
     assert "SUPERSECRET" not in rendered, f"the async path leaked: {rendered}"
     assert span.attributes["tidewall.error.type"]
+
+
+_CHUNKS = (b'data: {"id":"1","object":"chat.completion.chunk","created":0,'
+           b'"model":"gpt-4o","choices":[{"index":0,"delta":{"content":"hi"},'
+           b'"finish_reason":null}]}\n\n'
+           b'data: [DONE]\n\n')
+
+
+def _streaming_client():
+    def handler(request):
+        return httpx.Response(200, content=_CHUNKS,
+                              headers={"content-type": "text/event-stream"})
+
+    return openai.OpenAI(api_key="t", http_client=httpx.Client(
+        transport=httpx.MockTransport(handler)))
+
+
+def test_a_STREAMING_call_is_still_guarded_before_the_provider(
+        monkeypatch, exporter):
+    """The security half, asserted separately from the telemetry half.
+
+    A streaming span closes at creation and carries no completion metadata --
+    an observability limit. The guard is unaffected: it inspects the prompt
+    before the provider is called, streaming or not. Those two facts are
+    independent and the second is the one that matters.
+    """
+    _env(monkeypatch)
+    asked = []
+    monkeypatch.setattr(guard_module, "post_guard",
+                        lambda **kw: asked.append(kw["payload"]) or _CLEAN)
+
+    tidewall_otel.activate()
+    stream = _streaming_client().chat.completions.create(
+        model="gpt-4o", messages=[{"role": "user", "content": "hi"}], stream=True)
+
+    assert len(asked) == 1, "a streaming call bypassed the guard"
+    assert asked[0]["guard_input"]["messages"][0]["content"] == "hi"
+    assert list(stream), "the stream did not yield"
+
+
+def test_a_STREAMING_span_SAYS_it_carries_no_completion(monkeypatch, exporter):
+    """Absence of completion metadata must not read as "the model said
+    nothing". The span is marked streaming and marked as not carrying it."""
+    _env(monkeypatch)
+    monkeypatch.setattr(guard_module, "post_guard", lambda **kw: _CLEAN)
+
+    tidewall_otel.activate()
+    _streaming_client().chat.completions.create(
+        model="gpt-4o", messages=[{"role": "user", "content": "hi"}], stream=True)
+
+    span = exporter.get_finished_spans()[0]
+    assert span.attributes.get("tidewall.stream") == "true"
+    assert span.attributes.get("tidewall.stream.completion_recorded") == "false"
+    assert "gen_ai.response.finish_reasons" not in span.attributes, (
+        "a finish reason was invented for a stream nobody had consumed")
+
+
+def test_a_NON_streaming_span_is_unaffected(monkeypatch, exporter, guard_says):
+    """The other direction: ordinary calls must still record completion."""
+    _env(monkeypatch)
+    guard_says(_CLEAN)
+
+    tidewall_otel.activate()
+    _client().chat.completions.create(
+        model="gpt-4o", messages=[{"role": "user", "content": "hi"}])
+
+    span = exporter.get_finished_spans()[0]
+    assert "tidewall.stream" not in span.attributes
+    assert span.attributes["gen_ai.response.finish_reasons"] == ("stop",)

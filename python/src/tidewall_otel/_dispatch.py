@@ -237,13 +237,39 @@ def _record_refusal(span, kind: str, *, blocked: bool = False) -> None:
 def _invoke_and_record(wrapped, args, kwargs, span, surface):
     """Call the provider inside the span and record what came back."""
     response = wrapped(*args, **kwargs)
+    _record_outcome(span, response, kwargs, surface)
+    return response
+
+
+def _record_outcome(span, response, kwargs, surface) -> None:
+    """Record the response, or say honestly that it cannot be recorded.
+
+    A STREAMING call returns before any content exists: the provider hands
+    back a `Stream`, and completion text and finish reason only appear as the
+    caller consumes it. The span closes at creation, so it measures stream
+    SETUP and nothing else.
+
+    Keeping the span open through consumption would mean returning a proxy in
+    place of the provider's own object -- a change to what every streaming
+    caller receives, which is not something a security remediation should
+    introduce quietly. The honest alternative is to say so: the span is marked
+    streaming and carries no completion metadata, so nobody reads its absence
+    as "the model returned nothing".
+
+    The guard is unaffected: it inspects the prompt before the provider is
+    called, streaming or not.
+    """
+    if kwargs.get("stream"):
+        _annotate(span, "tidewall.stream", "true")
+        _annotate(span, "tidewall.stream.completion_recorded", "false")
+        return
+
     record_response_in_span(
         span,
         content=_response_text(response),
         finish_reason=_finish_reason(response),
         include_output=surface.span_output,
     )
-    return response
 
 
 def _response_text(response):
@@ -342,10 +368,7 @@ async def dispatch_async(surface, wrapped, instance, args, kwargs, config, guard
                                   detail=pre.detail)
             _annotate(span, "tidewall.guard.skipped", pre.reason)
             response = await wrapped(*args, **kwargs)
-            record_response_in_span(
-                span, content=_response_text(response),
-                finish_reason=_finish_reason(response),
-                include_output=surface.span_output)
+            _record_outcome(span, response, kwargs, surface)
             return response
 
         try:
@@ -370,8 +393,5 @@ async def dispatch_async(surface, wrapped, instance, args, kwargs, config, guard
 
         provider_kwargs = _apply(decision, call)
         response = await wrapped(*args, **provider_kwargs)
-        record_response_in_span(
-            span, content=_response_text(response),
-            finish_reason=_finish_reason(response),
-            include_output=surface.span_output)
+        _record_outcome(span, response, provider_kwargs, surface)
         return response
