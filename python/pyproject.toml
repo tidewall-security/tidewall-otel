@@ -74,6 +74,10 @@ dev = [
     # failed with a bare CalledProcessError from the build backend. Declared
     # rather than assumed, which is the same lesson as the `otel` extra.
     "setuptools>=68.0",
+    # The span tests need a real tracer. Without this they are skipped,
+    # which is how a documented feature that emitted nothing survived
+    # sixteen review rounds.
+    "opentelemetry-sdk>=1.20.0",
 ]
 all = ["tidewall-otel[otel,openai,anthropic]"]
 

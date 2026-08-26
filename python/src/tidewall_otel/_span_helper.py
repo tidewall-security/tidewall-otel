@@ -58,6 +58,7 @@ def gen_ai_span(
     provider: str,
     model: str,
     guard_input: dict | None = None,
+    include_input: bool = False,
 ) -> Generator[Any, None, None]:
     """Open a ``gen_ai.chat`` span with the standard request attributes.
 
@@ -87,7 +88,13 @@ def gen_ai_span(
         span.set_attribute(_ATTR_SYSTEM, provider)
         span.set_attribute(_ATTR_MODEL, model)
 
-        messages = (guard_input or {}).get("messages")
+        # `include_input` DEFAULTS TO FALSE and the caller passes the
+        # surface's own `span_input` flag. Serialising the conversation
+        # unconditionally is the P0 this programme opened with: prompts carry
+        # credentials, customer data and system prompts, and a span exporter
+        # ships them to an observability backend. The manifest declares the
+        # policy per surface; this function must not decide it.
+        messages = (guard_input or {}).get("messages") if include_input else None
         if messages:
             try:
                 span.set_attribute(
@@ -106,6 +113,7 @@ def record_response_in_span(
     content: str | None = None,
     finish_reason: str | None = None,
     blocked: bool = False,
+    include_output: bool = False,
 ) -> None:
     """Annotate a ``gen_ai.chat`` span with response details.
 
@@ -118,7 +126,10 @@ def record_response_in_span(
         return
 
     try:
-        if content:
+        # Same rule as the input side: `include_output` defaults to False and
+        # the caller passes the surface's `span_output` flag. Completions carry
+        # exactly the material prompts do.
+        if content and include_output:
             span.set_attribute(
                 _ATTR_OUTPUT_MESSAGES,
                 json.dumps([{"role": "assistant", "content": content}]),

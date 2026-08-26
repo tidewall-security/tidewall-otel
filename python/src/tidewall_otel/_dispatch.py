@@ -17,12 +17,14 @@ have to reconstruct arguments they never saw.
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol
 
 from ._bound import bound_nodes
 from ._coverage import classify_input
 from ._execution import DeadlineExceeded, ExecutorSaturated
+from ._span_helper import gen_ai_span, record_response_in_span
 from ._exceptions import LossyInputError, TidewallBlockedError, TidewallRefusedError
 from ._http import GuardSchemaInvalid, GuardTimeout, GuardUnreachable
 from ._manifest import Surface, client_escapes
@@ -208,28 +210,113 @@ def _apply(decision: Decision, call: BoundCall):
     return decision.kwargs
 
 
+logger = logging.getLogger("tidewall.otel.dispatch")
+
+
+def _annotate(span, key: str, value) -> None:
+    """Set one Tidewall attribute, never breaking the call if the span cannot."""
+    if span is None:
+        return
+    try:
+        span.set_attribute(key, str(value))
+    except Exception:                       # pragma: no cover - defensive
+        logger.debug("could not annotate span %s", key, exc_info=True)
+
+
+def _record_refusal(span, kind: str, *, blocked: bool = False) -> None:
+    """Mark a span for a call the provider never saw.
+
+    A refusal is the event an operator opens a trace to explain, so it must
+    leave one. `blocked` distinguishes a policy verdict from a guard failure,
+    because a dashboard that cannot tell them apart cannot triage either.
+    """
+    _annotate(span, "tidewall.refused", kind)
+    record_response_in_span(span, blocked=blocked, include_output=False)
+
+
+def _invoke_and_record(wrapped, args, kwargs, span, surface):
+    """Call the provider inside the span and record what came back."""
+    response = wrapped(*args, **kwargs)
+    record_response_in_span(
+        span,
+        content=_response_text(response),
+        finish_reason=_finish_reason(response),
+        include_output=surface.span_output,
+    )
+    return response
+
+
+def _response_text(response):
+    """Best-effort completion text. Never raises: a span is not worth a call."""
+    try:
+        choices = getattr(response, "choices", None)
+        if choices:
+            return getattr(getattr(choices[0], "message", None), "content", None)
+        content = getattr(response, "content", None)
+        if content:
+            return getattr(content[0], "text", None)
+    except Exception:                       # pragma: no cover - defensive
+        return None
+    return None
+
+
+def _finish_reason(response):
+    try:
+        choices = getattr(response, "choices", None)
+        if choices:
+            return getattr(choices[0], "finish_reason", None)
+        return getattr(response, "stop_reason", None)
+    except Exception:                       # pragma: no cover - defensive
+        return None
+
+
 def dispatch_sync(surface, wrapped, instance, args, kwargs, config, guard, executor,
                   state=None):
     call = _prepare(surface, wrapped, instance, args, kwargs, config, state)
     pre = decide_input(surface, call, config)
 
-    if isinstance(pre, RefuseLossy):
-        raise LossyInputError(pre.paths)
-    if isinstance(pre, SkipGuard):
-        if state is not None:
-            state.record_skip(surface.attribute, reason=pre.reason, detail=pre.detail)
-        return wrapped(*args, **kwargs)
+    # THE SPAN WRAPS EVERY EXIT, including the ones that never reach the
+    # provider. `gen_ai_span` and `record_response_in_span` were defined,
+    # documented and unit-tested while no production path called either, so a
+    # fully guarded call emitted nothing at all -- in a package named
+    # `tidewall-otel`, whose instrumentor docstring promised spans "regardless
+    # of mode". A refusal or a block is exactly the event an operator opens a
+    # trace to find, so those exits carry spans too.
+    #
+    # `include_input` is the surface's own flag, never a default: serialising
+    # the conversation is the P0 this programme opened with.
+    with gen_ai_span(provider=surface.provider,
+                     model=str(call.kwargs.get("model", "")),
+                     guard_input=getattr(pre, "guard_input", None),
+                     include_input=surface.span_input) as span:
+        if isinstance(pre, RefuseLossy):
+            _record_refusal(span, "lossy_input")
+            raise LossyInputError(pre.paths)
 
-    try:
-        # submit BLOCKS and returns the value; `deadline` is keyword-only.
-        raw = executor.submit(guard.check_raw,
-                              guard_input=pre.guard_input,
-                              deadline=config.guard_deadline_s)
-        outcome = classify_response(raw)
-    except BaseException as exc:
-        outcome = dispatch_outcome_for(exc)
+        if isinstance(pre, SkipGuard):
+            if state is not None:
+                state.record_skip(surface.attribute, reason=pre.reason,
+                                  detail=pre.detail)
+            _annotate(span, "tidewall.guard.skipped", pre.reason)
+            return _invoke_and_record(wrapped, args, kwargs, span, surface)
 
-    return wrapped(*args, **_apply(decide_outcome(surface, call, pre, outcome, config), call))
+        try:
+            # submit BLOCKS and returns the value; `deadline` is keyword-only.
+            raw = executor.submit(guard.check_raw,
+                                  guard_input=pre.guard_input,
+                                  deadline=config.guard_deadline_s)
+            outcome = classify_response(raw)
+        except BaseException as exc:
+            outcome = dispatch_outcome_for(exc)
+
+        _annotate(span, "tidewall.guard.outcome", outcome.kind)
+        decision = decide_outcome(surface, call, pre, outcome, config)
+
+        if isinstance(decision, Refuse):
+            _record_refusal(span, outcome.kind, blocked=outcome.kind == "blocked")
+
+        provider_kwargs = _apply(decision, call)
+        return _invoke_and_record(wrapped, args, provider_kwargs, span, surface)
 
 
 async def dispatch_async(surface, wrapped, instance, args, kwargs, config, guard,
@@ -238,25 +325,53 @@ async def dispatch_async(surface, wrapped, instance, args, kwargs, config, guard
     call = _prepare(surface, wrapped, instance, args, kwargs, config, state)
     pre = decide_input(surface, call, config)
 
-    if isinstance(pre, RefuseLossy):
-        raise LossyInputError(pre.paths)
-    if isinstance(pre, SkipGuard):
-        if state is not None:
-            state.record_skip(surface.attribute, reason=pre.reason, detail=pre.detail)
-        return await wrapped(*args, **kwargs)
+    # Same span discipline as the sync path, and it has to be duplicated
+    # rather than shared: the context manager wraps an `await`, so the two
+    # cannot be one function without making the sync path a coroutine.
+    with gen_ai_span(provider=surface.provider,
+                     model=str(call.kwargs.get("model", "")),
+                     guard_input=getattr(pre, "guard_input", None),
+                     include_input=surface.span_input) as span:
+        if isinstance(pre, RefuseLossy):
+            _record_refusal(span, "lossy_input")
+            raise LossyInputError(pre.paths)
 
-    try:
-        # The SAME bounded pool, awaited. run_in_executor(None, ...) would add
-        # the loop's default executor: a second, unbounded queue outside this
-        # admission layer.
-        raw = await executor.submit_awaitable(guard.check_raw,
-                                              guard_input=pre.guard_input,
-                                              deadline=config.guard_deadline_s)
-        outcome = classify_response(raw)
-    except asyncio.CancelledError:
-        raise                               # the caller went away
-    except BaseException as exc:
-        outcome = dispatch_outcome_for(exc)
+        if isinstance(pre, SkipGuard):
+            if state is not None:
+                state.record_skip(surface.attribute, reason=pre.reason,
+                                  detail=pre.detail)
+            _annotate(span, "tidewall.guard.skipped", pre.reason)
+            response = await wrapped(*args, **kwargs)
+            record_response_in_span(
+                span, content=_response_text(response),
+                finish_reason=_finish_reason(response),
+                include_output=surface.span_output)
+            return response
 
-    return await wrapped(*args, **_apply(
-        decide_outcome(surface, call, pre, outcome, config), call))
+        try:
+            # The SAME bounded pool, awaited. run_in_executor(None, ...) would
+            # add the loop's default executor: a second, unbounded queue
+            # outside this admission layer.
+            raw = await executor.submit_awaitable(
+                guard.check_raw,
+                guard_input=pre.guard_input,
+                deadline=config.guard_deadline_s)
+            outcome = classify_response(raw)
+        except asyncio.CancelledError:
+            raise                           # the caller went away
+        except BaseException as exc:
+            outcome = dispatch_outcome_for(exc)
+
+        _annotate(span, "tidewall.guard.outcome", outcome.kind)
+        decision = decide_outcome(surface, call, pre, outcome, config)
+
+        if isinstance(decision, Refuse):
+            _record_refusal(span, outcome.kind, blocked=outcome.kind == "blocked")
+
+        provider_kwargs = _apply(decision, call)
+        response = await wrapped(*args, **provider_kwargs)
+        record_response_in_span(
+            span, content=_response_text(response),
+            finish_reason=_finish_reason(response),
+            include_output=surface.span_output)
+        return response
