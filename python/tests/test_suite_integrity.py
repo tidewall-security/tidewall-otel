@@ -377,7 +377,7 @@ def test_every_public_exception_is_a_TidewallError():
 
 
 def test_no_document_claims_the_OS_ACCOUNT_NAME_is_a_default():
-    """P0-2's claim, asserted against every document that could restate it.
+    """The fail-open claim, asserted against every document that could restate it.
 
     The name-set drift checks compare only which variables appear, never what
     is said about them, so they passed while `_config.py`'s own reference still
@@ -386,7 +386,7 @@ def test_no_document_claims_the_OS_ACCOUNT_NAME_is_a_default():
 
     A wrong default is worse than a missing one here: it tells an operator the
     OS account name is collected by default, which is precisely the privacy
-    defect P0-2 removed. Anyone reading it would either wrongly avoid the
+    defect that was removed. Anyone reading it would either wrongly avoid the
     library or wrongly file a privacy exception for it.
     """
     import re
@@ -453,35 +453,32 @@ def test_every_DOCUMENTED_default_matches_the_code():
     assert not mismatches, "\n".join(mismatches)
 
 
-# REMOVED: an AST detector for "a test whose name claims a universal while its
-# body checks one case". It was wrong FIVE times during construction -- it
-# flagged parametrised tests, matched "at_all", exempted bodies calling `len`,
-# failed to recognise set arithmetic and wholesale equality, and was finally
-# defeated in one line by
+# DELIBERATELY NO AST detector for "a test whose name claims a universal while
+# its body checks one case", which is the defect this file exists to prevent.
+# Such a detector is defeated in one line:
 #
 #     assert any(surface == "one" for surface in surfaces)
 #
-# which claims every surface and checks one. That last is not a bug to patch:
-# `any` is an EXISTENTIAL, and no syntactic rule separates "iterates and checks
-# all" from "iterates and checks one" without understanding the assertion.
-# False-negative freedom was its entire purpose, so a detector this easy to walk
-# past is a green light over an analysis nobody should trust -- the liability
-# rule 17 of the review process describes.
+# claiming every surface and checking one. That is not a bug to patch: `any` is
+# an EXISTENTIAL, and no syntactic rule separates "iterates and checks all"
+# from "iterates and checks one" without understanding the assertion. Since
+# freedom from false negatives would be the whole purpose, a detector this easy
+# to walk past is worse than none -- a green light over an analysis nobody
+# should trust.
 #
-# What replaced it: the specific invariants, each mutation-tested, and the
-# practice this suite already demonstrated better than any detector could --
-# `@pytest.mark.parametrize("surface", SURFACES)` derives its cases from the
-# real collection, so the defect cannot be written in the first place.
+# The alternatives that do work: the specific invariants, each mutation-tested,
+# and deriving cases from the real collection --
+# `@pytest.mark.parametrize("surface", SURFACES)` -- so the defect cannot be
+# written in the first place.
 
 def test_production_code_is_pyflakes_CLEAN(capsys):
     """Not only undefined names: every pyflakes report over `src/`.
 
-    Two lint defects survived the undefined-name check because it filters to
-    that one message class -- a duplicated `TidewallConfigError` import that
-    silently shadowed the first, and an unused `TidewallError` import left
-    behind when exceptions moved modules. Neither breaks anything today; both
-    are the residue of edits that did not finish, and a redefinition in
-    particular is how an import starts resolving to something unintended.
+    An undefined-name check filters to one message class, so it passes over
+    a duplicated import that silently shadows the first, or an unused import
+    left behind when something moved modules. Neither breaks anything on its
+    own; both are the residue of edits that did not finish, and a redefinition
+    in particular is how an import starts resolving to something unintended.
 
     Runs the same tool the suite already trusts, without the filter.
     """
@@ -514,10 +511,10 @@ def test_the_README_names_every_outcome_kind_ENFORCE_can_RAISE():
 
     from tidewall_otel._dispatch import _FAILURES, TIME_REFUSALS
 
-    # Mutation-testing killed the first version of this test. It collected
-    # `outcome_kind="..."` LITERALS, and both time-based refusals are raised
-    # through a variable -- so the regex matched nothing and the test passed
-    # vacuously on the exact kinds it was written to police.
+    # Read the kinds from the source of truth, NOT by scanning for
+    # `outcome_kind="..."` literals: both time-based refusals are raised
+    # through a variable, so such a scan matches neither and passes vacuously
+    # on the exact kinds it polices.
     raised = set(re.findall(r'outcome_kind="([a-z_]+)"', dispatch))
     raised |= set(_FAILURES) | set(TIME_REFUSALS) | {"blocked"}
     assert TIME_REFUSALS <= raised and len(raised) > len(_FAILURES) + 1, \

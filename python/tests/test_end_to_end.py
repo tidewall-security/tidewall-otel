@@ -144,7 +144,7 @@ def test_a_TRANSFORM_rewrites_what_the_provider_receives(guard_says, provider):
 
 
 def test_extra_body_is_REFUSED_through_an_activated_client(guard_says, provider):
-    """P0-11 end to end: the bypass never reaches either side."""
+    """The extra_body bypass, end to end: it reaches neither side."""
     asked = guard_says(CLEAN)
     client, reached = provider
 
@@ -296,14 +296,13 @@ def test_a_failure_MID_ACTIVATION_leaves_no_live_partial_patch(monkeypatch):
 
 
 def test_an_escape_is_recorded_even_AFTER_an_unrelated_event(guard_says, provider):
-    """Finding 2 of round 2. The escape bridge must not be suppressible.
+    """The escape bridge must not be suppressible by unrelated history.
 
-    `and not state.events` added to the downgrade condition in `_prepare`
-    survived the entire behavioural suite: every existing escape test recorded
-    the escape as the FIRST event, so a guard reading "only downgrade while
-    nothing has happened yet" was indistinguishable from a correct one. A prior
-    skip -- a dry-run call, a lossy refusal, anything -- would then suppress
-    every later downgrade while the surface stayed `covered`.
+    A downgrade condition of the form "only while nothing has happened yet"
+    is indistinguishable from a correct one in any test that records the
+    escape as its FIRST event. A prior skip -- a dry-run call, a lossy
+    refusal, anything -- would then suppress every later downgrade while the
+    surface stayed `covered`, so the precondition here is an unrelated event.
     """
     guard_says(CLEAN)
     client, _reached = provider
@@ -327,7 +326,7 @@ def test_an_escape_is_recorded_even_AFTER_an_unrelated_event(guard_says, provide
 
 
 def test_deactivation_that_could_NOT_remove_reports_residual_not_removed(monkeypatch):
-    """Finding 1 of round 2. `removed` must mean removed.
+    """`removed` must mean removed.
 
     When another agent wraps a boundary after us, `PatchManager.remove()`
     correctly declines to write -- deleting their wrapper to reinstate ours
@@ -730,7 +729,7 @@ def test_a_TOOL_CALL_message_is_refused_in_enforce_and_declared_in_monitor():
     An assistant message can carry attacker-controlled
     `tool_calls[].function.arguments`. The normalizer emits only `role` and
     `content`, so the guard would never see them -- which would be a bypass
-    of exactly the P0-11 shape if the agent proceeded anyway.
+    of exactly that shape if the agent proceeded anyway.
 
     It does not. The path is unmapped, therefore lossy: `enforce` refuses
     before either the guard or the provider is contacted, and `monitor`
@@ -776,7 +775,7 @@ def test_a_TOOL_CALL_message_is_refused_in_enforce_and_declared_in_monitor():
 
 
 def test_a_container_that_READS_differently_than_it_STORES_is_refused():
-    """A guard bypass of the P0-11 shape, from the container rather than a kwarg.
+    """A guard bypass of the same shape, from the container rather than a kwarg.
 
     Classification walks values one way and the normalizer reads them another
     -- `items()` here, `get()` there. A dict SUBCLASS that overrides
@@ -1662,7 +1661,7 @@ def test_a_mutation_between_NORMALIZE_and_the_baseline_is_caught(monkeypatch, gu
     Anything running in that window makes the guard inspect the OLD content
     while both the before and after fingerprints describe the NEW content, so
     they compare equal and the mutation check reports nothing. The provider
-    then receives text the guard never saw: the same P0-11 shape, moved one
+    then receives text the guard never saw: the same shape, moved one
     step earlier than the window already closed.
 
     The window is not hypothetical. `gen_ai_span` enters OTel, which invokes

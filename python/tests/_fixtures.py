@@ -69,9 +69,9 @@ def _admits_free_form(annotation, _depth: int = 0, _seen=None) -> str | None:
     Callers MUST resolve annotations first, via
     ``inspect.signature(..., eval_str=True)``. Both provider SDKs use
     ``from __future__ import annotations``, so unresolved annotations are
-    plain strings and this returns ``None`` for absolutely everything -- which
-    is how an earlier version of this scan reported a clean bill of health for
-    every parameter on both providers.
+    plain strings and this returns ``None`` for absolutely everything -- so a
+    scan that forgets `eval_str` reports a clean bill of health for every
+    parameter on both providers.
     """
     if _depth > 5:
         return None

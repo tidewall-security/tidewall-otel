@@ -113,7 +113,7 @@ def test_the_TOKEN_is_never_in_the_config_repr(monkeypatch):
     default. The plain dataclass repr printed
     `token='...'` in cleartext.
 
-    P0-3 protected this token IN TRANSIT: https enforced, redirects refused,
+    The token is protected IN TRANSIT: https enforced, redirects refused,
     no plaintext scheme. Nothing protected its REPRESENTATION, and they are
     the same asset -- an attacker reading it from a log has it just as
     completely as one reading it off the wire.

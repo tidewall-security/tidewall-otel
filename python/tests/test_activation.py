@@ -121,14 +121,15 @@ def test_block_installs_REFUSERS_when_coverage_cannot_be_verified(monkeypatch):
     assert state.is_active() is False
     # NON-EMPTY first: `all()` over an empty dict is vacuously true, so
     # without this the assertion passes when the block branch never runs at
-    # all -- which is exactly what mutation-testing found.
+    # all.
     assert state.surfaces, "no surfaces were marked refusing"
     assert all(d == "refusing" for d in state.surfaces.values()), state.surfaces
 
 
 def test_is_active_DELEGATES_to_the_state(monkeypatch):
-    """A boolean maintained beside the dimensions can disagree with them, and
-    did. Nothing called the public helper, so a hardcoded True survived."""
+    """A boolean maintained beside the dimensions can disagree with them, so
+    the public helper must delegate rather than keep its own answer. Asserted
+    through the public name, or a hardcoded True is never exercised."""
     assert tidewall_otel.is_active() is False
     tidewall_otel.activate()
     assert tidewall_otel.is_active() is tidewall_otel.state().is_active()

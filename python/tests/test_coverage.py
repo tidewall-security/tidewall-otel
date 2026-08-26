@@ -18,7 +18,7 @@ def nodes_for(kwargs):
                             + OPENAI_CHAT_SYNC.non_prompt_bearing)
 
 
-# -- canonicalisation (spec section 3) ------------------------------------
+# -- canonicalisation ------------------------------------------------------
 
 def test_object_KEY_ORDER_is_not_significant():
     assert canonicalise({"a": 1, "b": 2}) == canonicalise({"b": 2, "a": 1})

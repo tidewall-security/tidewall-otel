@@ -237,7 +237,7 @@ def test_a_typed_content_call_in_enforce_reaches_NEITHER_guard_NOR_provider(
 
 
 def test_a_nonempty_extra_body_in_enforce_is_REFUSED(config, executor):
-    """O-11 at dispatch: the bypass is refused before either side is reached."""
+    """extra_body at dispatch: refused before either side is reached."""
     provider, guard = RecordingProvider(), GuardReturning(clean_body())
     call = {**minimal(OPENAI_CHAT_SYNC),
             "extra_body": {"messages": [{"role": "user", "content": "EVIL"}]}}
@@ -368,10 +368,10 @@ def test_ONE_except_clause_catches_every_refusal():
         assert issubclass(cls, TidewallError), cls
 
 
-# -- mode branches: correct, but previously unasserted ---------------------
-# A mechanical mutation sweep -- one that generates mutations from the source
-# rather than from the author's awareness -- found these branches unconstrained.
-# The behaviour was right; nothing held it there.
+# -- mode branches ---------------------------------------------------------
+# Every mode arm of `decide_outcome`, asserted individually. Testing enforce
+# alone leaves the monitor and dry-run branches unconstrained: the behaviour
+# can be right with nothing holding it there.
 
 def test_dry_run_makes_NO_guard_call_at_all(monkeypatch, executor):
     """dry-run's contract is that no request leaves the process. Asserting

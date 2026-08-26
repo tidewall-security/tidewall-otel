@@ -6,9 +6,9 @@ so a fully guarded call emitted nothing at all. In a package named
 `tidewall-otel`, whose instrumentor docstring promised spans "regardless of
 mode".
 
-Third instance of that shape in this codebase -- dispatch in round 1, the
-late-import finder in round 13, and the spans here. Every span test called
-the helper directly, so sixteen adversarial rounds went past it.
+A test that calls the span helper directly proves the helper works and never
+that dispatch calls it, which is how a component stays built, tested and
+wired to nothing. Every test here drives an activated client instead.
 """
 
 import json
@@ -199,7 +199,8 @@ def test_the_ASYNC_path_emits_a_span_too(monkeypatch, exporter, guard_says):
 
 def test_prompt_CONTENT_is_absent_from_the_span_by_default(
         monkeypatch, exporter, guard_says):
-    """P0-1, asserted where it can now actually be violated.
+    """Prompt content must not reach span attributes, asserted where it can
+    actually be violated.
 
     Wiring the span helper is what makes this reachable at all: before it, no
     span existed to leak into. The helper serialised `messages`
@@ -224,7 +225,7 @@ def test_prompt_CONTENT_is_absent_from_the_span_by_default(
 
 def test_a_PROVIDER_error_message_never_reaches_the_span(
         monkeypatch, exporter, guard_says):
-    """Wiring spans reintroduced P0-1 by a route the content flags do not see.
+    """Spans can leak prompt content by a route the content flags do not see.
 
     OTel records an uncaught exception as an event carrying its MESSAGE and
     STACK TRACE. Provider errors echo request bodies, so the conversation

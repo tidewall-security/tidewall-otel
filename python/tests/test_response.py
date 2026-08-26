@@ -166,10 +166,10 @@ def test_the_schema_is_PINNED_against_the_server_package():
 def test_a_BOOL_is_rejected_where_a_non_bool_is_expected(field):
     """Caught by the ordinary type check, since isinstance(True, str) is False.
 
-    A separate bool guard would only be needed for an int- or float-typed
-    field, because bool subclasses int. No field here is numeric, so such a
-    guard could never execute -- mutation-testing proved it dead and it was
-    removed rather than left implying a protection that is not operating.
+    A separate bool guard is needed only for an int- or float-typed field,
+    because bool subclasses int. No field here is numeric, so such a guard
+    could never execute, and dead code implies a protection that is not
+    operating. Add it with the first numeric field.
     """
     result = {"blocked": False, "transformed": False, "policy": "default"}
     result[field] = True

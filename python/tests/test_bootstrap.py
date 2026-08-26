@@ -1,4 +1,4 @@
-"""Bootstrap .pth, replacing sitecustomize (O-5). Task 13."""
+"""The bootstrap .pth, which replaces sitecustomize."""
 
 import base64
 import csv
@@ -195,10 +195,10 @@ def test_a_failing_bootstrap_is_SILENT_unless_debugging(tmp_path):
     """The property that is actually true, and the one worth guarding.
 
     `site` already contains exceptions from a .pth -- it prints the traceback
-    and continues -- so interpreter survival cannot distinguish a contained
-    failure from an uncontained one; mutation-testing showed exactly that.
-    What containment prevents is a TRACEBACK ON EVERY PROCESS START, in every
-    interpreter on the machine including pip's own.
+    and continues -- so asserting that the interpreter survives cannot
+    distinguish a contained failure from an uncontained one, and holds either
+    way. What containment prevents is a TRACEBACK ON EVERY PROCESS START, in
+    every interpreter on the machine including pip's own.
     """
     wheel = build_wheel_for("wheel", tmp_path)
     python, site = _venv(tmp_path)

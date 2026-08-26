@@ -1,4 +1,4 @@
-"""The patch manager (O-6, O-7). Task 6 of the P0 remediation plan."""
+"""The patch manager: transactional installation, and safe removal."""
 
 import inspect
 import sys
@@ -101,7 +101,7 @@ def test_remove_does_NOT_WRITE_when_the_outcome_is_not_ours(module):
 # -- transactional rollback ----------------------------------------------
 
 def test_a_failure_mid_install_ROLLS_BACK_every_earlier_patch(module):
-    """Partial installation is the O-6 defect: some boundaries guarded, some
+    """Partial installation: some boundaries guarded, some
     not, and the agent reporting success."""
     module.Second = type("Second", (), {"create": lambda self: "second"})
     original_first = Target.create
@@ -370,9 +370,9 @@ def test_identity_capture_is_DESCRIPTOR_SAFE(module):
     fresh object each access, so identity comparison against it is
     meaningless. `getattr_static` returns what is actually stored.
 
-    A staticmethod is the cheapest descriptor that demonstrates it: plain
-    functions make getattr and getattr_static agree, which is why this
-    survived mutation until now.
+    A staticmethod is the cheapest descriptor that demonstrates it: with
+    plain functions `getattr` and `getattr_static` agree, so a test using one
+    cannot tell the two apart.
     """
     import inspect
 
@@ -749,11 +749,11 @@ def test_an_entry_appended_RE_ENTRANTLY_during_undo_survives_the_commit(module):
 def test_a_COLLECTED_owner_is_unrecoverable_and_recorded():
     """The only PROVABLE irrecoverable condition: the owner is gone.
 
-    An attribute can always be recreated, so a missing one proves nothing --
-    an earlier version used `hasattr` and classified a live, retryable wrapper
-    as permanent whenever a foreign descriptor raised on class access or a
-    reload made the attribute briefly absent. An owner that has been collected
-    can never carry anything again, and nobody else can reach it either.
+    An attribute can always be recreated, so a missing one proves nothing:
+    keying on `hasattr` classifies a live, retryable wrapper as permanent
+    whenever a foreign descriptor raises on class access or a reload makes the
+    attribute briefly absent. An owner that has been collected can never carry
+    anything again, and nobody else can reach it either.
 
     This drives a REAL collection rather than a manufactured dead reference.
     It only became reachable once the installed wrapper stopped capturing its

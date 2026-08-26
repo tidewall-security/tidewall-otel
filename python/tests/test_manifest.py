@@ -188,7 +188,7 @@ def test_an_anthropic_TYPED_SYSTEM_BLOCK_is_lossy():
 @pytest.mark.parametrize("surface", [OPENAI_CHAT_SYNC, ANTHROPIC_MESSAGES_SYNC],
                          ids=lambda s: s.attribute)
 def test_a_nonempty_extra_body_is_LOSSY(surface):
-    """O-11. Both SDKs merge extra_body OVER the generated body, so it can
+    """Both SDKs merge extra_body OVER the generated body, so it can
     replace the very messages the guard just approved."""
     base = ({"messages": [], "model": "gpt-4o"} if surface is OPENAI_CHAT_SYNC
             else {"messages": [], "model": "c", "max_tokens": 8})
@@ -453,7 +453,7 @@ def test_the_extra_body_OVERRIDE_is_REAL_and_is_classified_lossy():
         extra_body={"messages": [{"role": "user", "content": "EVIL"}]},
     )
     assert captured["body"]["messages"][0]["content"] == "EVIL", (
-        "extra_body no longer overrides the wire body -- re-examine O-11"
+        "extra_body no longer overrides the wire body -- re-examine the rule"
     )
 
     nodes = bound_nodes_for(OPENAI_CHAT_SYNC, (), {
@@ -691,7 +691,7 @@ def test_MULTIPART_content_is_lossy_deliberately(surface):
 # there, but `extra="allow"` models keep unknown fields in
 # `__pydantic_extra__`, which is a SLOT -- and `model_dump()` serialises it.
 # So an extra mutated during the guard call changed the wire payload while
-# the fingerprint stayed byte-identical: the P0-11 shape once more, a
+# the fingerprint stayed byte-identical: one payload inspected and a
 # container reading differently than it stores.
 #
 # Pydantic is one instance of the general defect, so the fix is general:
@@ -744,8 +744,8 @@ def test_an_ANTHROPIC_model_mutated_in_place_is_caught():
 
 
 def test_a_PLAIN_SLOTTED_object_is_snapshotted_not_waved_through():
-    """Slots are the general case. An object with slots and no `__dict__`
-    previously fell to the untrusted fallback on its type name alone, which
+    """Slots are the general case. Without them, an object with slots and no
+    `__dict__` falls to the untrusted fallback on its type name alone -- which
     is stable across any mutation of its actual contents."""
     from tidewall_otel._manifest import _trusted
 
@@ -825,12 +825,10 @@ def test_a_DEEPLY_NESTED_schema_does_not_crash_the_walk():
 
 
 def test_a_SELF_REFERENCING_container_is_marked_as_a_CYCLE():
-    """Mutation-testing killed the first version of this test.
-
-    It asserted only that the walk terminated, which the depth bound alone
-    satisfies -- so deleting cycle detection entirely left it green. That is
-    the quantifier defect this codebase keeps producing: the name claimed
-    cycle detection, the body proved termination.
+    """Asserting only that the walk TERMINATES proves nothing here: the depth
+    bound alone satisfies that, so cycle detection could be deleted outright
+    with such a test still green. The name would claim cycle detection while
+    the body proved termination.
 
     The cycle must be caught WHERE IT CLOSES, at depth 1, not fifty levels
     later once the depth budget runs out -- otherwise every cycle burns the

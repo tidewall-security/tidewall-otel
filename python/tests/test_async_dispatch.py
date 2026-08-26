@@ -200,10 +200,11 @@ def test_all_four_factories_accept_the_executor():
     for name, (factory, _module, _dispatch) in factories.items():
         assert "executor" in inspect.signature(factory).parameters, name
 
-    # The signature check above is SPELLING. This is WIRING: keeping the
-    # parameter and passing `None` to dispatch left the old assertion green --
-    # the executor accepted and discarded, which is exactly the defect that
-    # made every enforce call an invariant violation in round 1.
+    # The signature check above is SPELLING. This is WIRING: a factory that
+    # keeps the parameter and passes `None` to dispatch satisfies a signature
+    # assertion while the executor is accepted and discarded -- and dispatch
+    # then dereferences None, making every enforce call an invariant
+    # violation.
     import asyncio
     import importlib
 
@@ -280,9 +281,9 @@ async def test_the_ASYNC_wrappers_route_through_dispatch(monkeypatch, config, ex
 
 
 def test_the_fail_open_check_is_GONE():
-    """A guard returning None on transport failure is the defect this
-    programme exists to remove. It survived 12b only because the async
-    wrappers still called it."""
+    """A guard returning None on transport failure fails open silently: the
+    caller cannot distinguish "checked, nothing found" from "never checked".
+    The method is gone rather than deprecated, so no caller can reach it."""
     from tidewall_otel._guard import TidewallGuard
 
     assert not hasattr(TidewallGuard, "check")

@@ -163,7 +163,7 @@ def test_the_DOCUMENTED_otel_command_guards_and_reports_itself(tmp_path):
 
 
 def test_the_DECLARED_sdk_ranges_match_the_ranges_the_manifest_VOUCHES_for():
-    """P0-6 asked for defined, tested SDK ranges. The manifest got them; the
+    """SDK version ranges must be defined AND tested. The manifest has them; the
     packaging did not, and the two silently disagreed.
 
     `pyproject.toml` declared `openai>=1.0.0` with NO ceiling while the

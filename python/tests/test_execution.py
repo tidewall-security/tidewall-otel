@@ -49,10 +49,10 @@ def test_a_failed_submission_does_not_leak_capacity():
     _pool.submit would consume a slot forever.
 
     CAPACITY 1 IS LOAD-BEARING. With max_workers=1 and queue_size=1 the
-    capacity is 2, so leaking one slot still leaves one free and the
-    assertion below passes either way -- mutation-testing the release arm
-    showed exactly that: the guard survived. One slot total means a single
-    leak is immediately observable.
+    capacity is 2, so leaking one slot still leaves one free and the assertion
+    below passes either way -- the release arm could be removed entirely
+    without failing. One slot total means a single leak is immediately
+    observable.
     """
     ex = BoundedExecutor(max_workers=1, queue_size=0)
     assert ex._capacity == 1

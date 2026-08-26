@@ -110,8 +110,8 @@ def test_a_nonpositive_or_unparseable_bound_is_refused(monkeypatch, name, bad):
 
 
 # -- validate(): the connection settings ----------------------------------
-# Policy errors raise from __post_init__; these are collected instead, and
-# nothing exercised them -- every branch survived mutation.
+# Policy errors raise from __post_init__; these are COLLECTED instead, so they
+# need their own cases -- the policy tests above cannot reach them.
 
 @pytest.mark.parametrize("missing,expected", [
     ("TIDEWALL_BASE_URL", "TIDEWALL_BASE_URL"),

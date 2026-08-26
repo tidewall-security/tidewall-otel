@@ -1,4 +1,4 @@
-"""Transport hardening (O-3). Task 3 of the P0 remediation plan."""
+"""Transport hardening: TLS, redirects, and typed failures."""
 
 import io
 import urllib.error
@@ -145,9 +145,10 @@ def test_the_socket_timeout_parameter_is_NOT_called_timeout():
     assert "timeout" not in params, "the renamed parameter still exists"
 
 
-# -- failure classification: previously unexercised ------------------------
-# The injected-opener tests never raise, so the typed-exception mapping was
-# unconstrained: every `raise Guard*` in the error paths survived mutation.
+# -- failure classification ------------------------------------------------
+# The injected-opener tests never raise, so they leave the typed-exception
+# mapping unconstrained -- every `raise Guard*` in the error paths needs a
+# case that actually reaches it.
 
 @pytest.mark.parametrize("raised,expected", [
     (urllib.error.URLError(TimeoutError("timed out")), "GuardTimeout"),
