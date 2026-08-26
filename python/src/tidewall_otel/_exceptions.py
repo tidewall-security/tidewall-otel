@@ -6,7 +6,20 @@ from typing import Any
 
 
 class TidewallError(Exception):
-    """Base exception for Tidewall OTel instrumentation errors."""
+    """Base exception for Tidewall OTel instrumentation errors.
+
+    Every declination carries an ``outcome_kind``. The README documents one
+    vocabulary and tells operators to catch this class, but only
+    `TidewallRefusedError` defined the attribute -- so code that branched on
+    it broke on `blocked`, the ordinary policy path this product exists to
+    produce, and the most likely branch anyone writes.
+    """
+
+    #: Overridden per subclass and per raise site. A closed vocabulary:
+    #: `blocked`, `lossy`, `mutated_during_guard`, `unverifiable_payload`,
+    #: `unreachable`, `timeout`, `saturated`, `schema_invalid`,
+    #: `invariant_violated`, `config_invalid`.
+    outcome_kind: str = "invariant_violated"
 
 
 class TidewallBlockedError(TidewallError):
@@ -26,11 +39,14 @@ class TidewallBlockedError(TidewallError):
     ) -> None:
         self.summary = summary
         self.detectors = detectors or {}
+        self.outcome_kind = "blocked"
         super().__init__(f"Tidewall blocked request: {summary}")
 
 
 class TidewallConfigError(TidewallError):
     """Raised when configuration is invalid or incomplete.
+
+    Its ``outcome_kind`` is ``config_invalid``.
 
     Raised BY DEFAULT: ``TIDEWALL_ON_ACTIVATION_FAILURE`` defaults to ``exit``,
     so invalid configuration stops the process rather than letting it continue
@@ -41,6 +57,8 @@ class TidewallConfigError(TidewallError):
     This docstring previously said the default "logs config errors and fails
     open instead" -- describing the exact behaviour this programme removed.
     """
+
+    outcome_kind = "config_invalid"
 
 
 class TidewallRefusedError(TidewallError):

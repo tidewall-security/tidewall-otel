@@ -309,15 +309,17 @@ def test_an_escape_is_recorded_even_AFTER_an_unrelated_event(guard_says, provide
     client, _reached = provider
 
     tidewall_otel.activate()
-    state = tidewall_otel.state()
 
-    # An unrelated event FIRST, recorded through the public seam.
-    state.record_skip("Messages.create", reason="unrelated", detail=None)
-    assert state.events, "the precondition did not take"
+    # An unrelated event FIRST. Recorded on the agent's own state, because
+    # `state()` now hands out a read-only snapshot -- a write to it would
+    # reach nothing, which is why the snapshot refuses rather than accepts.
+    tidewall_otel._state.record_skip("Messages.create", reason="unrelated")
+    assert tidewall_otel.state().events, "the precondition did not take"
 
     client.chat.completions.create(
         model="gpt-4o", messages=[{"role": "user", "content": "hi"}])
 
+    state = tidewall_otel.state()
     assert state.surfaces["Completions.create"] == "unverified", (
         "a prior event suppressed the escape downgrade"
     )
@@ -1588,3 +1590,66 @@ def test_a_GROWING_conversation_does_not_grow_the_event_log(monkeypatch, guard_s
     skip = next(e for e in state.events if e.reason == "lossy")
     assert skip.count == 30, "the recurrence was lost, not just the duplicates"
     assert len(skip.samples) <= 5
+
+
+def test_the_READMEs_exception_branching_EXAMPLE_actually_works(monkeypatch, guard_says, provider):
+    """The README now shows one `except TidewallError` branching on
+    `outcome_kind`. Documentation that has never been executed is a claim,
+    so this runs exactly the shape it prints."""
+    monkeypatch.setenv("TIDEWALL_MODE", "enforce")
+    guard_says(BLOCKED)
+    client, _reached = provider
+
+    tidewall_otel.activate()
+    try:
+        client.chat.completions.create(
+            model="gpt-4o", messages=[{"role": "user", "content": "hi"}])
+        raise AssertionError("the blocked verdict did not raise")
+    except tidewall_otel.TidewallError as declined:
+        assert declined.outcome_kind == "blocked", \
+            "the documented branch does not fire on the ordinary block path"
+
+
+def test_state_CANNOT_be_edited_into_claiming_coverage():
+    """`state()` returned the live object, so anyone holding it could set
+    `lifecycle` and add a surface and make `is_active()` report True with no
+    instrumentation installed at all.
+
+    An operator wires `is_active()` into a health check; a security agent
+    whose own account of itself can be rewritten through its public API is
+    the state-lying-about-reality defect it exists to prevent, arriving
+    through the front door.
+    """
+    tidewall_otel.deactivate()
+    snapshot = tidewall_otel.state()
+
+    with pytest.raises(AttributeError, match="read-only"):
+        snapshot.lifecycle = "installed"
+    with pytest.raises(AttributeError, match="read-only"):
+        snapshot.record_skip("Completions.create", reason="invented")
+
+    # Mutating the copied containers is possible but reaches nothing.
+    snapshot.surfaces["invented"] = "covered"
+    assert "invented" not in tidewall_otel.state().surfaces, \
+        "an edit to the snapshot reached the agent's own state"
+    assert tidewall_otel.state().is_active() is False
+
+
+def test_the_snapshot_still_REPORTS_everything_an_operator_needs():
+    """Read-only must not mean hollow: the snapshot has to carry the same
+    answers, or operators go back to reading internals."""
+    from tidewall_otel._state import State
+
+    live = State(lifecycle="installed", mode="enforce",
+                 surfaces={"Completions.create": "covered"})
+    live.record_guard_health("clean")
+    live.record_skip("Completions.create", reason="lossy", detail=("a",))
+    live.record_skip("Completions.create", reason="lossy", detail=("b",))
+
+    snapshot = live.snapshot()
+    assert snapshot.is_active() is True
+    assert snapshot.guard_health == "ok"
+    assert snapshot.surfaces == {"Completions.create": "covered"}
+    assert [(e.reason, e.count) for e in snapshot.events] == [("lossy", 2)]
+    assert snapshot.events[0].samples == [("a",), ("b",)]
+    assert snapshot.summary() == live.summary()

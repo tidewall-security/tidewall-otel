@@ -252,8 +252,10 @@ def state() -> State:
 
     Always answerable: an operator asking "is it on?" before activation must
     get an answer rather than an exception or None.
+
+    A read-only SNAPSHOT, not the live object. See `State.snapshot`.
     """
-    return _state
+    return _state.snapshot()
 
 
 def deactivate() -> None:

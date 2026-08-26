@@ -94,6 +94,17 @@ class State:
     #: defence is not running caller code under the lock at all -- see
     #: `_record_once` -- and this is the second line.
     _lock: Any = field(default_factory=threading.RLock, repr=False, compare=False)
+    #: True on the copy handed out by `snapshot()`. The agent's own state is
+    #: never frozen.
+    _frozen: bool = field(default=False, repr=False, compare=False)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if getattr(self, "_frozen", False):
+            raise AttributeError(
+                f"state() returns a read-only snapshot; cannot set {name!r}. "
+                "The agent's account of itself is not the caller's to edit."
+            )
+        object.__setattr__(self, name, value)
 
     def is_active(self) -> bool:
         """Whether the agent is enforcing across every boundary present.
@@ -120,6 +131,7 @@ class State:
         cannot vouch for a boundary it must stop claiming it, and an operator
         needs the reason to decide whether they care.
         """
+        self._refuse_if_snapshot()
         self.surfaces[surface] = "unverified"
         self._record_once(StateEvent("unverified", surface, reason, detail))
 
@@ -142,6 +154,7 @@ class State:
         work and `schema_invalid` is the guard answering badly -- calling
         either "unreachable" would misdirect whoever is paging.
         """
+        self._refuse_if_snapshot()
         with self._lock:
             if sequence and sequence < self._health_seq:
                 return          # a slower, older call finishing after a newer one
@@ -171,6 +184,15 @@ class State:
         """
         self._record_once(StateEvent("skip", surface, reason, detail))
 
+    def _refuse_if_snapshot(self) -> None:
+        """A write to a snapshot would silently go nowhere, which is worse
+        than an error: the caller believes they recorded something."""
+        if getattr(self, "_frozen", False):
+            raise AttributeError(
+                "state() returns a read-only snapshot; it cannot record. "
+                "The agent records its own state."
+            )
+
     def _record_once(self, event: StateEvent) -> None:
         """Append an event the first time its exact condition occurs.
 
@@ -179,6 +201,7 @@ class State:
         `count` and contribute up to `_MAX_SAMPLES` distinct details, so an
         operator still sees examples and still learns it recurred.
         """
+        self._refuse_if_snapshot()
         key = (event.kind, event.surface, event.reason)
         with self._lock:
             existing = self._recorded.get(key)
@@ -208,6 +231,36 @@ class State:
                     and not any(sample is event.detail
                                 for sample in existing.samples)):
                 existing.samples.append(event.detail)
+
+    def snapshot(self) -> "State":
+        """A read-only copy, which is what `state()` hands out.
+
+        Returning the live object made the agent's own account of itself
+        writable by anyone holding it: setting `lifecycle` and adding a
+        surface to the returned mapping made `is_active()` report True with
+        no instrumentation installed at all. An operator wiring `is_active()`
+        into a health check is trusting exactly that value, and a security
+        agent whose state can be edited through its public API is the
+        state-lying-about-reality defect it exists to prevent, arriving
+        through the front door.
+
+        Containers are copied, so mutating the snapshot cannot reach the
+        agent, and the snapshot itself refuses assignment rather than
+        accepting an edit that would do nothing.
+        """
+        from dataclasses import replace
+
+        with self._lock:
+            copy = State(
+                lifecycle=self.lifecycle,
+                mode=self.mode,
+                surfaces=dict(self.surfaces),
+                guard_health=self.guard_health,
+                events=[replace(event, samples=list(event.samples))
+                        for event in self.events],
+            )
+        object.__setattr__(copy, "_frozen", True)
+        return copy
 
     def summary(self) -> str:
         """One line naming every dimension.

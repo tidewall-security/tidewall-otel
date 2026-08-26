@@ -100,10 +100,15 @@ def test_the_adapter_is_a_thin_shim_over_the_manager():
     assert instrumentor._manager is not None, "activation bypassed the PatchManager"
     assert instrumentor._executor is not None, "activation created no bounded executor"
 
-    # ONE state object, not two. The wrappers were handed `instrumentor.state`;
-    # if `state()` returns a different instance, every runtime downgrade they
-    # record is invisible to the caller.
-    assert tidewall_otel.state() is instrumentor.state
+    # ONE state, not two. The wrappers were handed `instrumentor.state`; if
+    # that is a different object from the one `state()` reports, every runtime
+    # downgrade they record is invisible to the caller. Asserted by
+    # VISIBILITY rather than identity, because `state()` now returns a
+    # read-only snapshot -- and visibility is the property that matters.
+    instrumentor.state.record_skip("Messages.create", reason="probe")
+    assert any(event.reason == "probe" for event in tidewall_otel.state().events), (
+        "what the wrappers record is invisible through state()"
+    )
 
     # And the manager really holds the boundaries, so removal can compare.
     installed = {e.attribute for e in instrumentor._manager.journal if e.kind == "patch"}

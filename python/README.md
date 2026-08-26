@@ -220,7 +220,23 @@ For each instrumented call, the agent:
 
    Every exception above is a `tidewall_otel.TidewallError`, so one
    `except tidewall_otel.TidewallError` covers every way the agent can
-   decline a call.
+   decline a call — and every one carries `outcome_kind`, so that single
+   clause can branch on the reason without catching subclasses individually:
+
+   ```python
+   try:
+       response = client.chat.completions.create(...)
+   except tidewall_otel.TidewallError as declined:
+       if declined.outcome_kind == "blocked":
+           return "That request was blocked by policy."
+       raise                      # a guard failure is not a policy decision
+   ```
+
+   The classes are `TidewallBlockedError` (`blocked`), `LossyInputError`
+   (`lossy`, a subclass of `TidewallRefusedError`), `TidewallRefusedError`
+   (every other refusal above), and `TidewallConfigError`
+   (`config_invalid`), which is raised at ACTIVATION rather than per call —
+   by default, since `TIDEWALL_ON_ACTIVATION_FAILURE` is `exit`.
 5. Opens a `gen_ai.chat` OTel span with `gen_ai.*` attributes, runs
    the (possibly transformed) call inside the span, and records the
    response.
@@ -250,7 +266,13 @@ can see all three decision paths in a single run.
 - Streaming responses are not currently inspected by the agent — input
   guarding still applies, but per-chunk output guarding is on the
   roadmap.
-- Tool calls (function calling) are passed through unmodified for now.
+- Function calling has two halves, and they are treated differently. **Tool
+  definitions** — the `tools` you send — are shown to the guard and guarded
+  like any other input. **Assistant `tool_calls`** — the model's replies
+  carried back in a later request — are not representable to the guard, so
+  `enforce` refuses them and `monitor` proceeds and records a `lossy` skip.
+  An agent loop that feeds tool results back therefore needs `monitor` today.
+  The guard also does not inspect tool RESULTS as a separate surface.
 - This is alpha-quality software; APIs may change before 1.0.
 
 ## License

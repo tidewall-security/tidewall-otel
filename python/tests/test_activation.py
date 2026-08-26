@@ -58,7 +58,10 @@ def test_activation_is_IDEMPOTENT(monkeypatch):
     tidewall_otel.activate()
     first = tidewall_otel.state()
     tidewall_otel.activate()
-    assert tidewall_otel.state() is first
+    # Equality, not identity: `state()` hands out a fresh read-only snapshot
+    # each call. The claim is that activating twice CHANGES nothing, which
+    # identity only ever tested by proxy.
+    assert tidewall_otel.state() == first
 
 
 def test_deactivation_returns_the_lifecycle_to_removed(monkeypatch):

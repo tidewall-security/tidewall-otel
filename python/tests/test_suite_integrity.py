@@ -604,3 +604,43 @@ def test_no_test_accepts_a_BASE_refusal_without_naming_the_REASON():
     assert not offenders, (
         "these accept any failure the catch-all produces, including a defect "
         "in the code under test:\n  " + "\n  ".join(offenders))
+
+
+def test_the_README_does_not_CONTRADICT_itself_about_tool_calls():
+    """The coverage table said assistant `tool_calls` are refused in enforce
+    while Limitations said function calling passes through unmodified.
+
+    Opposite production behaviour, in one document. An adopter reading the
+    second sentence would deploy `enforce` expecting tool-calling workloads
+    to keep working and receive synchronous refusals instead -- and the two
+    halves of function calling really are treated differently, so the
+    distinction has to be stated rather than averaged.
+    """
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text()
+    limitations = readme[readme.index("## Limitations"):]
+
+    assert "passed through unmodified" not in limitations, \
+        "Limitations still claims tool calls pass through unmodified"
+    assert "tool_calls" in limitations and "definitions" in limitations.lower(), \
+        "Limitations does not distinguish tool definitions from tool_calls"
+
+
+def test_EVERY_tidewall_exception_carries_an_outcome_kind():
+    """The README documents one vocabulary and tells operators to catch
+    `TidewallError`, but only `TidewallRefusedError` defined the attribute --
+    so `except TidewallError as e: e.outcome_kind` raised `AttributeError`
+    on `blocked`, the ordinary policy path this product exists to produce
+    and the most likely branch anyone writes.
+    """
+    import inspect
+
+    from tidewall_otel import _exceptions
+
+    documented = (Path(__file__).resolve().parents[1] / "README.md").read_text()
+
+    for name, klass in vars(_exceptions).items():
+        if not (inspect.isclass(klass) and issubclass(klass, _exceptions.TidewallError)):
+            continue
+        assert hasattr(klass, "outcome_kind"), f"{name} carries no outcome_kind"
+        if klass is not _exceptions.TidewallError:
+            assert name in documented, f"{name} is raised but never documented"
