@@ -771,3 +771,84 @@ def test_a_TOOL_CALL_message_is_refused_in_enforce_and_declared_in_monitor():
     finally:
         guard_module.post_guard = original
         tidewall_otel.deactivate()
+
+
+def test_a_container_that_READS_differently_than_it_STORES_is_refused():
+    """A guard bypass of the P0-11 shape, from the container rather than a kwarg.
+
+    Classification walks values one way and the normalizer reads them another
+    -- `items()` here, `get()` there. A dict SUBCLASS that overrides
+    `get("content")` therefore showed the guard benign text while the
+    provider serialised the stored value, and the call PROCEEDED in enforce.
+    Reproduced before the fix: guard saw "benign text", provider received the
+    attack.
+
+    Fail-closed rather than clever: when two readings of a container
+    disagree, the agent cannot say which the provider will use, so the call
+    is lossy and enforce declines it.
+    """
+    import json
+    import os
+
+    import tidewall_otel._guard as guard_module
+
+    class Deceptive(dict):
+        def get(self, key, default=None):
+            if key == "content":
+                return "benign text"
+            return super().get(key, default)
+
+    os.environ["TIDEWALL_MODE"] = "enforce"
+    asked, sent = [], []
+    original = guard_module.post_guard
+    guard_module.post_guard = lambda **kw: (asked.append(kw["payload"]), {"result": CLEAN})[1]
+
+    tidewall_otel.activate()
+    try:
+        client = openai.OpenAI(api_key="t", http_client=httpx.Client(
+            transport=httpx.MockTransport(
+                lambda r: (sent.append(json.loads(r.content)),
+                           httpx.Response(200, json=_COMPLETION))[1])))
+
+        with pytest.raises(tidewall_otel.LossyInputError):
+            client.chat.completions.create(
+                model="gpt-4o",
+                messages=[Deceptive(role="user",
+                                    content="SECRET MALICIOUS INSTRUCTION")])
+
+        assert asked == [], "the guard was shown a body the provider would not send"
+        assert sent == [], "the provider received an uninspected payload"
+    finally:
+        guard_module.post_guard = original
+        tidewall_otel.deactivate()
+
+
+def test_an_ORDINARY_container_is_not_refused_by_the_divergence_check():
+    """The other direction. Subclassed mappings are ordinary in SDK code, and
+    a check that refused them all would be unusable -- only a container whose
+    readings actually DISAGREE is lossy."""
+    import os
+
+    import tidewall_otel._guard as guard_module
+
+    class Benign(dict):
+        pass
+
+    os.environ["TIDEWALL_MODE"] = "enforce"
+    original = guard_module.post_guard
+    guard_module.post_guard = lambda **kw: {"result": CLEAN}
+
+    tidewall_otel.activate()
+    try:
+        client = openai.OpenAI(api_key="t", http_client=httpx.Client(
+            transport=httpx.MockTransport(
+                lambda r: httpx.Response(200, json=_COMPLETION))))
+
+        for message in ({"role": "user", "content": "hi"},
+                        Benign(role="user", content="hi")):
+            result = client.chat.completions.create(
+                model="gpt-4o", messages=[message])
+            assert result.choices[0].message.content == "ok"
+    finally:
+        guard_module.post_guard = original
+        tidewall_otel.deactivate()

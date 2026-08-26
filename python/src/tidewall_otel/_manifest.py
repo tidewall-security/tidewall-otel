@@ -436,6 +436,30 @@ def _is_non_prompt_bearing(surface: Surface, path: str) -> bool:
     return any(matches(pattern, path) for pattern in surface.non_prompt_bearing)
 
 
+def _divergent_containers(nodes: dict[str, Any]) -> list[str]:
+    """Paths whose container reads differently through `get()` than it stores.
+
+    Only mappings are checked, and only where the two readings actually
+    differ: the point is not to reject subclasses, which are ordinary in SDK
+    code, but to refuse the specific case where the agent cannot tell which
+    value the provider will serialise.
+    """
+    divergent: list[str] = []
+    for path, value in nodes.items():
+        if not isinstance(value, dict):
+            continue
+        for key in list(value.keys()):
+            try:
+                stored = dict.__getitem__(value, key)
+                read = value.get(key)
+            except Exception:               # pragma: no cover - defensive
+                divergent.append(f"{path}.{key}")
+                continue
+            if stored is not read and stored != read:
+                divergent.append(f"{path}.{key}")
+    return divergent
+
+
 def lossy_paths(surface: Surface, nodes: dict[str, Any]) -> tuple[str, ...]:
     """Every bound path this surface cannot faithfully send.
 
@@ -451,6 +475,23 @@ def lossy_paths(surface: Surface, nodes: dict[str, Any]) -> tuple[str, ...]:
     parameter and enforce mode refuses everything.
     """
     lossy: list[str] = []
+
+    # FOURTH source, and the only one about the container rather than the
+    # path: a mapping whose `get()` disagrees with what it stores.
+    #
+    # Classification walks values one way and the normalizer reads them
+    # another -- `items()`/`vars()` here, `get()`/`getattr()` there. A dict
+    # SUBCLASS that overrides `get("content")` therefore showed the guard
+    # "benign text" while the provider serialised the stored value, and the
+    # call proceeded in enforce. That is the P0-11 shape exactly: one payload
+    # inspected, a different one sent, with nothing in between noticing.
+    #
+    # Fail-closed rather than clever: if the two readings of a container
+    # disagree, the agent cannot say which one the provider will use, so the
+    # call is lossy and enforce declines it. A plain dict, and any container
+    # whose readings agree, is unaffected.
+    lossy.extend(_divergent_containers(nodes))
+
     for path, value in nodes.items():
         if any(matches(pattern, path) for pattern in surface.known_lossy):
             lossy.append(path)
