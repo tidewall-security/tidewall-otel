@@ -296,7 +296,7 @@ def _finish_reason(response):
         return None
 
 
-def _refuse_if_mutated(surface, call, before, span) -> None:
+def _handle_mutation(surface, call, before, span, config, state) -> None:
     """Refuse if what we inspected is no longer what we would send.
 
     The guard is asked about a snapshot; the provider is invoked with the
@@ -307,10 +307,23 @@ def _refuse_if_mutated(surface, call, before, span) -> None:
 
     This does not lock the caller's data, which the agent does not own. It
     declines to proceed when the two no longer match.
+
+    Outside enforce it must not decline at all. Monitor's promise is that it
+    does not affect users, and every other refusal path here honours that:
+    blocked, transformed, and every failure kind fall through to Proceed.
+    This one raised unconditionally, so a caller mutating its own kwargs had
+    its request killed by the mode that exists to kill nothing. Monitor still
+    cannot vouch for the surface, so it says so durably instead -- out of the
+    threat model is not the same as unnoticed.
     """
     if content_fingerprint(surface, call.kwargs) == before:
         return
     _annotate(span, "tidewall.refused", "mutated_during_guard")
+    if config.mode != "enforce":
+        if state is not None:
+            state.record_unverified(surface.attribute,
+                                    reason="mutated_during_guard")
+        return
     raise TidewallRefusedError(
         "refusing: the request changed while the guard was inspecting it",
         outcome_kind="mutated_during_guard",
@@ -359,7 +372,7 @@ def dispatch_sync(surface, wrapped, instance, args, kwargs, config, guard, execu
             outcome = dispatch_outcome_for(exc)
 
         _annotate(span, "tidewall.guard.outcome", outcome.kind)
-        _refuse_if_mutated(surface, call, before, span)
+        _handle_mutation(surface, call, before, span, config, state)
         decision = decide_outcome(surface, call, pre, outcome, config)
 
         if isinstance(decision, Refuse):
@@ -412,7 +425,7 @@ async def dispatch_async(surface, wrapped, instance, args, kwargs, config, guard
             outcome = dispatch_outcome_for(exc)
 
         _annotate(span, "tidewall.guard.outcome", outcome.kind)
-        _refuse_if_mutated(surface, call, before, span)
+        _handle_mutation(surface, call, before, span, config, state)
         decision = decide_outcome(surface, call, pre, outcome, config)
 
         if isinstance(decision, Refuse):

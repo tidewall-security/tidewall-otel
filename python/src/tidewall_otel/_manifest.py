@@ -443,7 +443,59 @@ def _is_non_prompt_bearing(surface: Surface, path: str) -> bool:
 _EXACT_SCALARS = (str, int, float, bool)
 
 
-def _trusted(value: Any) -> Any:
+_MEMBER_DESCRIPTOR = type(type("_S", (), {"__slots__": ("x",)}).x)
+
+# The walk is bounded. Recursion was unbounded, so a deeply nested tool
+# schema raised `RecursionError` and a self-referencing container did the
+# same -- and `content_fingerprint` is called OUTSIDE dispatch's try block,
+# so it escaped as a crash attributable to this agent rather than as a
+# verdict. Exhausting a budget is not a licence to wave the value through:
+# it snapshots as unvouchable, which is what the agent actually knows.
+#
+# 50 is far past real JSON Schema nesting (a 2000-field schema walks in
+# under 2ms and is 2 deep); the budget exists for the pathological case.
+_MAX_DEPTH = 50
+_MAX_NODES = 20_000
+
+
+def _slot_state(value: Any, depth: int, path: frozenset, budget: list) -> tuple:
+    """Values stored in `__slots__`, read through the member descriptor.
+
+    `__dict__` is not all of an object's state. Pydantic v2 keeps declared
+    fields there, but an `extra="allow"` model keeps unknown fields in
+    `__pydantic_extra__` -- a slot -- and `model_dump()` serialises them. An
+    extra mutated during the guard call therefore changed the wire payload
+    while a `__dict__`-only fingerprint stayed byte-identical.
+
+    Pydantic is one instance of the general defect, so this is general:
+    every slot declared anywhere in the MRO. Reading through the descriptor
+    rather than attribute access is the same rule the mapping branch follows
+    with `dict.items` -- an overridden `__getattribute__` must not be able to
+    dress up what is actually stored.
+    """
+    items = []
+    for klass in type(value).__mro__:
+        declared = klass.__dict__.get("__slots__", ())
+        if isinstance(declared, str):
+            declared = (declared,)
+        for name in declared:
+            if name in ("__dict__", "__weakref__"):
+                continue
+            descriptor = klass.__dict__.get(name)
+            if not isinstance(descriptor, _MEMBER_DESCRIPTOR):
+                continue                    # shadowed by a class attribute
+            try:
+                items.append((str(name), _trusted(
+                    descriptor.__get__(value, klass), depth + 1, path, budget)))
+            except AttributeError:
+                items.append((str(name), ("unset", None)))
+            except Exception:               # pragma: no cover - defensive
+                items.append((str(name), ("?", "unreadable")))
+    return tuple(sorted(items, key=repr))
+
+
+def _trusted(value: Any, depth: int = 0, path: frozenset = frozenset(),
+             budget: list | None = None) -> Any:
     """A snapshot comparable with BUILT-IN operations only.
 
     The divergence check first compared readings with `!=`, which calls the
@@ -457,12 +509,37 @@ def _trusted(value: Any) -> Any:
     `("?", "LyingStr")` rather than as a string, and nothing it overrides can
     make that match `("str", "benign text")`.
     """
+    if budget is None:
+        budget = [_MAX_NODES]
+    budget[0] -= 1
+    if budget[0] < 0:
+        return ("?", "budget-exhausted")
+    if depth > _MAX_DEPTH:
+        return ("?", "too-deep")
+
     if value is None:
         return ("none", None)
     if type(value) in _EXACT_SCALARS:
         return (type(value).__name__, value)
+
+    # Containers can refer to themselves. Track identity along THIS path
+    # only, so a value shared between siblings still snapshots normally.
+    if id(value) in path:
+        return ("?", "cycle")
+    inner = path | {id(value)}
+
     if type(value) in (list, tuple):
-        return ("list", tuple(_trusted(item) for item in value))
+        return ("list", tuple(_trusted(item, depth + 1, inner, budget)
+                              for item in value))
+    if type(value) in (set, frozenset):
+        # Ordinary data, and reachable through slots: pydantic keeps
+        # `__pydantic_fields_set__` as a set. Leaving it to the untrusted
+        # fallback would mark every pydantic-bearing message divergent and
+        # refuse legitimate traffic in enforce. Sorted by snapshot, because
+        # iteration order is not part of the value.
+        return ("set", tuple(sorted(
+            (_trusted(item, depth + 1, inner, budget) for item in value),
+            key=repr)))
 
     if isinstance(value, dict):
         # SUBCLASSES INCLUDED, read through `dict.items` rather than the
@@ -473,7 +550,8 @@ def _trusted(value: Any) -> Any:
         # items is also what makes the snapshot immune to an overridden
         # `items()` or `get()`.
         return ("dict", type(value).__name__, tuple(sorted(
-            (str(key), _trusted(item)) for key, item in dict.items(value))))
+            (str(key), _trusted(item, depth + 1, inner, budget))
+            for key, item in dict.items(value))))
 
     # SCALAR SUBCLASSES ARE NEVER TRUSTED, and this must come before the
     # object branch below: a `str` subclass has a `__dict__` like any other
@@ -487,15 +565,18 @@ def _trusted(value: Any) -> Any:
     # Objects with instance state -- pydantic message and tool models are the
     # ordinary case, and the SDKs hand them to callers routinely. Snapshot
     # their `__dict__` through `object.__getattribute__`, so a descriptor or
-    # `__getattr__` cannot dress up what is actually stored. Refusing these
-    # outright would be a denial of service on legitimate applications.
+    # `__getattr__` cannot dress up what is actually stored.
     try:
         state = object.__getattribute__(value, "__dict__")
     except Exception:
-        return ("?", type(value).__name__)
+        state = None
+    slots = _slot_state(value, depth, inner, budget)
     if type(state) is dict:
         return ("obj", type(value).__name__, tuple(sorted(
-            (str(key), _trusted(item)) for key, item in dict.items(state))))
+            (str(key), _trusted(item, depth + 1, inner, budget))
+            for key, item in dict.items(state))), slots)
+    if slots:
+        return ("obj", type(value).__name__, (), slots)
 
     # Anything else is not something this agent can vouch for.
     return ("?", type(value).__name__)

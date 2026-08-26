@@ -1013,3 +1013,97 @@ def test_a_MUTATED_dict_subclass_is_caught_by_the_fingerprint():
     finally:
         guard_module.post_guard = original
         tidewall_otel.deactivate()
+
+
+def test_MONITOR_does_not_block_on_a_mutation_it_cannot_verify(monkeypatch, provider):
+    """Monitor's whole promise is that it does not affect users.
+
+    Every other refusal path honours the mode switch -- blocked, transformed,
+    and every failure kind fall through to Proceed outside enforce. The
+    mutation check did not: it raised unconditionally, so a caller who
+    mutated its own kwargs during the guard call had its request killed by
+    the mode that exists precisely to kill nothing.
+
+    Monitor cannot claim the surface either. It records `unverified` with the
+    reason, which is the difference between out-of-model and unnoticed.
+    """
+    import tidewall_otel._guard as guard_module
+
+    monkeypatch.setenv("TIDEWALL_MODE", "monitor")
+    message = {"role": "user", "content": "benign at inspection time"}
+    client, reached = provider
+
+    def mutating_guard(**kwargs):
+        message["content"] = "changed after inspection"
+        return {"result": CLEAN}
+
+    monkeypatch.setattr(guard_module, "post_guard", mutating_guard)
+
+    tidewall_otel.activate()
+    client.chat.completions.create(model="gpt-4o", messages=[message])
+
+    assert len(reached) == 1, "monitor blocked a call it only promised to watch"
+    state = tidewall_otel.state()
+    assert state.surfaces["Completions.create"] == "unverified"
+    assert any(e.reason == "mutated_during_guard" for e in state.events), \
+        "monitor proceeded but recorded nothing, which is a silent bypass"
+
+
+async def test_MONITOR_does_not_block_on_a_mutation_on_the_ASYNC_path(monkeypatch):
+    """The async mutation window is the wider of the two -- the loop can run
+    arbitrary other tasks while the guard call is awaited -- so the async path
+    needs its own proof, not the sync path's."""
+    import tidewall_otel._guard as guard_module
+
+    monkeypatch.setenv("TIDEWALL_MODE", "monitor")
+    message = {"role": "user", "content": "benign at inspection time"}
+    reached = []
+
+    def mutating_guard(**kwargs):
+        message["content"] = "changed after inspection"
+        return {"result": CLEAN}
+
+    monkeypatch.setattr(guard_module, "post_guard", mutating_guard)
+
+    def handler(request):
+        reached.append(json.loads(request.content))
+        return httpx.Response(200, json=_COMPLETION)
+
+    client = openai.AsyncOpenAI(
+        api_key="t",
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+
+    tidewall_otel.activate()
+    await client.chat.completions.create(model="gpt-4o", messages=[message])
+
+    assert len(reached) == 1, "monitor blocked an async call it only watched"
+    state = tidewall_otel.state()
+    assert any(e.reason == "mutated_during_guard" for e in state.events)
+
+
+async def test_ENFORCE_still_refuses_a_mutation_on_the_ASYNC_path(monkeypatch):
+    """Making monitor non-blocking must not make enforce non-blocking. The
+    async arm gets its own enforce proof for the same reason."""
+    import tidewall_otel._guard as guard_module
+
+    monkeypatch.setenv("TIDEWALL_MODE", "enforce")
+    message = {"role": "user", "content": "benign at inspection time"}
+    reached = []
+
+    def mutating_guard(**kwargs):
+        message["content"] = "MALICIOUS after inspection"
+        return {"result": CLEAN}
+
+    monkeypatch.setattr(guard_module, "post_guard", mutating_guard)
+
+    client = openai.AsyncOpenAI(
+        api_key="t",
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda r: (reached.append(json.loads(r.content)),
+                       httpx.Response(200, json=_COMPLETION))[1])))
+
+    tidewall_otel.activate()
+    with pytest.raises(tidewall_otel.TidewallRefusedError, match="changed"):
+        await client.chat.completions.create(model="gpt-4o", messages=[message])
+
+    assert reached == [], "async enforce sent content nothing inspected"

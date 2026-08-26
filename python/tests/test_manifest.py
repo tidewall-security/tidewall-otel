@@ -683,3 +683,178 @@ def test_MULTIPART_content_is_lossy_deliberately(surface):
     assert any("content" in path for path in lossy), (
         f"{surface.attribute}: a block list was classified inspectable, so "
         f"enforce would guard a flattened string and send the blocks")
+
+
+# -- state that does not live in __dict__ ----------------------------------
+#
+# The object branch read `__dict__` alone. Pydantic v2 keeps declared fields
+# there, but `extra="allow"` models keep unknown fields in
+# `__pydantic_extra__`, which is a SLOT -- and `model_dump()` serialises it.
+# So an extra mutated during the guard call changed the wire payload while
+# the fingerprint stayed byte-identical: the P0-11 shape once more, a
+# container reading differently than it stores.
+#
+# Pydantic is one instance of the general defect, so the fix is general:
+# snapshot every slot declared across the MRO, read through the member
+# descriptor so an overridden `__getattr__` cannot dress up what is stored.
+
+def test_a_PYDANTIC_EXTRA_field_is_inside_the_fingerprint():
+    """The exact bypass, on a real pydantic v2 model."""
+    import pydantic
+    from tidewall_otel._manifest import _trusted
+
+    class Model(pydantic.BaseModel):
+        model_config = pydantic.ConfigDict(extra="allow")
+        role: str
+
+    message = Model(role="user", content="benign")
+    before = _trusted(message)
+    assert message.model_dump()["content"] == "benign"
+
+    message.content = "MALICIOUS"
+
+    assert message.model_dump()["content"] == "MALICIOUS", "premise wrong"
+    assert _trusted(message) != before, \
+        "an extra field changed the serialised payload invisibly"
+
+
+def test_a_REAL_SDK_model_mutated_in_place_is_caught():
+    """Agent loops append the assistant's own response object back into
+    `messages`, so real SDK models genuinely reach this code as request
+    content -- the dict-subclass test did not establish that."""
+    from openai.types.chat import ChatCompletionMessage
+
+    from tidewall_otel._manifest import _trusted
+
+    message = ChatCompletionMessage(role="assistant", content="benign")
+    before = _trusted(message)
+    message.content = "MALICIOUS"
+    assert _trusted(message) != before, "a real OpenAI model mutated invisibly"
+
+
+def test_an_ANTHROPIC_model_mutated_in_place_is_caught():
+    from anthropic.types import TextBlock
+
+    from tidewall_otel._manifest import _trusted
+
+    block = TextBlock(type="text", text="benign")
+    before = _trusted(block)
+    block.text = "MALICIOUS"
+    assert _trusted(block) != before, "a real Anthropic model mutated invisibly"
+
+
+def test_a_PLAIN_SLOTTED_object_is_snapshotted_not_waved_through():
+    """Slots are the general case. An object with slots and no `__dict__`
+    previously fell to the untrusted fallback on its type name alone, which
+    is stable across any mutation of its actual contents."""
+    from tidewall_otel._manifest import _trusted
+
+    class Slotted:
+        __slots__ = ("payload",)
+
+        def __init__(self, payload):
+            self.payload = payload
+
+    value = Slotted("benign")
+    before = _trusted(value)
+    value.payload = "MALICIOUS"
+    assert _trusted(value) != before, "slot state mutated invisibly"
+
+
+def test_slot_reads_ignore_a_LYING_getattr():
+    """Read through the member descriptor, not attribute access, for the same
+    reason the dict branch reads through `dict.items`."""
+    from tidewall_otel._manifest import _trusted
+
+    class Liar:
+        __slots__ = ("payload",)
+
+        def __init__(self, payload):
+            self.payload = payload
+
+        def __getattribute__(self, name):
+            if name == "payload":
+                return "benign"
+            return object.__getattribute__(self, name)
+
+    value = Liar("MALICIOUS")
+    assert value.payload == "benign", "premise wrong"
+    snapshot = repr(_trusted(value))
+    assert "MALICIOUS" in snapshot, "the snapshot believed an overridden reader"
+
+
+def test_ordinary_PYDANTIC_content_is_not_marked_divergent():
+    """The fix above must not become a denial of service.
+
+    `__pydantic_fields_set__` is a set, and slot capture puts it inside every
+    pydantic snapshot. Left to the untrusted fallback it would snapshot as
+    `("?", "set")`, and `_divergent_containers` refuses any mapping value it
+    cannot vouch for -- so every message carrying a pydantic model would be
+    refused as lossy in enforce. Sets are ordinary data and snapshot as such.
+    """
+    from openai.types.chat import ChatCompletionMessage
+
+    from tidewall_otel._manifest import _divergent_containers, _is_untrusted, _trusted
+
+    message = ChatCompletionMessage(role="assistant", content="hello")
+    assert not _is_untrusted(_trusted(message)), \
+        "an ordinary SDK model snapshotted as unvouchable"
+    assert _divergent_containers({"messages[0]": {"m": message}}) == []
+
+
+# -- the walk is bounded ---------------------------------------------------
+#
+# Recursion was unbounded. `content_fingerprint` is called OUTSIDE dispatch's
+# try block, so a deeply nested schema or a self-referencing container
+# escaped as a `RecursionError` attributable to this agent rather than as a
+# verdict -- breaking both enforce and monitor on a payload the agent was
+# only supposed to inspect.
+
+def test_a_DEEPLY_NESTED_schema_does_not_crash_the_walk():
+    from tidewall_otel._manifest import _is_untrusted, _trusted
+
+    deep = {"type": "object"}
+    node = deep
+    for _ in range(600):                    # past CPython's recursion limit
+        node["properties"] = {"x": {"type": "object"}}
+        node = node["properties"]["x"]
+
+    snapshot = _trusted(deep)               # must not raise
+    assert _is_untrusted(snapshot), \
+        "exhausting the budget waved the value through as vouched-for"
+
+
+def test_a_SELF_REFERENCING_container_terminates():
+    from tidewall_otel._manifest import _trusted
+
+    cycle = {}
+    cycle["self"] = cycle
+    assert _trusted(cycle)                  # must not raise or hang
+
+
+def test_a_value_shared_between_siblings_is_still_snapshotted():
+    """Cycle detection tracks identity along the current path only. Tracking
+    it globally would snapshot the second occurrence of any shared value as a
+    cycle, and SDK payloads reuse objects routinely."""
+    from tidewall_otel._manifest import _trusted
+
+    shared = {"role": "user", "content": "hello"}
+    snapshot = repr(_trusted({"a": shared, "b": shared}))
+    assert snapshot.count("hello") == 2, "a shared value was mistaken for a cycle"
+
+
+def test_a_LARGE_tool_schema_stays_cheap():
+    """The bound must not become the cost. A realistic large schema walks in
+    milliseconds; the budget is for the pathological case."""
+    import time
+
+    from tidewall_otel._manifest import _trusted
+
+    schema = {"type": "object", "properties": {
+        f"field_{i}": {"type": "string", "description": "x" * 50}
+        for i in range(2000)}}
+
+    started = time.perf_counter()
+    _trusted(schema)
+    elapsed = time.perf_counter() - started
+    assert elapsed < 0.5, f"walking a 2000-field schema took {elapsed:.3f}s"
