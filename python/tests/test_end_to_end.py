@@ -1653,3 +1653,85 @@ def test_the_snapshot_still_REPORTS_everything_an_operator_needs():
     assert [(e.reason, e.count) for e in snapshot.events] == [("lossy", 2)]
     assert snapshot.events[0].samples == [("a",), ("b",)]
     assert snapshot.summary() == live.summary()
+
+
+def test_a_mutation_between_NORMALIZE_and_the_baseline_is_caught(monkeypatch, guard_says):
+    """The guard is shown a normalized copy, and the fingerprint baseline was
+    taken AFTERWARDS -- with span construction in between.
+
+    Anything running in that window makes the guard inspect the OLD content
+    while both the before and after fingerprints describe the NEW content, so
+    they compare equal and the mutation check reports nothing. The provider
+    then receives text the guard never saw: the same P0-11 shape, moved one
+    step earlier than the window already closed.
+
+    The window is not hypothetical. `gen_ai_span` enters OTel, which invokes
+    every registered span processor -- ordinary application code, running on
+    the caller's thread, on every guarded call.
+    """
+    import tidewall_otel._dispatch as dispatch
+
+    monkeypatch.setenv("TIDEWALL_MODE", "enforce")
+    asked = guard_says(CLEAN)
+    message = {"role": "user", "content": "benign at normalisation time"}
+    sent = []
+
+    real_span = dispatch.gen_ai_span
+
+    def mutating_span(*args, **kwargs):
+        # Exactly where a span processor runs: after normalize(), before the
+        # baseline fingerprint.
+        message["content"] = "MALICIOUS after the guard's copy was taken"
+        return real_span(*args, **kwargs)
+
+    monkeypatch.setattr(dispatch, "gen_ai_span", mutating_span)
+
+    client = openai.OpenAI(api_key="t", http_client=httpx.Client(
+        transport=httpx.MockTransport(
+            lambda r: (sent.append(json.loads(r.content)),
+                       httpx.Response(200, json=_COMPLETION))[1])))
+
+    tidewall_otel.activate()
+    with pytest.raises(tidewall_otel.TidewallRefusedError) as raised:
+        client.chat.completions.create(model="gpt-4o", messages=[message])
+
+    assert raised.value.outcome_kind == "mutated_during_guard"
+    assert sent == [], "the provider received content the guard never saw"
+    # The guard really was shown the ORIGINAL text, which is what makes the
+    # mismatch a mismatch rather than a false alarm.
+    assert asked, "the guard was never called"
+    assert "benign" in json.dumps(asked[0]), \
+        "premise: the guard was shown the pre-mutation content"
+
+
+async def test_the_pre_baseline_window_is_closed_on_the_ASYNC_path(monkeypatch, guard_says):
+    """The async arm has the same window, and holds it open longer: the
+    coroutine can be suspended anywhere between normalisation and the
+    baseline while the loop runs other tasks."""
+    import tidewall_otel._dispatch as dispatch
+
+    monkeypatch.setenv("TIDEWALL_MODE", "enforce")
+    asked = guard_says(CLEAN)
+    message = {"role": "user", "content": "benign at normalisation time"}
+    reached = []
+
+    real_span = dispatch.gen_ai_span
+
+    def mutating_span(*args, **kwargs):
+        message["content"] = "MALICIOUS after the guard's copy was taken"
+        return real_span(*args, **kwargs)
+
+    monkeypatch.setattr(dispatch, "gen_ai_span", mutating_span)
+
+    client = openai.AsyncOpenAI(api_key="t", http_client=httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda r: (reached.append(json.loads(r.content)),
+                       httpx.Response(200, json=_COMPLETION))[1])))
+
+    tidewall_otel.activate()
+    with pytest.raises(tidewall_otel.TidewallRefusedError) as raised:
+        await client.chat.completions.create(model="gpt-4o", messages=[message])
+
+    assert raised.value.outcome_kind == "mutated_during_guard"
+    assert reached == [], "the async provider received content the guard never saw"
+    assert asked and "benign" in json.dumps(asked[0])

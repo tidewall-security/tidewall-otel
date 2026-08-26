@@ -359,6 +359,17 @@ def _handle_mutation(surface, call, before, span, config, state) -> None:
 def dispatch_sync(surface, wrapped, instance, args, kwargs, config, guard, executor,
                   state=None):
     call = _prepare(surface, wrapped, instance, args, kwargs, config, state)
+    # THE BASELINE IS TAKEN FIRST, before classification, normalisation or the
+    # span. `normalize()` copies the caller's content into `guard_input`, and
+    # a baseline taken AFTER it makes the guard inspect the OLD content while
+    # both fingerprints describe the NEW -- so they compare equal and the
+    # provider receives text nothing examined. Span construction sits in that
+    # window and enters OTel, which invokes every registered span processor:
+    # ordinary application code, on the caller's thread, on every call.
+    #
+    # Taken here, any change from this point on shows up in the comparison
+    # after the guard call, whatever ran in between.
+    before = content_fingerprint(surface, call.kwargs)
     pre = decide_input(surface, call, config)
 
     # THE SPAN WRAPS EVERY EXIT, including the ones that never reach the
@@ -387,7 +398,6 @@ def dispatch_sync(surface, wrapped, instance, args, kwargs, config, guard, execu
             return _invoke_and_record(wrapped, args, kwargs, span, surface)
 
         observation = next(_HEALTH_SEQUENCE)
-        before = content_fingerprint(surface, call.kwargs)
 
         try:
             # submit BLOCKS and returns the value; `deadline` is keyword-only.
@@ -415,6 +425,17 @@ async def dispatch_async(surface, wrapped, instance, args, kwargs, config, guard
                          executor, state=None):
     """The same sequence, differing only in awaiting rather than blocking."""
     call = _prepare(surface, wrapped, instance, args, kwargs, config, state)
+    # THE BASELINE IS TAKEN FIRST, before classification, normalisation or the
+    # span. `normalize()` copies the caller's content into `guard_input`, and
+    # a baseline taken AFTER it makes the guard inspect the OLD content while
+    # both fingerprints describe the NEW -- so they compare equal and the
+    # provider receives text nothing examined. Span construction sits in that
+    # window and enters OTel, which invokes every registered span processor:
+    # ordinary application code, on the caller's thread, on every call.
+    #
+    # Taken here, any change from this point on shows up in the comparison
+    # after the guard call, whatever ran in between.
+    before = content_fingerprint(surface, call.kwargs)
     pre = decide_input(surface, call, config)
 
     # Same span discipline as the sync path, and it has to be duplicated
@@ -438,7 +459,6 @@ async def dispatch_async(surface, wrapped, instance, args, kwargs, config, guard
             return response
 
         observation = next(_HEALTH_SEQUENCE)
-        before = content_fingerprint(surface, call.kwargs)
 
         try:
             # The SAME bounded pool, awaited. run_in_executor(None, ...) would
