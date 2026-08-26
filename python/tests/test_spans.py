@@ -384,3 +384,103 @@ def test_a_NON_streaming_span_is_unaffected(monkeypatch, exporter, guard_says):
     span = exporter.get_finished_spans()[0]
     assert "tidewall.stream" not in span.attributes
     assert span.attributes["gen_ai.response.finish_reasons"] == ("stop",)
+
+
+def test_a_TRACER_that_raises_on_start_does_not_break_the_guarded_call(
+        monkeypatch, guard_says):
+    """Telemetry must never break the thing it observes.
+
+    Opening a span happens before the guard is contacted, which made the
+    tracing pipeline a runtime dependency of the security path: a misconfigured
+    processor raising in `start_as_current_span` prevented every guarded call.
+    Reproduced before the fix -- the create() raised RuntimeError from the
+    tracer.
+    """
+    from tidewall_otel import _span_helper
+
+    _env(monkeypatch)
+    guard_says(_CLEAN)
+
+    class ExplodingTracer:
+        def start_as_current_span(self, *args, **kwargs):
+            raise RuntimeError("span processor is misconfigured")
+
+    monkeypatch.setattr(_span_helper, "_get_tracer", lambda: ExplodingTracer())
+
+    tidewall_otel.activate()
+    result = _client().chat.completions.create(
+        model="gpt-4o", messages=[{"role": "user", "content": "hi"}])
+
+    assert result.choices[0].message.content == "ok", (
+        "a broken tracer prevented a guarded call from completing")
+
+
+def test_a_SPAN_that_raises_on_close_does_not_replace_the_result(
+        monkeypatch, guard_says):
+    """A processor raising in `on_end` must not surface as an application
+    error, and must not mask a genuine one either."""
+    from tidewall_otel import _span_helper
+
+    _env(monkeypatch)
+    guard_says(_CLEAN)
+
+    class BrokenSpan:
+        def set_attribute(self, *a, **k):
+            pass
+
+        def set_status(self, *a, **k):
+            pass
+
+    class BrokenManager:
+        def __enter__(self):
+            return BrokenSpan()
+
+        def __exit__(self, *exc):
+            raise RuntimeError("exporter failed on flush")
+
+    class BrokenTracer:
+        def start_as_current_span(self, *args, **kwargs):
+            return BrokenManager()
+
+    monkeypatch.setattr(_span_helper, "_get_tracer", lambda: BrokenTracer())
+
+    tidewall_otel.activate()
+    result = _client().chat.completions.create(
+        model="gpt-4o", messages=[{"role": "user", "content": "hi"}])
+
+    assert result.choices[0].message.content == "ok", (
+        "a failing exporter replaced the provider's result")
+
+
+def test_a_BROKEN_exporter_does_not_mask_a_genuine_refusal(
+        monkeypatch, guard_says):
+    """The other direction, and the one that matters more: when the guard
+    blocks, the caller must still see the block rather than an exporter
+    error."""
+    from tidewall_otel import _span_helper
+
+    _env(monkeypatch)
+    guard_says(_BLOCKED)
+
+    class BrokenManager:
+        def __enter__(self):
+            class S:
+                def set_attribute(self, *a, **k):
+                    pass
+
+                def set_status(self, *a, **k):
+                    pass
+            return S()
+
+        def __exit__(self, *exc):
+            raise RuntimeError("exporter failed on flush")
+
+    monkeypatch.setattr(_span_helper, "_get_tracer",
+                        lambda: type("T", (), {
+                            "start_as_current_span":
+                                lambda self, *a, **k: BrokenManager()})())
+
+    tidewall_otel.activate()
+    with pytest.raises(tidewall_otel.TidewallBlockedError):
+        _client().chat.completions.create(
+            model="gpt-4o", messages=[{"role": "user", "content": "attack"}])

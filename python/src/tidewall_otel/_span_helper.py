@@ -83,39 +83,44 @@ def gen_ai_span(
         yield None
         return
 
-    # record_exception=False, set_status_on_exception=False.
-    #
-    # OTel records an uncaught exception as an event carrying its MESSAGE and
-    # STACK TRACE. Provider errors echo request bodies, and this agent's own
-    # guard errors carry up to 500 bytes of the guard's response -- so with
-    # the default the conversation reached the exporter through
-    # `exception.message` no matter what `span_input` and `span_output` said.
-    # Wiring spans at all reintroduced P0-1 by this route until it was closed.
-    #
-    # The type is recorded instead: enough to tell a dashboard that the call
-    # failed and roughly how, with nothing that can carry a prompt.
-    with tracer.start_as_current_span(
-        "gen_ai.chat", record_exception=False, set_status_on_exception=False
-    ) as span:
-        span.set_attribute(_ATTR_OPERATION, "chat")
-        span.set_attribute(_ATTR_SYSTEM, provider)
-        span.set_attribute(_ATTR_MODEL, model)
+    # THE WHOLE LIFECYCLE IS BEST-EFFORT. Every dispatch now opens a span
+    # before contacting the guard, which made the tracing pipeline a runtime
+    # dependency of the security path: a processor that raised in
+    # `start_as_current_span` or `on_start` prevented the guarded call
+    # entirely, and one that raised on `on_end` could replace the
+    # application's own exception while unwinding. Observability breaking the
+    # thing it observes is the failure mode this agent exists to avoid,
+    # arriving from the telemetry side.
+    try:
+        manager = tracer.start_as_current_span(
+            "gen_ai.chat", record_exception=False, set_status_on_exception=False
+        )
+        span = manager.__enter__()
+    except Exception:
+        logger.debug("could not open a gen_ai span", exc_info=True)
+        yield None
+        return
 
-        # `include_input` DEFAULTS TO FALSE and the caller passes the
-        # surface's own `span_input` flag. Serialising the conversation
-        # unconditionally is the P0 this programme opened with: prompts carry
-        # credentials, customer data and system prompts, and a span exporter
-        # ships them to an observability backend. The manifest declares the
-        # policy per surface; this function must not decide it.
-        messages = (guard_input or {}).get("messages") if include_input else None
-        if messages:
-            try:
+    try:
+        try:
+            span.set_attribute(_ATTR_OPERATION, "chat")
+            span.set_attribute(_ATTR_SYSTEM, provider)
+            span.set_attribute(_ATTR_MODEL, model)
+
+            # `include_input` DEFAULTS TO FALSE and the caller passes the
+            # surface's own `span_input` flag. Serialising the conversation
+            # unconditionally is the P0 this programme opened with: prompts
+            # carry credentials, customer data and system prompts, and a span
+            # exporter ships them to an observability backend. The manifest
+            # declares the policy per surface; this function must not decide
+            # it.
+            messages = (guard_input or {}).get("messages") if include_input else None
+            if messages:
                 span.set_attribute(
                     _ATTR_INPUT_MESSAGES, json.dumps(messages, default=str)
                 )
-            except Exception:
-                # Serialisation should never break the span — drop silently.
-                pass
+        except Exception:
+            logger.debug("could not annotate a gen_ai span", exc_info=True)
 
         try:
             yield span
@@ -124,9 +129,18 @@ def gen_ai_span(
             try:
                 span.set_attribute("tidewall.error.type", type(exc).__name__)
                 span.set_status(StatusCode.ERROR)
-            except Exception:               # pragma: no cover - defensive
-                pass
+            except Exception:
+                logger.debug("could not record an error on a span", exc_info=True)
             raise
+    finally:
+        # Closing must not replace the caller's exception or its result.
+        # `None, None, None` deliberately: exception recording is disabled on
+        # this span and the status has already been set above, so there is
+        # nothing for OTel to add and something for it to leak.
+        try:
+            manager.__exit__(None, None, None)
+        except Exception:
+            logger.debug("could not close a gen_ai span", exc_info=True)
 
 
 def record_response_in_span(
