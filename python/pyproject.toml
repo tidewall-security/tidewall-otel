@@ -1,6 +1,10 @@
 [build-system]
 requires = ["setuptools>=68.0", "wheel"]
-build-backend = "setuptools.build_meta"
+# OUR backend, not setuptools' directly. `backend-path` makes _build_pth
+# importable during an isolated build; it does not make its functions PEP 517
+# hooks, because the frontend calls them on the NAMED backend.
+build-backend = "_build_pth"
+backend-path = ["."]
 
 [project]
 name = "tidewall-otel"
@@ -29,6 +33,7 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
 ]
 dependencies = [
     "wrapt>=1.14.0",
@@ -43,14 +48,37 @@ Issues = "https://github.com/tidewall-security/tidewall-otel/issues"
 otel = [
     "opentelemetry-api>=1.20.0",
     "opentelemetry-sdk>=1.20.0",
+    # BaseInstrumentor lives here. Without it the package silently falls back
+    # to the stub in _instrumentor.py and the OTel entry point does nothing.
+    "opentelemetry-instrumentation>=0.41b0",
 ]
-openai = ["openai>=1.0.0"]
-anthropic = ["anthropic>=0.20.0"]
+# CEILINGS MATTER. These must match the manifest's `version_range`, which is
+# the range that has actually been tested. Unbounded floors let a fresh install
+# resolve openai 3.x, which routes through `httpx2` rather than `httpx` -- so
+# the transport allowlist matched nothing, every ORDINARY client was reported
+# as a construction-time escape, and `is_active()` was False for everyone.
+# CI installs this extra, so CI was red on both matrix versions.
+openai = ["openai>=1.40.0,<2.0.0"]
+anthropic = ["anthropic>=0.27.0,<1.0.0"]
 dev = [
     "tidewall-otel[otel,openai,anthropic]",
     "pytest>=7.0",
     "pytest-asyncio>=0.21",
     "respx>=0.20",
+    "build>=1.0",          # the packaging acceptance invokes `python -m build`
+    "pyflakes>=3.0",       # the test-suite breadth check
+    "httpx>=0.24",         # wire-body capture over httpx.MockTransport
+    # The bootstrap acceptance calls `_build_pth.build_editable()` in the
+    # CURRENT interpreter, not through an isolated build, so setuptools must
+    # be importable here. Python 3.12 stopped bundling it into new venvs, so
+    # on 3.12 -- one of the two versions CI runs -- four bootstrap tests
+    # failed with a bare CalledProcessError from the build backend. Declared
+    # rather than assumed, which is the same lesson as the `otel` extra.
+    "setuptools>=68.0",
+    # The span tests need a real tracer. Without this they are skipped,
+    # which is how a documented feature that emitted nothing survived
+    # sixteen review rounds.
+    "opentelemetry-sdk>=1.20.0",
 ]
 all = ["tidewall-otel[otel,openai,anthropic]"]
 
@@ -62,6 +90,9 @@ tidewall-instrument = "tidewall_otel._bootstrap.cli:main"
 # this entry point and activates TidewallInstrumentor automatically.
 [project.entry-points."opentelemetry_instrumentor"]
 tidewall = "tidewall_otel._instrumentor:TidewallInstrumentor"
+
+[tool.setuptools]
+py-modules = ["tidewall_otel_bootstrap"]      # the module the .pth imports
 
 [tool.setuptools.packages.find]
 where = ["src"]

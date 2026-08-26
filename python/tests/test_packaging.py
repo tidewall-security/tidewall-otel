@@ -1,0 +1,334 @@
+"""Packaging acceptance for the P0 remediation programme.
+
+Task 1 of the accepted implementation plan.
+"""
+
+import re
+import subprocess
+import sys
+import tomllib
+from pathlib import Path
+
+PYPROJECT = Path(__file__).resolve().parents[1] / "pyproject.toml"
+
+
+def test_the_otel_extra_supplies_baseinstrumentor():
+    """``BaseInstrumentor`` lives in opentelemetry-instrumentation, not in
+    -api or -sdk. Without it ``pip install tidewall-otel[otel]`` silently uses
+    the stub in ``_instrumentor.py`` and the OTel entry point never works."""
+    extras = tomllib.loads(PYPROJECT.read_text())["project"]["optional-dependencies"]
+    otel = " ".join(extras["otel"])
+    assert "opentelemetry-instrumentation" in otel, extras["otel"]
+
+
+def test_the_extra_installs_the_real_base_class_in_a_CLEAN_environment(tmp_path):
+    """Builds a wheel and installs ONLY ``wheel[otel]`` into a fresh venv.
+
+    Running the current interpreter proves nothing: the dev environment
+    already contains opentelemetry-instrumentation, so the assertion would
+    pass whether or not the extra declares it.
+    """
+    root = PYPROJECT.parent
+    subprocess.run(
+        [sys.executable, "-m", "build", "--wheel", "--outdir", str(tmp_path)],
+        cwd=root, check=True, capture_output=True,
+    )
+    wheel = next(tmp_path.glob("*.whl"))
+
+    venv = tmp_path / "venv"
+    subprocess.run([sys.executable, "-m", "venv", str(venv)], check=True)
+    python = venv / ("Scripts" if sys.platform == "win32" else "bin") / "python"
+
+    subprocess.run(
+        [str(python), "-m", "pip", "install", "-q", f"{wheel}[otel]"],
+        check=True, capture_output=True,
+    )
+
+    result = subprocess.run(
+        [str(python), "-c",
+         "import tidewall_otel._instrumentor as m; print(m._HAS_OTEL_INSTRUMENTOR)"],
+        capture_output=True, text=True,
+    )
+    assert result.stdout.strip() == "True", result.stdout + result.stderr
+
+
+def test_the_CI_test_step_is_EXACTLY_the_accepted_command():
+    """A WHITELIST, not a shell analyser.
+
+    Earlier drafts matched ``|| true``, then ``|| :``, ``;`` and ``set +e``,
+    and still missed ``set +e`` on a preceding line of a multiline ``run:``
+    block while false-positiving on ``pytest -q -k "foo;bar"``. Pinning the
+    exact command needs no shell parsing, cannot false-positive, and rejects
+    swallow forms nobody has thought of.
+
+    Widening this is a deliberate, reviewable act: add the new exact string.
+    """
+    workflow = PYPROJECT.resolve().parents[1] / ".github" / "workflows" / "ci.yml"
+    assert workflow.exists(), f"workflow not found at {workflow}"
+
+    ACCEPTED = {"pytest -q", "uv run pytest -q"}
+
+    steps = re.findall(r"- name: (.+?)\n(.*?)(?=\n      - |\Z)",
+                       workflow.read_text(), re.S)
+    test_steps = [(name, body) for name, body in steps if "pytest" in body]
+    assert test_steps, "no CI step runs pytest at all"
+
+    for name, body in test_steps:
+        run = re.search(r"run:\s*(?:\|\s*\n)?(.*?)(?=\n\s*[a-z-]+:|\Z)", body, re.S)
+        command = " ".join(run.group(1).split()) if run else ""
+        assert command in ACCEPTED, (
+            f"CI step {name!r} runs {command!r}, which is not an accepted test "
+            f"command. Accepted: {sorted(ACCEPTED)}. If this is a legitimate "
+            f"change, widen ACCEPTED deliberately -- do not relax the check."
+        )
+
+
+def test_the_DOCUMENTED_otel_command_guards_and_reports_itself(tmp_path):
+    """`opentelemetry-instrument python app.py` -- README activation method 2.
+
+    Both halves matter, and they failed independently:
+
+    * The SDK must actually be patched and a real call must reach the guard.
+    * `tidewall_otel.state()` must SAY so. The entry point never calls the
+      public `activate()`; it constructs the instrumentor and calls its hook.
+      That patched the SDK correctly while the module-level state stayed at
+      its initial `uninstalled`, so an operator wiring `is_active()` into a
+      health check under the documented zero-code workflow read False and
+      would have concluded they were unprotected. The mirror image of
+      reporting `active` while unguarded, and just as wrong.
+
+    Only reproducible from a real wheel in a clean venv: an editable install
+    has no `.pth`, and the dev environment resolves the entry point
+    differently. Reading the source cannot find this at all.
+    """
+    root = PYPROJECT.parent
+    subprocess.run(
+        [sys.executable, "-m", "build", "--wheel", "--outdir", str(tmp_path)],
+        cwd=root, check=True, capture_output=True,
+    )
+    wheel = next(tmp_path.glob("*.whl"))
+
+    venv = tmp_path / "venv"
+    subprocess.run([sys.executable, "-m", "venv", str(venv)], check=True)
+    bindir = venv / ("Scripts" if sys.platform == "win32" else "bin")
+    python = bindir / "python"
+
+    subprocess.run(
+        [str(python), "-m", "pip", "install", "-q", f"{wheel}[otel]",
+         "openai", "httpx"],
+        check=True, capture_output=True,
+    )
+
+    app = tmp_path / "app.py"
+    app.write_text(
+        "import inspect, httpx, openai, tidewall_otel\n"
+        "import tidewall_otel._guard as G\n"
+        "from openai.resources.chat.completions.completions import Completions\n"
+        "asked = []\n"
+        "G.post_guard = lambda **kw: (asked.append(kw['payload']), {'result': {\n"
+        "    'blocked': False, 'transformed': False, 'policy': 'p'}})[1]\n"
+        "def ok(request):\n"
+        "    return httpx.Response(200, json={'id': 'x', 'object': 'chat.completion',\n"
+        "        'created': 0, 'model': 'gpt-4o', 'choices': [{'index': 0,\n"
+        "        'finish_reason': 'stop', 'message': {'role': 'assistant',\n"
+        "        'content': 'ok'}}]})\n"
+        "c = openai.OpenAI(api_key='t',\n"
+        "                  http_client=httpx.Client(transport=httpx.MockTransport(ok)))\n"
+        "c.chat.completions.create(model='gpt-4o',\n"
+        "                          messages=[{'role': 'user', 'content': 'hi'}])\n"
+        "patched = getattr(inspect.getattr_static(Completions, 'create'),\n"
+        "                  '__tidewall_wrapper__', False)\n"
+        "st = tidewall_otel.state()\n"
+        "print(f'patched={patched} asked={len(asked)} lifecycle={st.lifecycle} '\n"
+        "      f'surface={st.surfaces.get(\"Completions.create\")}')\n"
+    )
+
+    result = subprocess.run(
+        [str(bindir / "opentelemetry-instrument"), str(python), str(app)],
+        capture_output=True, text=True, cwd=tmp_path,
+        env={"PATH": str(bindir) + ":/usr/bin:/bin",
+             "TIDEWALL_BASE_URL": "https://guard.example", "TIDEWALL_TOKEN": "t"},
+    )
+    line = next((l for l in result.stdout.splitlines() if l.startswith("patched=")), "")
+
+    # `surface=unverified` is not incidental. The app builds its client on
+    # httpx.MockTransport, which IS a construction-time escape, so the wrapper
+    # downgrades that surface AT CALL TIME. Seeing it here proves `state()`
+    # returns the SAME object the wrappers write into rather than a snapshot
+    # taken at publish -- a copy would still read `covered`, which is exactly
+    # how a rewritten wire body once coexisted with a full-coverage report.
+    assert line == ("patched=True asked=1 lifecycle=installed "
+                    "surface=unverified"), (
+        f"stdout={result.stdout!r} stderr={result.stderr[-800:]!r}")
+
+
+def test_the_DECLARED_sdk_ranges_match_the_ranges_the_manifest_VOUCHES_for():
+    """SDK version ranges must be defined AND tested. The manifest has them; the
+    packaging did not, and the two silently disagreed.
+
+    `pyproject.toml` declared `openai>=1.0.0` with NO ceiling while the
+    manifest vouched only for `>=1.40.0,<2.0.0`. A fresh install therefore
+    resolved openai 3.x, which routes through `httpx2` instead of `httpx` --
+    so the transport allowlist matched nothing, EVERY ordinary client was
+    reported as a construction-time escape, and `is_active()` was False for
+    everyone. CI installs this extra, so CI was red on both matrix versions
+    while the dev machine, holding older pinned SDKs, stayed green.
+
+    A version range is a claim about what has been tested. Two copies of it
+    that can disagree is one copy too many.
+    """
+    import tomllib
+
+    from tidewall_otel._manifest import SURFACES
+
+    extras = tomllib.loads(PYPROJECT.read_text())["project"]["optional-dependencies"]
+
+    # COLLECT, do not collapse. `{s.provider: s.version_range for s in
+    # SURFACES}` keeps only the LAST surface per provider, so a later surface
+    # could carry any range at all and this test would not notice -- proven by
+    # mutating AsyncCompletions.create to ">=999.0.0,<1000.0.0", which left it
+    # passing. Disposition is computed PER SURFACE from `Surface.version_range`
+    # while packaging is declared per provider, so the surfaces of one provider
+    # agreeing is a precondition for the comparison below to mean anything.
+    by_provider: dict[str, set[str]] = {}
+    for surface in SURFACES:
+        by_provider.setdefault(surface.provider, set()).add(surface.version_range)
+    assert by_provider, "the manifest declares no surfaces"
+
+    disagreeing = {p: sorted(r) for p, r in by_provider.items() if len(r) > 1}
+    assert not disagreeing, (
+        "surfaces of one provider vouch for different ranges, so no single "
+        f"packaging declaration can match them all: {disagreeing}")
+
+    vouched = {p: r.pop() for p, r in by_provider.items()}
+
+    mismatches = []
+    for provider, version_range in sorted(vouched.items()):
+        declared = [d for d in extras.get(provider, []) if d.startswith(provider)]
+        if not declared:
+            mismatches.append(f"{provider}: no dependency declared in the "
+                              f"'{provider}' extra")
+            continue
+        actual = declared[0][len(provider):].replace(" ", "")
+        expected = version_range.replace(" ", "")
+        if actual != expected:
+            mismatches.append(
+                f"{provider}: pyproject declares {actual!r}, "
+                f"manifest vouches for {expected!r}")
+    assert not mismatches, "\n".join(mismatches)
+
+
+def test_the_agent_WORKS_without_the_otel_extra_installed(tmp_path):
+    """The fallback `BaseInstrumentor` stub, which is now tested nowhere else.
+
+    `_instrumentor.py` falls back to a local stub when
+    `opentelemetry-instrumentation` is absent, so the agent works for anyone
+    who installs `tidewall-otel` without the `otel` extra. Until now that
+    path was the one every local run exercised BY ACCIDENT, because the dev
+    interpreter happened to lack the package -- and the real base class was
+    exercised only by CI.
+
+    Installing the real one locally fixed a fix that was wrong on the
+    production path, and inverted the gap: the stub is now what nothing
+    covers. Both paths ship, so both are tested deliberately rather than by
+    whatever happens to be installed.
+
+    The two differ in a way that matters: the real `BaseInstrumentor` is a
+    SINGLETON and the stub is not.
+    """
+    root = PYPROJECT.parent
+    subprocess.run(
+        [sys.executable, "-m", "build", "--wheel", "--outdir", str(tmp_path)],
+        cwd=root, check=True, capture_output=True,
+    )
+    wheel = next(tmp_path.glob("*.whl"))
+
+    venv = tmp_path / "venv"
+    subprocess.run([sys.executable, "-m", "venv", str(venv)], check=True)
+    python = venv / ("Scripts" if sys.platform == "win32" else "bin") / "python"
+
+    # NO [otel] extra -- but DO use [openai], which carries the version
+    # ceiling. Installing `openai` bare resolves to a major outside the
+    # manifest's vouched range, and every surface is then honestly reported
+    # `unverified` -- correct behaviour that would make this test look like a
+    # stub failure. The ceiling is the thing being relied on, not bypassed.
+    subprocess.run(
+        [str(python), "-m", "pip", "install", "-q", f"{wheel}[openai]", "httpx"],
+        check=True, capture_output=True,
+    )
+
+    probe = tmp_path / "probe.py"
+    probe.write_text(
+        "import tidewall_otel\n"
+        "import tidewall_otel._instrumentor as m\n"
+        "tidewall_otel.activate()\n"
+        "state = tidewall_otel.state()\n"
+        "print(f'stub={not m._HAS_OTEL_INSTRUMENTOR} "
+        "lifecycle={state.lifecycle} active={state.is_active()}')\n"
+        "tidewall_otel.deactivate()\n"
+        "print(f'after={tidewall_otel.state().lifecycle}')\n"
+    )
+
+    result = subprocess.run(
+        [str(python), str(probe)], capture_output=True, text=True,
+        env={"PATH": "/usr/bin:/bin",
+             "TIDEWALL_BASE_URL": "https://guard.example", "TIDEWALL_TOKEN": "t"},
+    )
+    out = result.stdout
+    assert "stub=True" in out, f"the extra leaked in: {out}{result.stderr[-400:]}"
+    assert "lifecycle=installed" in out, (
+        f"the agent did not activate without the otel extra: "
+        f"{out}{result.stderr[-400:]}")
+    assert "active=True" in out, out
+    assert "after=removed" in out, out
+
+
+def test_the_CI_MATRIX_covers_every_python_the_package_CLAIMS():
+    """Classifiers and the CI matrix are two statements of the same fact.
+
+    Drift either way is a lie of a different kind: a classifier without a
+    matrix entry claims support nothing verifies, and a matrix entry without a
+    classifier means the interpreter with the most tests passing is one users
+    are never told about. Both were true here -- the classifiers stopped at
+    3.13 while 3.14 was verified on every commit, and CI ran neither.
+
+    Read from both sources rather than restated, so this cannot agree with
+    itself while disagreeing with the package.
+    """
+    import re
+    import tomllib
+
+    with PYPROJECT.open("rb") as handle:
+        classifiers = tomllib.load(handle)["project"]["classifiers"]
+    claimed = {c.rsplit(" :: ", 1)[-1] for c in classifiers
+               if c.startswith("Programming Language :: Python :: 3.")}
+
+    workflow = (PYPROJECT.resolve().parents[1] / ".github" / "workflows" / "ci.yml").read_text()
+    matrix_line = re.search(r"python-version:\s*\[(.+?)\]", workflow)
+    assert matrix_line, "no python-version matrix in the CI workflow"
+    tested = set(re.findall(r'"([\d.]+)"', matrix_line.group(1)))
+
+    assert claimed, "the package claims no Python versions at all"
+    assert claimed == tested, (
+        f"classifiers claim {sorted(claimed)}, CI runs {sorted(tested)}"
+    )
+
+
+def test_a_CI_JOB_makes_the_response_schema_pin_RUNNABLE():
+    """The pin skips unless the server package is importable.
+
+    Without a job that supplies it, the pin skips in every environment --
+    local, CI, everywhere -- and a guard that never runs is not a guard. This
+    asserts the arrangement exists, not that it passed: that is the job's own
+    business.
+    """
+    workflow = (PYPROJECT.resolve().parents[1] / ".github" / "workflows" / "ci.yml").read_text()
+
+    assert "tidewall-server" in workflow, (
+        "no CI job checks out the guard server, so the response-schema pin "
+        "skips everywhere it runs"
+    )
+    assert "PYTHONPATH" in workflow, (
+        "the server is checked out but never put on the path, so the pin "
+        "still skips"
+    )

@@ -53,7 +53,7 @@ The instrumentation degrades gracefully:
 cd python
 pip install -e ".[all]"
 
-export TIDEWALL_BASE_URL=http://localhost:8080
+export TIDEWALL_BASE_URL=https://guard.example.com
 export TIDEWALL_TOKEN=your-tidewall-api-token
 export TIDEWALL_MODE=enforce
 

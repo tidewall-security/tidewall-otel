@@ -16,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.12", "3.13"]
+        python-version: ["3.12", "3.13", "3.14"]
     defaults:
       run:
         working-directory: python
@@ -37,4 +37,47 @@ jobs:
           python -c "import tidewall_otel; print(tidewall_otel.__version__)"
 
       - name: Tests
-        run: pytest -q || true  # tests directory may be empty at v0.1.0
+        run: pytest -q
+
+  schema-pin:
+    # The response-schema pin imports `GuardResult` from the server package and
+    # skips when it is absent -- which, without this job, is everywhere. A pin
+    # that never runs is not a pin, so one job checks the server out and runs
+    # the suite with it importable. The server is NOT a dependency of the
+    # package: it is needed at test time only, which is why this is a separate
+    # job rather than an entry in the dev extra.
+    name: Response schema matches the server
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out the guard server
+        uses: actions/checkout@v4
+        with:
+          repository: tidewall-security/tidewall-server
+          path: guard-server
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install
+        working-directory: python
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Confirm the server schema is importable
+        run: |
+          PYTHONPATH="$GITHUB_WORKSPACE/guard-server" python -c "
+          from app.models import GuardResult
+          required = {n for n, i in GuardResult.model_fields.items() if i.is_required()}
+          print('server requires:', sorted(required))
+          assert required, 'GuardResult declares no required fields; the pin would be vacuous'
+          "
+
+      - name: Tests
+        working-directory: python
+        env:
+          PYTHONPATH: ${{ github.workspace }}/guard-server
+        run: pytest -q

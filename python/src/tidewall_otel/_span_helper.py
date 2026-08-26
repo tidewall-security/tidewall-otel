@@ -57,15 +57,17 @@ def gen_ai_span(
     *,
     provider: str,
     model: str,
-    messages: list[dict[str, str]] | None = None,
+    guard_input: dict | None = None,
+    include_input: bool = False,
 ) -> Generator[Any, None, None]:
     """Open a ``gen_ai.chat`` span with the standard request attributes.
 
     Args:
         provider: ``gen_ai.system`` value — ``"openai"``, ``"anthropic"``, etc.
         model: Model identifier, recorded as ``gen_ai.request.model``.
-        messages: Input messages in canonical (OpenAI) shape; serialized
-            into ``gen_ai.input.messages`` if supplied.
+        guard_input: The complete guard input; its ``messages`` are
+            serialized into ``gen_ai.input.messages`` if span content is
+            enabled.
 
     Yields:
         The active span, or ``None`` if OTel isn't installed.
@@ -81,21 +83,64 @@ def gen_ai_span(
         yield None
         return
 
-    with tracer.start_as_current_span("gen_ai.chat") as span:
-        span.set_attribute(_ATTR_OPERATION, "chat")
-        span.set_attribute(_ATTR_SYSTEM, provider)
-        span.set_attribute(_ATTR_MODEL, model)
+    # THE WHOLE LIFECYCLE IS BEST-EFFORT. Every dispatch opens a span before
+    # contacting the guard, which makes the tracing pipeline a runtime
+    # dependency of the security path: unguarded, a processor raising in
+    # `start_as_current_span` or `on_start` prevents the guarded call
+    # entirely, and one raising on `on_end` replaces the application's own
+    # exception while unwinding. Observability breaking the thing it observes
+    # is the failure mode this agent exists to avoid, arriving from the
+    # telemetry side.
+    try:
+        manager = tracer.start_as_current_span(
+            "gen_ai.chat", record_exception=False, set_status_on_exception=False
+        )
+        span = manager.__enter__()
+    except Exception:
+        logger.debug("could not open a gen_ai span", exc_info=True)
+        yield None
+        return
 
-        if messages:
-            try:
+    try:
+        try:
+            span.set_attribute(_ATTR_OPERATION, "chat")
+            span.set_attribute(_ATTR_SYSTEM, provider)
+            span.set_attribute(_ATTR_MODEL, model)
+
+            # `include_input` DEFAULTS TO FALSE and the caller passes the
+            # surface's own `span_input` flag. Serialising the conversation
+            # unconditionally is the P0 this programme opened with: prompts
+            # carry credentials, customer data and system prompts, and a span
+            # exporter ships them to an observability backend. The manifest
+            # declares the policy per surface; this function must not decide
+            # it.
+            messages = (guard_input or {}).get("messages") if include_input else None
+            if messages:
                 span.set_attribute(
                     _ATTR_INPUT_MESSAGES, json.dumps(messages, default=str)
                 )
-            except Exception:
-                # Serialisation should never break the span — drop silently.
-                pass
+        except Exception:
+            logger.debug("could not annotate a gen_ai span", exc_info=True)
 
-        yield span
+        try:
+            yield span
+        except BaseException as exc:
+            # TYPE ONLY -- never `str(exc)`, which is the leak itself.
+            try:
+                span.set_attribute("tidewall.error.type", type(exc).__name__)
+                span.set_status(StatusCode.ERROR)
+            except Exception:
+                logger.debug("could not record an error on a span", exc_info=True)
+            raise
+    finally:
+        # Closing must not replace the caller's exception or its result.
+        # `None, None, None` deliberately: exception recording is disabled on
+        # this span and the status has already been set above, so there is
+        # nothing for OTel to add and something for it to leak.
+        try:
+            manager.__exit__(None, None, None)
+        except Exception:
+            logger.debug("could not close a gen_ai span", exc_info=True)
 
 
 def record_response_in_span(
@@ -104,6 +149,7 @@ def record_response_in_span(
     content: str | None = None,
     finish_reason: str | None = None,
     blocked: bool = False,
+    include_output: bool = False,
 ) -> None:
     """Annotate a ``gen_ai.chat`` span with response details.
 
@@ -116,7 +162,10 @@ def record_response_in_span(
         return
 
     try:
-        if content:
+        # Same rule as the input side: `include_output` defaults to False and
+        # the caller passes the surface's `span_output` flag. Completions carry
+        # exactly the material prompts do.
+        if content and include_output:
             span.set_attribute(
                 _ATTR_OUTPUT_MESSAGES,
                 json.dumps([{"role": "assistant", "content": content}]),

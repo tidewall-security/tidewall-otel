@@ -14,12 +14,11 @@ behaviours expected by the wrappers:
 from __future__ import annotations
 
 import logging
-import time
 from dataclasses import dataclass, field
 from typing import Any
 
 from tidewall_otel._config import TidewallConfig
-from tidewall_otel._http import GuardAPIError, post_guard
+from tidewall_otel._http import post_guard
 
 logger = logging.getLogger("tidewall.otel.guard")
 
@@ -66,97 +65,55 @@ class TidewallGuard:
     def __init__(self, config: TidewallConfig) -> None:
         self._config = config
 
-    def check(
+    def _payload_for(
         self,
+        guard_input: dict,
         *,
-        messages: list[dict[str, str]],
         event_type: str = "input",
         model: str = "",
         llm_provider: str = "",
-    ) -> GuardResult | None:
-        """Send messages to the Tidewall guard for evaluation.
+    ) -> dict:
+        """Wrap a guard input in the request envelope.
 
-        Args:
-            messages: Conversation messages in OpenAI Chat Completions format.
-            event_type: ``input`` (default), ``output``, ``tool_input``,
-                ``tool_output``, or ``tool_listing`` — controls which policy
-                rules the server applies.
-            model: Model identifier, recorded with the event for analytics.
-            llm_provider: Provider name (``openai``, ``anthropic``...).
-
-        Returns:
-            A :class:`GuardResult` on success, or ``None`` if the call was
-            skipped (dry-run) or failed (fail-open). Callers must treat
-            ``None`` as "no decision" and let the original call proceed.
+        Task 3 owns ``post_guard`` and its ``payload``; this builds that
+        payload, so the envelope has one definition rather than being
+        assembled inline wherever a request is sent.
         """
-        if self._config.mode == "dry-run":
-            logger.debug(
-                "[dry-run] Would guard %s (%d messages, model=%s, provider=%s)",
-                event_type, len(messages), model, llm_provider,
-            )
-            return None
-
+        extra_info: dict[str, Any] = {"app_name": self._config.app_name}
         payload: dict[str, Any] = {
-            "guard_input": {"messages": messages},
+            "guard_input": guard_input,
             "event_type": event_type,
             "app_id": self._config.app_id,
-            "user_id": self._config.user_id,
             "llm_provider": llm_provider,
             "model": model,
-            "extra_info": {
-                "app_name": self._config.app_name,
-                "user_name": self._config.user_id,
-            },
+            "extra_info": extra_info,
         }
 
-        t0 = time.monotonic()
-        try:
-            response = post_guard(
-                base_url=self._config.base_url,
-                token=self._config.token,
-                payload=payload,
-                timeout=self._config.timeout,
-            )
-            latency = (time.monotonic() - t0) * 1000
+        # OMITTED, not blank. An empty string still asserts a field the
+        # operator never set, and a downstream consumer treating presence as
+        # meaningful would record it as an identity.
+        if self._config.user_id:
+            payload["user_id"] = self._config.user_id
+            extra_info["user_name"] = self._config.user_id
 
-            result_data = response.get("result") or {}
-            guard_result = GuardResult(
-                blocked=bool(result_data.get("blocked", False)),
-                transformed=bool(result_data.get("transformed", False)),
-                guard_output=result_data.get("guard_output"),
-                detectors=result_data.get("detectors") or {},
-                summary=str(response.get("summary") or ""),
-                latency_ms=latency,
-            )
+        return payload
 
-            if guard_result.blocked:
-                logger.warning(
-                    "Tidewall BLOCKED %s (%.0fms): %s",
-                    event_type, latency, guard_result.summary,
-                )
-            elif guard_result.has_detections:
-                logger.info(
-                    "Tidewall detections on %s (%.0fms): %s",
-                    event_type, latency, guard_result.summary,
-                )
-            else:
-                logger.debug(
-                    "Tidewall %s clean (%.0fms)", event_type, latency
-                )
+    def check_raw(self, *, guard_input: dict, event_type: str = "input",
+                  model: str = "", llm_provider: str = "") -> dict:
+        """Perform the request and return the DECODED BODY.
 
-            return guard_result
+        Raises GuardUnreachable / GuardTimeout / GuardSchemaInvalid rather
+        than swallowing them into None the way :meth:`check` does. Anything
+        else propagates and dispatch files it as invariant_violated.
 
-        except GuardAPIError:
-            latency = (time.monotonic() - t0) * 1000
-            logger.warning(
-                "Tidewall guard call failed for %s after %.0fms — failing open",
-                event_type, latency, exc_info=True,
-            )
-            return None
-        except Exception:
-            latency = (time.monotonic() - t0) * 1000
-            logger.warning(
-                "Unexpected error during Tidewall guard call (%s, %.0fms) — failing open",
-                event_type, latency, exc_info=True,
-            )
-            return None
+        The transport raises those types directly (they subclass
+        GuardAPIError), so there is no seam here to sniff causes at.
+        """
+        return post_guard(
+            base_url=self._config.base_url,
+            token=self._config.token.reveal(),
+            payload=self._payload_for(guard_input, event_type=event_type,
+                                      model=model, llm_provider=llm_provider),
+            socket_timeout=self._config.socket_timeout,
+        )
+

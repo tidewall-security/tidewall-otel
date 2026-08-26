@@ -1,0 +1,923 @@
+"""The supported-surface manifest. Task 4 of the P0 remediation plan."""
+
+import inspect
+
+import httpx
+import pytest
+
+from tests._fixtures import _sdk_installed
+from tidewall_otel._bound import bound_nodes, matches
+from tidewall_otel._manifest import (
+    ANTHROPIC_MESSAGES_ASYNC,
+    ANTHROPIC_MESSAGES_SYNC,
+    OPENAI_CHAT_ASYNC,
+    OPENAI_CHAT_SYNC,
+    OUT_OF_SCOPE,
+    SURFACES,
+    _is_standard_transport,
+    client_escapes,
+    disposition_for,
+    lossy_paths,
+    resolve,
+)
+
+requires_sdks = pytest.mark.skipif(
+    not (_sdk_installed("openai") and _sdk_installed("anthropic")),
+    reason="provider SDKs not installed",
+)
+
+
+def bound_nodes_for(surface, args, kwargs, wrapped=None):
+    """The ONLY way this suite walks a call, so no test can exercise the walk
+    without the stops and sentinels that keep the fail-closed rule from
+    refusing everything."""
+    return bound_nodes(
+        wrapped or resolve(surface), args, kwargs,
+        stop=surface.opaque_subtrees + surface.non_prompt_bearing,
+        unset=surface.unset_sentinels,
+    )
+
+
+# -- the contract ---------------------------------------------------------
+
+def test_every_currently_patched_method_is_in_the_manifest():
+    """Anything patched and unlisted is a boundary with no contract."""
+    from tidewall_otel._instrumentor import _ANTHROPIC_MODULE, _OPENAI_MODULE
+
+    # DERIVE what activation actually patches and compare the whole set.
+    # Naming four members cannot detect a FIFTH: adding
+    # `(_OPENAI_MODULE, "Completions.stream", ...)` to the install specs left
+    # this test green while a boundary with no contract was patched -- which
+    # is exactly what its docstring says it prevents.
+    import tidewall_otel._instrumentor as instrumentor_module
+    from tidewall_otel._config import TidewallConfig
+    from tidewall_otel._manager import PatchManager
+
+    installed: list[tuple[str, str]] = []
+    real_install_all = PatchManager.install_all
+
+    def record(self, specs, *args, **kwargs):
+        installed.extend((module, attribute) for module, attribute, _ in specs)
+        return real_install_all(self, specs, *args, **kwargs)
+
+    instrumentor = instrumentor_module.TidewallInstrumentor()
+    PatchManager.install_all = record
+    try:
+        instrumentor._instrument(config=TidewallConfig(
+            base_url="https://guard.example", token="t"))
+    finally:
+        PatchManager.install_all = real_install_all
+        instrumentor._uninstrument()
+
+    listed = {(surface.module, surface.attribute) for surface in SURFACES}
+    assert installed, "activation patched nothing, so this proves nothing"
+    assert set(installed) <= listed, (
+        f"patched but unlisted: {sorted(set(installed) - listed)}")
+
+
+def test_every_entry_declares_a_complete_contract():
+    for surface in SURFACES:
+        assert surface.provider_fields, surface
+        assert surface.path_map, surface
+        assert surface.lossless_for, surface
+        assert surface.lossless_shapes, surface
+        assert surface.unset_sentinel_refs, surface
+        assert surface.version_range, surface
+        assert surface.span_input is False and surface.span_output is False, (
+            f"{surface.attribute}: span content must default OFF"
+        )
+
+
+def test_the_path_map_is_bijective():
+    """No two provider paths may map to one guard path, or a value could be
+    inspected under another's name."""
+    for surface in SURFACES:
+        targets = list(surface.path_map.values())
+        assert len(targets) == len(set(targets)), surface.attribute
+
+
+def test_no_entry_maps_a_field_the_route_does_not_read():
+    """The server reads guard_input.messages and guard_input.tools and
+    NOTHING else. A mapping to any other key certifies an inspection that
+    does not happen, and both bijection directions compare client-side paths,
+    so nothing else can detect it."""
+    READ_BY_THE_ROUTE = ("guard_input.messages", "guard_input.tools")
+    for surface in SURFACES:
+        for target in surface.path_map.values():
+            assert target.startswith(READ_BY_THE_ROUTE), (
+                f"{surface.attribute}: maps {target}, which no route reads"
+            )
+
+
+def test_unlisted_surfaces_are_named_as_out_of_scope():
+    assert "openai.responses" in OUT_OF_SCOPE
+    assert "anthropic.messages.stream" in OUT_OF_SCOPE
+
+
+def test_surface_entries_are_frozen_hashable_and_NOT_slotted():
+    """cached_property writes into __dict__, bypassing the frozen __setattr__.
+    Adding slots=True raises at first access, and slots is an obvious-looking
+    optimisation for a frozen dataclass."""
+    import dataclasses
+
+    for surface in SURFACES:
+        assert dataclasses.is_dataclass(surface)
+        assert hash(surface) is not None
+        assert hasattr(surface, "__dict__"), (
+            f"{surface.attribute}: must not use slots=True"
+        )
+
+
+def test_importing_the_manifest_imports_NO_sdk():
+    """Both SDKs are optional extras; the manifest must import without them."""
+    from tests._fixtures import run_python
+
+    out = run_python("-c", "import sys, tidewall_otel._manifest; "
+                           "print('openai' in sys.modules, 'anthropic' in sys.modules)")
+    assert out.strip() == "False False"
+
+
+@requires_sdks
+def test_unset_sentinels_resolve_to_TYPES_when_the_sdk_is_present():
+    for surface in SURFACES:
+        for sentinel in surface.unset_sentinels:
+            assert isinstance(sentinel, type), (surface.attribute, sentinel)
+        assert isinstance(object(), surface.unset_sentinels) is False
+
+
+# -- lossiness, by predicate rather than by label -------------------------
+
+@requires_sdks
+def test_a_minimal_real_call_has_NO_lossy_paths():
+    """The regression test for the fail-closed inversion. If this fails,
+    enforce mode blocks all traffic."""
+    nodes = bound_nodes_for(OPENAI_CHAT_SYNC, (), {
+        "messages": [{"role": "user", "content": "hi"}], "model": "gpt-4o"})
+    assert lossy_paths(OPENAI_CHAT_SYNC, nodes) == ()
+
+
+@requires_sdks
+def test_typed_content_is_lossy_BY_PREDICATE_not_by_label():
+    """The server joins message content as strings, so a typed list is a
+    TypeError before any detector runs. Asserting two English labels are
+    absent from a tuple would pass with the mechanism ignored entirely."""
+    nodes = bound_nodes_for(OPENAI_CHAT_SYNC, (), {"model": "gpt-4o", "messages": [
+        {"role": "user", "content": "plain"},
+        {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+    ]})
+    lossy = lossy_paths(OPENAI_CHAT_SYNC, nodes)
+    assert "messages[1].content" in lossy
+    assert "messages[0].content" not in lossy
+
+
+@requires_sdks
+def test_an_anthropic_TYPED_SYSTEM_BLOCK_is_lossy():
+    target = resolve(ANTHROPIC_MESSAGES_SYNC)
+    typed = bound_nodes_for(ANTHROPIC_MESSAGES_SYNC, (), {
+        "system": [{"type": "text", "text": "be helpful"}],
+        "messages": [], "model": "claude-x", "max_tokens": 8}, wrapped=target)
+    assert "system" in lossy_paths(ANTHROPIC_MESSAGES_SYNC, typed)
+
+    plain = bound_nodes_for(ANTHROPIC_MESSAGES_SYNC, (), {
+        "system": "be helpful", "messages": [], "model": "claude-x",
+        "max_tokens": 8}, wrapped=target)
+    assert "system" not in lossy_paths(ANTHROPIC_MESSAGES_SYNC, plain)
+
+
+@requires_sdks
+@pytest.mark.parametrize("surface", [OPENAI_CHAT_SYNC, ANTHROPIC_MESSAGES_SYNC],
+                         ids=lambda s: s.attribute)
+def test_a_nonempty_extra_body_is_LOSSY(surface):
+    """Both SDKs merge extra_body OVER the generated body, so it can
+    replace the very messages the guard just approved."""
+    base = ({"messages": [], "model": "gpt-4o"} if surface is OPENAI_CHAT_SYNC
+            else {"messages": [], "model": "c", "max_tokens": 8})
+
+    override = bound_nodes_for(surface, (), {
+        **base, "extra_body": {"messages": [{"role": "user", "content": "EVIL"}]}})
+    assert "extra_body" in lossy_paths(surface, override)
+
+    absent = bound_nodes_for(surface, (), base)
+    assert "extra_body" not in lossy_paths(surface, absent)
+
+
+@requires_sdks
+def test_an_allowed_tools_tool_choice_is_lossy_and_a_named_one_is_not():
+    """Three of tool_choice's four variants are pure controls; the fourth
+    supplies INLINE tool objects the guard never sees."""
+    inline = bound_nodes_for(OPENAI_CHAT_SYNC, (), {
+        "messages": [], "model": "gpt-4o",
+        "tool_choice": {"type": "allowed_tools", "allowed_tools": {
+            "mode": "auto", "tools": [{"function": {"name": "exfiltrate"}}]}}})
+    assert "tool_choice" in lossy_paths(OPENAI_CHAT_SYNC, inline)
+
+    for control in ("auto", "required",
+                    {"type": "function", "function": {"name": "get_weather"}}):
+        nodes = bound_nodes_for(OPENAI_CHAT_SYNC, (), {
+            "messages": [], "model": "gpt-4o", "tool_choice": control})
+        assert "tool_choice" not in lossy_paths(OPENAI_CHAT_SYNC, nodes), control
+
+
+@requires_sdks
+def test_an_anthropic_output_config_SCHEMA_is_lossy_and_effort_only_is_not():
+    """OutputConfigParam.format.schema is Dict[str, object] -- descriptions,
+    enums and examples no detector sees. Classified from its TYPE, not its
+    name."""
+    base = {"messages": [], "model": "c", "max_tokens": 8}
+    with_schema = bound_nodes_for(ANTHROPIC_MESSAGES_SYNC, (), {
+        **base, "output_config": {"format": {"type": "json_schema",
+                                             "schema": {"description": "secret"}}}})
+    assert "output_config" in lossy_paths(ANTHROPIC_MESSAGES_SYNC, with_schema)
+
+    effort_only = bound_nodes_for(ANTHROPIC_MESSAGES_SYNC, (), {
+        **base, "output_config": {"effort": "high"}})
+    assert "output_config" not in lossy_paths(ANTHROPIC_MESSAGES_SYNC, effort_only)
+
+
+@requires_sdks
+def test_a_json_schema_response_format_is_lossy_and_a_plain_one_is_not():
+    schema = bound_nodes_for(OPENAI_CHAT_SYNC, (), {
+        "messages": [], "model": "gpt-4o",
+        "response_format": {"type": "json_schema",
+                            "json_schema": {"description": "secret"}}})
+    assert "response_format" in lossy_paths(OPENAI_CHAT_SYNC, schema)
+
+    plain = bound_nodes_for(OPENAI_CHAT_SYNC, (), {
+        "messages": [], "model": "gpt-4o",
+        "response_format": {"type": "json_object"}})
+    assert "response_format" not in lossy_paths(OPENAI_CHAT_SYNC, plain)
+
+
+@requires_sdks
+def test_the_legacy_functions_API_is_lossy_not_silently_uninspected():
+    """functions[*] carries name, description and parameters and is never
+    sent. Classifying it a control would certify an inspection that does not
+    happen."""
+    nodes = bound_nodes_for(OPENAI_CHAT_SYNC, (), {
+        "messages": [], "model": "gpt-4o",
+        "functions": [{"name": "run_sql", "description": "runs SQL",
+                       "parameters": {"type": "object"}}]})
+    assert "functions" in lossy_paths(OPENAI_CHAT_SYNC, nodes)
+
+
+def test_an_unknown_kwarg_is_lossy_without_any_declaration():
+    """The fail-closed default, through the same function."""
+    def future_sdk(self, *, messages, model, **kwargs): ...
+
+    nodes = bound_nodes_for(OPENAI_CHAT_SYNC, (), {
+        "messages": [], "model": "gpt-4o", "some_new_2027_field": "x"},
+        wrapped=future_sdk)
+    assert "some_new_2027_field" in lossy_paths(OPENAI_CHAT_SYNC, nodes)
+
+
+# -- signature classification --------------------------------------------
+
+@requires_sdks
+def test_every_signature_parameter_is_CLASSIFIED():
+    """Three categories: mapped, non_prompt_bearing, or known_lossy.
+
+    EXPECTED TO BREAK ON SDK UPGRADE. That is the point: a new parameter must
+    be classified deliberately, not silently uninspected.
+    """
+    root = lambda pattern: pattern.split("[")[0].split(".")[0]
+    for surface in SURFACES:
+        params = set(inspect.signature(resolve(surface)).parameters) - {"self", "kwargs", "args"}
+        mapped = {root(p) for p in surface.path_map}
+        declared = ({root(p) for p in surface.non_prompt_bearing}
+                    | {root(p) for p in surface.known_lossy})
+        unaccounted = params - mapped - declared
+        assert not unaccounted, (
+            f"{surface.attribute}: {sorted(unaccounted)} are in no category. "
+            f"An SDK upgrade added parameters -- classify each as mapped, "
+            f"non_prompt_bearing, or known_lossy. Do NOT bulk-add to "
+            f"non_prompt_bearing: check what each one carries first."
+        )
+        contract = mapped | {root(p) for p in surface.known_lossy}
+        broken = contract - params
+        assert not broken, (
+            f"{surface.attribute}: {sorted(broken)} are mapped or declared "
+            f"lossy but absent from this SDK -- the contract is dead code"
+        )
+
+
+@requires_sdks
+def test_no_non_prompt_bearing_entry_hides_a_nested_schema():
+    """The GENERAL form, so the next one is caught by the suite rather than a
+    reviewer. eval_str is load-bearing: both SDKs use postponed annotations,
+    so without it every annotation is a string and this flags nothing."""
+    from tests._fixtures import _admits_free_form
+
+    for surface in SURFACES:
+        signature = inspect.signature(resolve(surface), eval_str=True)
+
+        # SANITY: known cases must flag, or this proves nothing.
+        assert _admits_free_form(signature.parameters["extra_body"].annotation)
+
+        for name in surface.non_prompt_bearing:
+            if name not in signature.parameters:
+                continue
+            if _admits_free_form(signature.parameters[name].annotation):
+                assert _shape_for_exists(surface, name), (
+                    f"{surface.attribute}.{name} transitively admits "
+                    f"Dict[str, object] but is declared a pure control with "
+                    f"no predicate"
+                )
+
+
+def _shape_for_exists(surface, name):
+    return any(matches(pattern, name) for pattern in surface.lossless_shapes)
+
+
+# -- client integrity -----------------------------------------------------
+
+@requires_sdks
+@pytest.mark.parametrize("label,construct", [
+    ("openai default",        lambda: __import__("openai").OpenAI(api_key="t")),
+    ("openai async",          lambda: __import__("openai").AsyncOpenAI(api_key="t")),
+    ("anthropic default",     lambda: __import__("anthropic").Anthropic(api_key="t")),
+    ("anthropic async",       lambda: __import__("anthropic").AsyncAnthropic(api_key="t")),
+    ("openai proxy",          lambda: __import__("openai").OpenAI(
+        api_key="t", http_client=httpx.Client(proxy="http://localhost:8888"))),
+    ("openai async proxy",    lambda: __import__("openai").AsyncOpenAI(
+        api_key="t", http_client=httpx.AsyncClient(proxy="http://localhost:8888"))),
+    ("anthropic proxy",       lambda: __import__("anthropic").Anthropic(
+        api_key="t", http_client=httpx.Client(proxy="http://localhost:8888"))),
+    ("custom timeout",        lambda: __import__("openai").OpenAI(api_key="t", timeout=30.0)),
+    ("base_url override",     lambda: __import__("openai").OpenAI(
+        api_key="t", base_url="https://gateway.internal/v1")),
+    ("max_retries",           lambda: __import__("openai").OpenAI(api_key="t", max_retries=5)),
+    ("default_headers",       lambda: __import__("openai").OpenAI(
+        api_key="t", default_headers={"x-team": "search"})),
+    ("verify=False",          lambda: __import__("openai").OpenAI(
+        api_key="t", http_client=httpx.Client(verify=False))),
+    ("custom limits",         lambda: __import__("openai").OpenAI(
+        api_key="t", http_client=httpx.Client(limits=httpx.Limits(max_connections=5)))),
+    ("trust_env=False",       lambda: __import__("openai").OpenAI(
+        api_key="t", http_client=httpx.Client(trust_env=False))),
+], ids=lambda x: x if isinstance(x, str) else "")
+def test_an_ordinary_client_has_NO_escapes(label, construct):
+    """The false-positive guard matters more than the positive one: a detector
+    that fires on ordinary usage makes is_active() false for every proxy user
+    and trains the operator to ignore it."""
+    assert client_escapes(construct()) == (), label
+
+
+class _Rewriter(httpx.BaseTransport):
+    def handle_request(self, request):
+        return httpx.Response(200, json={})
+
+
+@requires_sdks
+@pytest.mark.parametrize("construct,expected", [
+    (lambda: __import__("anthropic").Anthropic(
+        api_key="t", middleware=[lambda r, n: n(r)]), "middleware"),
+    (lambda: __import__("openai").OpenAI(api_key="t", http_client=httpx.Client(
+        transport=httpx.MockTransport(lambda r: httpx.Response(200)))), "transport"),
+    (lambda: __import__("openai").OpenAI(api_key="t", http_client=httpx.Client(
+        mounts={"all://": httpx.MockTransport(lambda r: httpx.Response(200))})), "mounts"),
+    (lambda: __import__("openai").OpenAI(api_key="t", http_client=httpx.Client(
+        event_hooks={"request": [lambda r: None]})), "event_hooks"),
+])
+def test_each_construction_time_escape_is_DETECTED(construct, expected):
+    """Out of the threat model, but never unnoticed: each was reproduced
+    rewriting the wire body after inspection."""
+    assert expected in client_escapes(construct())
+
+
+def test_a_transport_WEARING_THE_STANDARD_NAME_is_not_trusted():
+    """Comparing class NAMES certifies an impostor. Identity, not names."""
+    Impostor = type("HTTPTransport", (_Rewriter,), {})
+    assert type(Impostor()).__name__ == "HTTPTransport"
+    assert not _is_standard_transport(Impostor())
+
+
+def test_a_SUBCLASS_of_the_real_transport_is_not_trusted_either():
+    """Why identity and not isinstance: a subclass overriding handle_request
+    passes isinstance and can rewrite the body freely."""
+    class Sneaky(httpx.HTTPTransport):
+        def handle_request(self, request):
+            return httpx.Response(200, json={})
+
+    assert isinstance(Sneaky(), httpx.HTTPTransport)
+    assert not _is_standard_transport(Sneaky())
+
+
+def test_genuine_transports_are_still_trusted_under_identity():
+    """Tightening the check must not start flagging the real ones."""
+    assert _is_standard_transport(httpx.Client()._transport)
+    assert _is_standard_transport(httpx.AsyncClient()._transport)
+    assert _is_standard_transport(None)
+    for mounted in httpx.Client(proxy="http://localhost:8888")._mounts.values():
+        assert _is_standard_transport(mounted)
+
+
+# -- disposition -----------------------------------------------------------
+
+def test_an_out_of_range_sdk_makes_the_surface_UNVERIFIED():
+    assert disposition_for(OPENAI_CHAT_SYNC, installed_version="1.50.0") == "covered"
+    assert disposition_for(OPENAI_CHAT_SYNC, installed_version="2.0.0") == "unverified"
+    assert disposition_for(OPENAI_CHAT_SYNC, installed_version="1.0.0") == "unverified"
+
+
+@requires_sdks
+def test_the_extra_body_OVERRIDE_is_REAL_and_is_classified_lossy():
+    """Two assertions, because the refusal is only meaningful if the threat is.
+
+    First: capture the body the SDK actually builds, with no Tidewall in the
+    picture, and prove extra_body wins. If a future SDK stops merging, this
+    fails and the refusal can be reconsidered deliberately rather than left in
+    place for a reason that stopped being true.
+
+    Second: the manifest classifies it lossy. Refusal at dispatch is asserted
+    where dispatch exists.
+    """
+    import json
+
+    import openai
+
+    captured = {}
+
+    def handler(request):
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={
+            "id": "x", "object": "chat.completion", "created": 0,
+            "model": "gpt-4o", "choices": [{
+                "index": 0, "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "ok"}}]})
+
+    client = openai.OpenAI(
+        api_key="t", http_client=httpx.Client(transport=httpx.MockTransport(handler)))
+    client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": "SAFE"}],
+        extra_body={"messages": [{"role": "user", "content": "EVIL"}]},
+    )
+    assert captured["body"]["messages"][0]["content"] == "EVIL", (
+        "extra_body no longer overrides the wire body -- re-examine the rule"
+    )
+
+    nodes = bound_nodes_for(OPENAI_CHAT_SYNC, (), {
+        "model": "gpt-4o", "messages": [{"role": "user", "content": "SAFE"}],
+        "extra_body": {"messages": [{"role": "user", "content": "EVIL"}]}})
+    assert "extra_body" in lossy_paths(OPENAI_CHAT_SYNC, nodes)
+
+
+def test_known_lossy_is_an_EXPLICIT_declaration_not_a_fallback():
+    """Mutation-testing showed `known_lossy` adds no DETECTION power: its
+    entries are in neither path_map nor non_prompt_bearing, so the unknown-key
+    fallback catches them anyway, and deleting the known_lossy branch left
+    every test passing.
+
+    What it does provide is an explicit, reviewable statement that a
+    prompt-bearing field was considered and refused, rather than silently
+    falling through. That is worth having and worth asserting -- but the
+    earlier claim that it is "stronger than the fallback" was simply false.
+    """
+    assert "functions" in OPENAI_CHAT_SYNC.known_lossy
+    assert "prediction" in OPENAI_CHAT_SYNC.known_lossy
+    for name in OPENAI_CHAT_SYNC.known_lossy:
+        assert name not in OPENAI_CHAT_SYNC.non_prompt_bearing, (
+            f"{name} is declared both a control and lossy"
+        )
+
+
+def test_the_anthropic_write_back_splits_the_system_prompt_BACK_OUT():
+    """The transform must restore Anthropic's separate `system` kwarg."""
+    kwargs = {"messages": [{"role": "user", "content": "hi"}],
+              "system": "be careful", "model": "claude-x"}
+    guard_messages = [{"role": "system", "content": "be careful, cleaned"},
+                      {"role": "user", "content": "hi"}]
+
+    out = ANTHROPIC_MESSAGES_SYNC.transform_into(kwargs, guard_messages)
+    assert out["system"] == "be careful, cleaned"
+    assert out["messages"] == [{"role": "user", "content": "hi"}]
+    assert all(m["role"] != "system" for m in out["messages"])
+    assert out["model"] == "claude-x", "untouched kwargs must survive"
+
+
+def test_the_anthropic_write_back_KEEPS_every_message_when_there_is_no_system():
+    """Taking the head unconditionally deletes the caller's FIRST MESSAGE on
+    every ordinary call -- the normalizer only prepends a system message when
+    `system` was supplied."""
+    kwargs = {"messages": [{"role": "user", "content": "first"}], "model": "c"}
+    guard_messages = [{"role": "user", "content": "first"},
+                      {"role": "assistant", "content": "second"}]
+
+    out = ANTHROPIC_MESSAGES_SYNC.transform_into(kwargs, guard_messages)
+    assert "system" not in out
+
+    # DERIVED from what was supplied. Asserting `len(...) == 2` and then
+    # member [0] checks cardinality and one element -- a write-back that
+    # corrupted every message after the first passed exactly that pair of
+    # assertions under a name promising EVERY message.
+    assert out["messages"] == guard_messages, (
+        f"the write-back did not preserve every message: {out['messages']}")
+
+
+def test_the_anthropic_write_back_tolerates_an_empty_list():
+    out = ANTHROPIC_MESSAGES_SYNC.transform_into({"model": "c"}, [])
+    assert out == {"model": "c"}
+
+
+def test_the_openai_write_back_replaces_only_messages():
+    kwargs = {"messages": [{"role": "user", "content": "old"}],
+              "model": "gpt-4o", "temperature": 0.2, "seed": 7}
+    guard_messages = [{"role": "user", "content": "clean"}]
+    out = OPENAI_CHAT_SYNC.transform_into(kwargs, guard_messages)
+
+    # WHOLE OBJECT. Checking `messages[0]` plus three named kwargs let a
+    # write-back that APPENDED a fabricated assistant message pass -- the
+    # first message was right and every named kwarg survived, and the test
+    # never looked at what else was in the list.
+    assert out == {**kwargs, "messages": guard_messages}
+
+
+def test_the_path_map_never_claims_a_path_the_NORMALIZER_cannot_produce():
+    """The map is a claim about what the agent carries to the guard.
+
+    It listed `messages[*].tool_calls[*].function.arguments` while
+    `normalize_openai_messages` emits only `role` and `content`, so the map
+    asserted a coverage nothing provided. Harmless in effect -- an unmapped
+    path is lossy, so such a call is refused before the guard or the provider
+    -- but a map that lies is the defect class this programme exists to
+    remove, and the next reader would have trusted it.
+
+    DERIVED from the normalizer's actual output rather than a list of known
+    offenders, so a future map entry with no producer fails here.
+    """
+    from tidewall_otel._normalizer import normalize
+
+    kwargs = {
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi", "tool_calls": [
+                {"id": "c1", "type": "function",
+                 "function": {"name": "f", "arguments": "{}"}}]},
+        ],
+        "tools": [{"type": "function", "function": {
+            "name": "f", "description": "d", "parameters": {}}}],
+    }
+    produced = normalize(OPENAI_CHAT_SYNC, kwargs)
+
+    def emitted_paths(value, prefix=""):
+        if isinstance(value, dict):
+            for key, sub in value.items():
+                path = f"{prefix}.{key}" if prefix else key
+                yield path
+                yield from emitted_paths(sub, path)
+        elif isinstance(value, list):
+            for item in value:
+                # Yield the ELEMENT path itself, not only its children. The
+                # first version walked into items and never emitted
+                # `messages[*]`, so the map's legitimate element entries
+                # looked unbacked -- the walker was wrong, not the map.
+                yield f"{prefix}[*]"
+                yield from emitted_paths(item, f"{prefix}[*]")
+
+    emitted = set(emitted_paths({"guard_input": produced}))
+
+    unbacked = sorted(
+        target for target in OPENAI_CHAT_SYNC.path_map.values()
+        if target not in emitted
+    )
+    assert not unbacked, (
+        "the path map claims targets the normalizer never emits: "
+        f"{unbacked}")
+
+
+@pytest.mark.parametrize("surface", SURFACES, ids=lambda s: s.attribute)
+def test_normalization_preserves_message_VALUES_not_just_paths(surface):
+    """Coverage certifies path membership; this certifies the values.
+
+    `classify_input` delegates to `lossy_paths`, which checks that every
+    provider path is mapped -- membership and coarse shape. `canonicalise`
+    exists to compare structures and was called by nothing. So a normalizer
+    regression that TRUNCATED, coerced, reordered or substituted content kept
+    every expected path, stayed classified lossless, and would have let
+    `enforce` guard one representation while sending the original kwargs to
+    the provider.
+
+    Value comparison belongs here rather than on the hot path: doing it per
+    call means normalising and walking every request twice to catch a defect
+    that can only be introduced by editing this repository.
+
+    Parametrised over SURFACES, so a provider added later is covered without
+    anyone remembering to extend a list.
+    """
+    from tidewall_otel._coverage import canonicalise
+    from tidewall_otel._normalizer import normalize
+
+    if surface.provider == "anthropic":
+        kwargs = {
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 16,
+            "system": "you are careful",
+            "messages": [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "second"},
+                {"role": "user", "content": "third — with unicode"},
+            ],
+        }
+    else:
+        kwargs = {
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "system", "content": "you are careful"},
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "second"},
+                {"role": "user", "content": "third — with unicode"},
+            ],
+        }
+
+    guard_input = normalize(surface, kwargs)
+    shown = [canonicalise({"role": m.get("role"), "content": m.get("content")})
+             for m in guard_input["messages"]]
+
+    for message in kwargs["messages"]:
+        wanted = canonicalise({"role": message["role"],
+                               "content": message["content"]})
+        assert wanted in shown, (
+            f"{surface.attribute}: the guard was shown a different value for "
+            f"{message['role']!r}: {guard_input['messages']}")
+
+    # And the ORDER survives: a guard that sees a conversation reordered sees
+    # a different conversation.
+    provider_contents = [m["content"] for m in kwargs["messages"]]
+    shown_contents = [m.get("content") for m in guard_input["messages"]]
+    assert [c for c in shown_contents if c in provider_contents] == provider_contents, (
+        f"{surface.attribute}: message order changed: {shown_contents}")
+
+
+@pytest.mark.parametrize("surface", SURFACES, ids=lambda s: s.attribute)
+def test_MULTIPART_content_is_lossy_deliberately(surface):
+    """Pinned so the refusal is a decision rather than an accident.
+
+    The normalizer flattens text blocks to a joined string, which reads like
+    support -- and it is, for `monitor` and `dry-run`. In `enforce` the call
+    is refused, because the manifest declares no `content[*]` paths.
+
+    Declaring them was tried and reverted: three provider paths would collapse
+    onto one guard path, breaking the bijection that stops a value being
+    inspected under another's name, and the write-back cannot rebuild a block
+    list from a redacted string.
+
+    The substantive reason is that an image block carries instructions the
+    guard cannot read. Documented in python/README.md under "What is refused
+    in enforce", and this test is what keeps that table true.
+    """
+    from tidewall_otel._manifest import lossy_paths
+    from tidewall_otel._bound import bound_nodes
+
+    def target(**kwargs):
+        return kwargs
+
+    kwargs = {"model": "m", "messages": [
+        {"role": "user", "content": [{"type": "text", "text": "describe"}]}]}
+    if surface.provider == "anthropic":
+        kwargs["max_tokens"] = 16
+
+    nodes = bound_nodes(target, (), kwargs, stop=surface.opaque_subtrees, unset=())
+    lossy = lossy_paths(surface, nodes)
+
+    assert any("content" in path for path in lossy), (
+        f"{surface.attribute}: a block list was classified inspectable, so "
+        f"enforce would guard a flattened string and send the blocks")
+
+
+# -- state that does not live in __dict__ ----------------------------------
+#
+# The object branch read `__dict__` alone. Pydantic v2 keeps declared fields
+# there, but `extra="allow"` models keep unknown fields in
+# `__pydantic_extra__`, which is a SLOT -- and `model_dump()` serialises it.
+# So an extra mutated during the guard call changed the wire payload while
+# the fingerprint stayed byte-identical: one payload inspected and a
+# container reading differently than it stores.
+#
+# Pydantic is one instance of the general defect, so the fix is general:
+# snapshot every slot declared across the MRO, read through the member
+# descriptor so an overridden `__getattr__` cannot dress up what is stored.
+
+def test_a_PYDANTIC_EXTRA_field_is_inside_the_fingerprint():
+    """The exact bypass, on a real pydantic v2 model."""
+    import pydantic
+    from tidewall_otel._manifest import _trusted
+
+    class Model(pydantic.BaseModel):
+        model_config = pydantic.ConfigDict(extra="allow")
+        role: str
+
+    message = Model(role="user", content="benign")
+    before = _trusted(message)
+    assert message.model_dump()["content"] == "benign"
+
+    message.content = "MALICIOUS"
+
+    assert message.model_dump()["content"] == "MALICIOUS", "premise wrong"
+    assert _trusted(message) != before, \
+        "an extra field changed the serialised payload invisibly"
+
+
+def test_a_REAL_SDK_model_mutated_in_place_is_caught():
+    """Agent loops append the assistant's own response object back into
+    `messages`, so real SDK models genuinely reach this code as request
+    content -- the dict-subclass test did not establish that."""
+    from openai.types.chat import ChatCompletionMessage
+
+    from tidewall_otel._manifest import _trusted
+
+    message = ChatCompletionMessage(role="assistant", content="benign")
+    before = _trusted(message)
+    message.content = "MALICIOUS"
+    assert _trusted(message) != before, "a real OpenAI model mutated invisibly"
+
+
+def test_an_ANTHROPIC_model_mutated_in_place_is_caught():
+    from anthropic.types import TextBlock
+
+    from tidewall_otel._manifest import _trusted
+
+    block = TextBlock(type="text", text="benign")
+    before = _trusted(block)
+    block.text = "MALICIOUS"
+    assert _trusted(block) != before, "a real Anthropic model mutated invisibly"
+
+
+def test_a_PLAIN_SLOTTED_object_is_snapshotted_not_waved_through():
+    """Slots are the general case. Without them, an object with slots and no
+    `__dict__` falls to the untrusted fallback on its type name alone -- which
+    is stable across any mutation of its actual contents."""
+    from tidewall_otel._manifest import _trusted
+
+    class Slotted:
+        __slots__ = ("payload",)
+
+        def __init__(self, payload):
+            self.payload = payload
+
+    value = Slotted("benign")
+    before = _trusted(value)
+    value.payload = "MALICIOUS"
+    assert _trusted(value) != before, "slot state mutated invisibly"
+
+
+def test_slot_reads_ignore_a_LYING_getattr():
+    """Read through the member descriptor, not attribute access, for the same
+    reason the dict branch reads through `dict.items`."""
+    from tidewall_otel._manifest import _trusted
+
+    class Liar:
+        __slots__ = ("payload",)
+
+        def __init__(self, payload):
+            self.payload = payload
+
+        def __getattribute__(self, name):
+            if name == "payload":
+                return "benign"
+            return object.__getattribute__(self, name)
+
+    value = Liar("MALICIOUS")
+    assert value.payload == "benign", "premise wrong"
+    snapshot = repr(_trusted(value))
+    assert "MALICIOUS" in snapshot, "the snapshot believed an overridden reader"
+
+
+def test_ordinary_PYDANTIC_content_is_not_marked_divergent():
+    """The fix above must not become a denial of service.
+
+    `__pydantic_fields_set__` is a set, and slot capture puts it inside every
+    pydantic snapshot. Left to the untrusted fallback it would snapshot as
+    `("?", "set")`, and `_divergent_containers` refuses any mapping value it
+    cannot vouch for -- so every message carrying a pydantic model would be
+    refused as lossy in enforce. Sets are ordinary data and snapshot as such.
+    """
+    from openai.types.chat import ChatCompletionMessage
+
+    from tidewall_otel._manifest import _divergent_containers, _is_untrusted, _trusted
+
+    message = ChatCompletionMessage(role="assistant", content="hello")
+    assert not _is_untrusted(_trusted(message)), \
+        "an ordinary SDK model snapshotted as unvouchable"
+    assert _divergent_containers({"messages[0]": {"m": message}}) == []
+
+
+# -- the walk is bounded ---------------------------------------------------
+#
+# Recursion was unbounded. `content_fingerprint` is called OUTSIDE dispatch's
+# try block, so a deeply nested schema or a self-referencing container
+# escaped as a `RecursionError` attributable to this agent rather than as a
+# verdict -- breaking both enforce and monitor on a payload the agent was
+# only supposed to inspect.
+
+def test_a_DEEPLY_NESTED_schema_does_not_crash_the_walk():
+    from tidewall_otel._manifest import _is_untrusted, _trusted
+
+    deep = {"type": "object"}
+    node = deep
+    for _ in range(600):                    # past CPython's recursion limit
+        node["properties"] = {"x": {"type": "object"}}
+        node = node["properties"]["x"]
+
+    snapshot = _trusted(deep)               # must not raise
+    assert _is_untrusted(snapshot), \
+        "exhausting the budget waved the value through as vouched-for"
+
+
+def test_a_SELF_REFERENCING_container_is_marked_as_a_CYCLE():
+    """Asserting only that the walk TERMINATES proves nothing here: the depth
+    bound alone satisfies that, so cycle detection could be deleted outright
+    with such a test still green. The name would claim cycle detection while
+    the body proved termination.
+
+    The cycle must be caught WHERE IT CLOSES, at depth 1, not fifty levels
+    later once the depth budget runs out -- otherwise every cycle burns the
+    budget that real nesting needs.
+    """
+    from tidewall_otel._manifest import _trusted
+
+    cycle = {}
+    cycle["self"] = cycle
+    assert _trusted(cycle) == ("dict", "dict", (("self", ("?", "cycle")),))
+
+    circular = [1]
+    circular.append(circular)
+    assert _trusted(circular) == ("list", (("int", 1), ("?", "cycle")))
+
+
+def test_a_value_shared_between_siblings_is_still_snapshotted():
+    """Cycle detection tracks identity along the current path only. Tracking
+    it globally would snapshot the second occurrence of any shared value as a
+    cycle, and SDK payloads reuse objects routinely."""
+    from tidewall_otel._manifest import _trusted
+
+    shared = {"role": "user", "content": "hello"}
+    snapshot = repr(_trusted({"a": shared, "b": shared}))
+    assert snapshot.count("hello") == 2, "a shared value was mistaken for a cycle"
+
+
+def test_a_LARGE_tool_schema_stays_cheap():
+    """The bound must not become the cost. A realistic large schema walks in
+    milliseconds; the budget is for the pathological case."""
+    import time
+
+    from tidewall_otel._manifest import _trusted
+
+    schema = {"type": "object", "properties": {
+        f"field_{i}": {"type": "string", "description": "x" * 50}
+        for i in range(2000)}}
+
+    started = time.perf_counter()
+    _trusted(schema)
+    elapsed = time.perf_counter() - started
+    assert elapsed < 0.5, f"walking a 2000-field schema took {elapsed:.3f}s"
+
+
+def test_every_declared_surface_is_KEYWORD_ONLY():
+    """The fingerprint covers positional arguments, and `args` is empty for
+    every surface we patch -- today.
+
+    That is a property of the SDK versions in front of us, not a guarantee.
+    If a provider ever makes a parameter positional, this says so rather than
+    letting it sit silently outside the comparison.
+    """
+    import inspect
+
+    from tidewall_otel._manifest import SURFACES
+
+    positional, resolved = {}, 0
+    for surface in SURFACES:
+        target = _resolve_surface_callable(surface)
+        if target is None:
+            continue
+        resolved += 1
+        names = [p.name for p in inspect.signature(target).parameters.values()
+                 if p.name != "self"
+                 and p.kind in (inspect.Parameter.POSITIONAL_ONLY,
+                                inspect.Parameter.POSITIONAL_OR_KEYWORD)]
+        if names:
+            positional[surface.attribute] = names
+
+    # Not vacuous: a resolver that silently returned None for everything
+    # would report a clean result forever.
+    assert resolved == len(SURFACES), \
+        f"only resolved {resolved} of {len(SURFACES)} surfaces"
+    assert not positional, (
+        "these surfaces accept positional payload, which the fingerprint "
+        f"covers but no test exercises: {positional}")
+
+
+def _resolve_surface_callable(surface):
+    """The unpatched method a surface names, or None if its SDK is absent."""
+    import importlib
+
+    try:
+        module = importlib.import_module(surface.module)
+    except ImportError:                     # pragma: no cover - SDK absent
+        return None
+    target = module
+    for part in surface.attribute.split("."):
+        target = getattr(target, part, None)
+        if target is None:
+            return None
+    return target
