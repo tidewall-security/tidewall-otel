@@ -17,6 +17,7 @@ have to reconstruct arguments they never saw.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol
@@ -143,6 +144,13 @@ Decision = Proceed | Transform | Refuse
 # none, because both are raised through a variable, so it passed vacuously on
 # exactly the two kinds it was written to cover.
 TIME_REFUSALS = frozenset({"mutated_during_guard", "unverifiable_payload"})
+
+#: Stamped BEFORE guard I/O, published after. Guard health is one shared
+#: scalar written by every call, and a call that begins during an outage and
+#: stalls can finish after a later call has already observed recovery -- its
+#: assignment would republish an incident that is over. `itertools.count` is
+#: atomic in CPython; ordering is enforced when the value is published.
+_HEALTH_SEQUENCE = itertools.count(1)
 
 _FAILURES = frozenset({
     "unreachable", "timeout", "saturated", "schema_invalid",
@@ -378,6 +386,7 @@ def dispatch_sync(surface, wrapped, instance, args, kwargs, config, guard, execu
             _annotate(span, "tidewall.guard.skipped", pre.reason)
             return _invoke_and_record(wrapped, args, kwargs, span, surface)
 
+        observation = next(_HEALTH_SEQUENCE)
         before = content_fingerprint(surface, call.kwargs)
 
         try:
@@ -391,7 +400,7 @@ def dispatch_sync(surface, wrapped, instance, args, kwargs, config, guard, execu
 
         _annotate(span, "tidewall.guard.outcome", outcome.kind)
         if state is not None:
-            state.record_guard_health(outcome.kind)
+            state.record_guard_health(outcome.kind, sequence=observation)
         _handle_mutation(surface, call, before, span, config, state)
         decision = decide_outcome(surface, call, pre, outcome, config)
 
@@ -428,6 +437,7 @@ async def dispatch_async(surface, wrapped, instance, args, kwargs, config, guard
             _record_outcome(span, response, kwargs, surface)
             return response
 
+        observation = next(_HEALTH_SEQUENCE)
         before = content_fingerprint(surface, call.kwargs)
 
         try:
@@ -446,7 +456,7 @@ async def dispatch_async(surface, wrapped, instance, args, kwargs, config, guard
 
         _annotate(span, "tidewall.guard.outcome", outcome.kind)
         if state is not None:
-            state.record_guard_health(outcome.kind)
+            state.record_guard_health(outcome.kind, sequence=observation)
         _handle_mutation(surface, call, before, span, config, state)
         decision = decide_outcome(surface, call, pre, outcome, config)
 

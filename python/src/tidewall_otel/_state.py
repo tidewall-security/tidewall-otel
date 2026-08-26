@@ -27,6 +27,7 @@ report itself enforcing, which is the most misleading answer available.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -37,17 +38,30 @@ _GUARD_HEALTH = {"clean": "ok", "blocked": "ok", "transformed": "ok"}
 _ENFORCING_MODES = frozenset({"enforce", "monitor"})
 
 
+#: Distinct details kept per condition. An operator needs examples, not a
+#: transcript: the details are caller-controlled and can grow per call.
+_MAX_SAMPLES = 5
+
+
 @dataclass
 class StateEvent:
-    """Something worth telling an operator about, with its reason."""
+    """Something worth telling an operator about, with its reason.
 
-    kind: str                       # "skip" | "unverified"
+    One entry per CONDITION, not per occurrence. `count` says how often it
+    happened and `samples` holds a bounded set of distinct details, because
+    the details come from the caller's own payload and can differ every time.
+    """
+
+    kind: str                       # "skip" | "unverified" | "unrecoverable"
     surface: str
     reason: str
     detail: Any = None
+    count: int = 1
+    samples: list = field(default_factory=list)
 
     def __str__(self) -> str:
-        return f"{self.kind} {self.surface}: {self.reason} {self.detail}"
+        seen = f" (x{self.count})" if self.count > 1 else ""
+        return f"{self.kind} {self.surface}: {self.reason} {self.detail}{seen}"
 
 
 @dataclass
@@ -62,13 +76,19 @@ class State:
     #: behind it.
     guard_health: str = "unknown"
     events: list[StateEvent] = field(default_factory=list)
-    #: Keys of events already recorded. An operator needs to know WHICH
-    #: conditions occurred, not how many times: a process using a custom
-    #: httpx client recorded one `client_escapes` event per LLM call and grew
-    #: this list forever, and monitor mode did the same with one `skip` per
-    #: lossy call. Both are steady-state conditions that repeat on every call
-    #: by their nature, so the log they produced was unbounded by design.
-    _recorded: set = field(default_factory=set, repr=False, compare=False)
+    #: Condition -> its event. An operator needs to know WHICH conditions
+    #: occurred, not how many times: a process using a custom httpx client
+    #: recorded one `client_escapes` event per LLM call, and monitor did the
+    #: same with one `skip` per lossy call, in the mode designed to be left
+    #: running. Keyed WITHOUT the detail, because the detail is the caller's
+    #: own payload -- an agent loop appending turns reported
+    #: `messages[1..N].content`, a longer tuple every call, so keying on it
+    #: grew the log quadratically.
+    _recorded: dict = field(default_factory=dict, repr=False, compare=False)
+    #: The last observation published to `guard_health`, so a stalled call
+    #: finishing late cannot republish an outage that has already recovered.
+    _health_seq: int = 0
+    _lock: Any = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def is_active(self) -> bool:
         """Whether the agent is enforcing across every boundary present.
@@ -98,7 +118,7 @@ class State:
         self.surfaces[surface] = "unverified"
         self._record_once(StateEvent("unverified", surface, reason, detail))
 
-    def record_guard_health(self, outcome_kind: str) -> None:
+    def record_guard_health(self, outcome_kind: str, sequence: int = 0) -> None:
         """What the last guard call says about the guard.
 
         The dimension existed, was documented, and was tested by direct
@@ -117,7 +137,11 @@ class State:
         work and `schema_invalid` is the guard answering badly -- calling
         either "unreachable" would misdirect whoever is paging.
         """
-        self.guard_health = _GUARD_HEALTH.get(outcome_kind, outcome_kind)
+        with self._lock:
+            if sequence and sequence < self._health_seq:
+                return          # a slower, older call finishing after a newer one
+            self._health_seq = max(sequence, self._health_seq)
+            self.guard_health = _GUARD_HEALTH.get(outcome_kind, outcome_kind)
 
     def record_history(self, subject: str, reason: str, detail: Any = None) -> None:
         """Record something that HAPPENED, without claiming anything current.
@@ -145,15 +169,26 @@ class State:
     def _record_once(self, event: StateEvent) -> None:
         """Append an event the first time its exact condition occurs.
 
-        Deduplicated on every field, so a NEW reason or a new detail is still
-        recorded -- what is dropped is the hundredth identical report of a
-        condition already visible in the log.
+        Keyed on kind, surface and reason -- NOT the detail, which the caller
+        controls and which can differ on every call. Repeats increment
+        `count` and contribute up to `_MAX_SAMPLES` distinct details, so an
+        operator still sees examples and still learns it recurred.
         """
-        key = (event.kind, event.surface, event.reason, repr(event.detail))
-        if key in self._recorded:
-            return
-        self._recorded.add(key)
-        self.events.append(event)
+        key = (event.kind, event.surface, event.reason)
+        with self._lock:
+            existing = self._recorded.get(key)
+            if existing is None:
+                if event.detail is not None:
+                    event.samples = [event.detail]
+                self._recorded[key] = event
+                self.events.append(event)
+                return
+            existing.count += 1
+            if (event.detail is not None
+                    and len(existing.samples) < _MAX_SAMPLES
+                    and not any(sample == event.detail
+                                for sample in existing.samples)):
+                existing.samples.append(event.detail)
 
     def summary(self) -> str:
         """One line naming every dimension.

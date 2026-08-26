@@ -9,6 +9,7 @@ from tidewall_otel._config import TidewallConfig
 from tidewall_otel._dispatch import LossyInputError, dispatch_async
 from tidewall_otel._exceptions import TidewallBlockedError, TidewallError
 from tidewall_otel._execution import BoundedExecutor
+from tidewall_otel._http import GuardUnreachable
 from tidewall_otel._manifest import OPENAI_CHAT_ASYNC
 from tidewall_otel._state import State
 
@@ -286,3 +287,38 @@ def test_the_fail_open_check_is_GONE():
 
     assert not hasattr(TidewallGuard, "check")
     assert hasattr(TidewallGuard, "check_raw")
+
+
+async def test_the_ASYNC_arm_orders_health_observations_too(config, executor):
+    import threading
+
+    from tidewall_otel._state import State
+
+    released = threading.Event()
+    state = State(lifecycle="installed", surfaces={"Completions.create": "covered"})
+
+    class StallingGuard:
+        def check_raw(self, *, guard_input, **kwargs):
+            released.wait(timeout=5)
+            raise GuardUnreachable("the outage this call started in")
+
+    async def provider(*a, **k):
+        return "ok"
+
+    old = asyncio.create_task(dispatch_async(
+        OPENAI_CHAT_ASYNC, provider, FakeInstance(), (),
+        minimal(OPENAI_CHAT_ASYNC), config, StallingGuard(), executor, state))
+    await asyncio.sleep(0)
+    wait_until(lambda: executor.outstanding() >= 1, timeout=5)
+
+    await dispatch_async(OPENAI_CHAT_ASYNC, provider, FakeInstance(), (),
+                         minimal(OPENAI_CHAT_ASYNC), config,
+                         GuardReturning(clean_body()), executor, state)
+    assert state.guard_health == "ok", "premise: the newer call saw recovery"
+
+    released.set()
+    with pytest.raises(TidewallError):
+        await old
+
+    assert state.guard_health == "ok", \
+        "a stalled older async call republished a recovered outage"

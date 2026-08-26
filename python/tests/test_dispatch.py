@@ -441,3 +441,56 @@ def test_every_FAILURE_KIND_can_actually_be_produced():
     unproducible = _FAILURES - produced
     assert not unproducible, (
         f"failure kinds nothing can emit: {sorted(unproducible)}")
+
+
+# -- guard health under concurrency ---------------------------------------
+
+def test_a_STALLED_call_does_not_republish_an_outage_that_RECOVERED(config, executor):
+    """Guard health is one scalar written by every call after its own guard
+    operation finishes, so completion order is not start order.
+
+    A call that begins during an outage and stalls can finish AFTER a later
+    call has already observed recovery. Publishing unconditionally then
+    reports an incident that is over, and an operator watching `state()`
+    sees an outage with no failing traffic behind it. The observation is
+    stamped before the guard call and published in order.
+    """
+    import threading
+
+    from tests._fixtures import wait_until
+    from tidewall_otel._state import State
+
+    released = threading.Event()
+    state = State(lifecycle="installed", surfaces={"Completions.create": "covered"})
+
+    class StallingGuard:
+        """Fails, but only after the caller lets it."""
+
+        def check_raw(self, *, guard_input, **kwargs):
+            released.wait(timeout=5)
+            raise GuardUnreachable("the outage this call started in")
+
+    def old_call():
+        try:
+            dispatch_sync(OPENAI_CHAT_SYNC, RecordingProvider(), FakeInstance(), (),
+                          minimal(OPENAI_CHAT_SYNC), config, StallingGuard(),
+                          executor, state)
+        except TidewallError:
+            pass                        # expected: this call really did fail
+
+    stalled = threading.Thread(target=old_call)
+    stalled.start()
+    wait_until(lambda: executor.outstanding() >= 1, timeout=5)
+
+    # A newer call observes recovery while the older one is still stalled.
+    dispatch_sync(OPENAI_CHAT_SYNC, RecordingProvider(), FakeInstance(), (),
+                  minimal(OPENAI_CHAT_SYNC), config,
+                  GuardReturning(clean_body()), executor, state)
+    assert state.guard_health == "ok", "premise: the newer call saw recovery"
+
+    released.set()
+    stalled.join(timeout=5)
+    assert not stalled.is_alive()
+
+    assert state.guard_health == "ok", \
+        "a stalled older call republished an outage that had already recovered"

@@ -1461,8 +1461,115 @@ def test_a_DIFFERENT_reason_is_still_recorded(monkeypatch, guard_says):
     state.record_unverified("s", reason="client_escapes", detail=("transport",))
     assert len(state.events) == 1
 
+    # A different DETAIL is a sample of the same condition, not a new one --
+    # details are the caller's payload and vary per call by nature.
     state.record_unverified("s", reason="client_escapes", detail=("mount",))
+    assert len(state.events) == 1
+    assert state.events[0].samples == [("transport",), ("mount",)], \
+        "a genuinely different detail was not kept as an example"
+
+    # A different REASON, SURFACE or KIND is a different condition.
     state.record_unverified("s", reason="late_import")
-    state.record_skip("s", reason="lossy")
+    state.record_unverified("other", reason="client_escapes")
+    state.record_skip("s", reason="client_escapes")
     assert len(state.events) == 4, \
-        "a new reason or detail was swallowed as a duplicate"
+        "a new reason, surface or kind was swallowed as a duplicate"
+
+
+def test_VARYING_lossy_details_do_not_grow_the_event_log(monkeypatch, guard_says):
+    """Deduplicating on the full detail was not enough.
+
+    The key included `repr(event.detail)`, and monitor passes
+    `coverage.lossy_paths` as the detail -- which the CALLER controls. An
+    application sending a different unsupported key each time produced a new
+    key every call, so both the log and the dedup index grew per call again.
+    The first version of this test repeated an identical detail and missed it.
+    """
+    monkeypatch.setenv("TIDEWALL_MODE", "monitor")
+    guard_says(CLEAN)
+    reached = []
+    client = openai.OpenAI(api_key="t", http_client=httpx.Client(
+        transport=httpx.MockTransport(
+            lambda r: (reached.append(1),
+                       httpx.Response(200, json=_COMPLETION))[1])))
+
+    tidewall_otel.activate()
+    for i in range(200):
+        client.chat.completions.create(
+            model="gpt-4o", messages=[{"role": "user", "content": "hi"}],
+            extra_body={f"unsupported_{i}": True})
+
+    assert len(reached) == 200
+    state = tidewall_otel.state()
+    assert len(state.events) < 10, \
+        f"200 calls with varying details left {len(state.events)} events"
+    assert len(state._recorded) < 10, \
+        f"the dedup index itself grew to {len(state._recorded)}"
+
+
+def test_a_repeated_condition_is_COUNTED_not_merely_dropped():
+    """Bounding the log must not lose the fact that it kept happening."""
+    from tidewall_otel._state import State
+
+    state = State()
+    for i in range(100):
+        state.record_skip("s", reason="lossy", detail=(f"path_{i}",))
+
+    assert len(state.events) == 1
+    event = state.events[0]
+    assert event.count == 100, "an operator cannot tell this recurred"
+    assert 1 < len(event.samples) <= 5, \
+        f"expected a bounded sample of details, got {len(event.samples)}"
+
+
+def test_a_STALE_health_observation_cannot_overwrite_a_newer_one():
+    """Guard health is a shared scalar written after each call completes.
+
+    A call that begins during an outage and stalls can finish AFTER a later
+    call has already observed recovery, and its assignment would republish
+    the outage -- state() then reports an incident that is over.
+    """
+    from tidewall_otel._state import State
+
+    state = State()
+    state.record_guard_health("unreachable", sequence=1)
+    state.record_guard_health("clean", sequence=2)
+    assert state.guard_health == "ok"
+
+    state.record_guard_health("timeout", sequence=1)     # the stalled older call
+    assert state.guard_health == "ok", \
+        "an older call republished an outage that had already recovered"
+
+
+def test_a_GROWING_conversation_does_not_grow_the_event_log(monkeypatch, guard_says):
+    """The realistic shape, and the one that made this quadratic.
+
+    An agent loop appends turns, so a lossy element reports
+    `messages[1].content`, then `messages[1..3]`, then `messages[1..5]` -- a
+    LONGER detail tuple every call. Keying the log on the detail therefore
+    stored a new, larger entry per call. Thirty calls left thirty-one events.
+    """
+    monkeypatch.setenv("TIDEWALL_MODE", "monitor")
+    guard_says(CLEAN)
+    reached = []
+    client = openai.OpenAI(api_key="t", http_client=httpx.Client(
+        transport=httpx.MockTransport(
+            lambda r: (reached.append(1),
+                       httpx.Response(200, json=_COMPLETION))[1])))
+
+    tidewall_otel.activate()
+    conversation = []
+    for _ in range(30):
+        conversation.append({"role": "user", "content": "hi"})
+        conversation.append({"role": "user",
+                             "content": [{"type": "text", "text": "block"}]})
+        client.chat.completions.create(model="gpt-4o",
+                                       messages=list(conversation))
+
+    assert len(reached) == 30, "monitor blocked calls it promised to watch"
+    state = tidewall_otel.state()
+    assert len(state.events) < 10, \
+        f"30 turns of an ordinary agent loop left {len(state.events)} events"
+    skip = next(e for e in state.events if e.reason == "lossy")
+    assert skip.count == 30, "the recurrence was lost, not just the duplicates"
+    assert len(skip.samples) <= 5
