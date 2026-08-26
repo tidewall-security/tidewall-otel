@@ -223,3 +223,23 @@ async def test_an_extra_body_FILLED_after_inspection_is_refused_ASYNC(monkeypatc
 
     assert raised.value.outcome_kind == "mutated_during_guard"
     assert reached == []
+
+
+def test_the_guard_payload_carries_the_MODEL_and_the_PROVIDER(monkeypatch, guard_says):
+    """Anthropic gets its own proof: `llm_provider` comes from the surface,
+    so a single-provider test cannot show it is the RIGHT surface's value."""
+    monkeypatch.setenv("TIDEWALL_BASE_URL", "https://guard.example")
+    monkeypatch.setenv("TIDEWALL_TOKEN", "t")
+    monkeypatch.setenv("TIDEWALL_MODE", "enforce")
+    asked = guard_says(_CLEAN)
+    reached = []
+
+    tidewall_otel.activate()
+    _client(reached).messages.create(
+        model="claude-3-5-sonnet-20241022", max_tokens=16,
+        messages=[{"role": "user", "content": "hi"}])
+
+    assert asked, "the guard was never called"
+    assert asked[0]["model"] == "claude-3-5-sonnet-20241022"
+    assert asked[0]["llm_provider"] == "anthropic", \
+        f"reported as {asked[0]['llm_provider']!r}, not the calling surface"

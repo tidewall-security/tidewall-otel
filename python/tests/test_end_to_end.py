@@ -1801,3 +1801,61 @@ async def test_an_extra_body_FILLED_after_inspection_is_refused_ASYNC(monkeypatc
 
     assert raised.value.outcome_kind == "mutated_during_guard"
     assert reached == []
+
+
+# -- what the guard is told ABOUT the call --------------------------------
+#
+# The guard server keys access rules on `model` and `llm_provider`: a stored
+# rule of the form {"field": "model", "op": "==", "value": "..."} is compared
+# against whatever the payload carries, and `_evaluate_condition` returns
+# False for a value it cannot find. Dispatch has both facts in hand -- it
+# passes them to `gen_ai_span` -- so omitting them from the guard call sends
+# empty strings and every model- or provider-scoped policy silently stops
+# matching. A rule that never fires reports nothing, which is the worst
+# available failure.
+
+def test_the_guard_payload_carries_the_MODEL_and_the_PROVIDER(monkeypatch, guard_says, provider):
+    monkeypatch.setenv("TIDEWALL_MODE", "enforce")
+    asked = guard_says(CLEAN)
+    client, _reached = provider
+
+    tidewall_otel.activate()
+    client.chat.completions.create(
+        model="gpt-4o", messages=[{"role": "user", "content": "hi"}])
+
+    assert asked, "the guard was never called"
+    assert asked[0]["model"] == "gpt-4o", \
+        f"model-scoped access rules compare against {asked[0]['model']!r}"
+    assert asked[0]["llm_provider"] == "openai", \
+        f"provider-scoped rules compare against {asked[0]['llm_provider']!r}"
+
+
+async def test_the_ASYNC_payload_carries_them_too(monkeypatch, guard_says):
+    monkeypatch.setenv("TIDEWALL_MODE", "enforce")
+    asked = guard_says(CLEAN)
+    client = openai.AsyncOpenAI(api_key="t", http_client=httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda r: httpx.Response(200, json=_COMPLETION))))
+
+    tidewall_otel.activate()
+    await client.chat.completions.create(
+        model="gpt-4o-mini", messages=[{"role": "user", "content": "hi"}])
+
+    assert asked[0]["model"] == "gpt-4o-mini"
+    assert asked[0]["llm_provider"] == "openai"
+
+
+def test_the_guard_PORT_declares_them_so_an_omission_is_visible():
+    """Declared on the Protocol, not left to the implementation's defaults.
+
+    `TidewallGuard.check_raw` defaults both to `""`, so a dispatch that never
+    passes them type-checks, runs, and produces a payload the server accepts
+    -- the omission has no symptom until a policy quietly fails to match.
+    """
+    import inspect
+
+    from tidewall_otel._dispatch import GuardPort
+
+    declared = set(inspect.signature(GuardPort.check_raw).parameters)
+    assert {"model", "llm_provider"} <= declared, \
+        f"the port hides what the payload needs: {sorted(declared)}"

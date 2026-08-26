@@ -82,9 +82,18 @@ class GuardPort(Protocol):
     NOT here: it comes from the executor, which raises ExecutorSaturated, and
     dispatch translates it. Naming it on the port would misstate which layer
     owns overload.
+
+    ``model`` and ``llm_provider`` are DECLARED here, not left to the
+    implementation's defaults. The guard server keys its access rules on both
+    -- a rule reading `{"field": "model", "op": "==", "value": ...}` compares
+    against whatever arrives -- so a caller that omits them sends empty
+    strings, and every model- or provider-scoped rule silently stops
+    matching. A policy that never fires is worse than one that refuses to
+    load, because nothing reports it.
     """
 
-    def check_raw(self, *, guard_input: dict) -> dict: ...
+    def check_raw(self, *, guard_input: dict, model: str = "",
+                  llm_provider: str = "") -> dict: ...
 
 
 #: Exception to outcome. The adapter's whole classification responsibility,
@@ -398,6 +407,8 @@ def dispatch_sync(surface, wrapped, instance, args, kwargs, config, guard, execu
             # submit BLOCKS and returns the value; `deadline` is keyword-only.
             raw = executor.submit(guard.check_raw,
                                   guard_input=pre.guard_input,
+                                  model=str(call.kwargs.get("model", "")),
+                                  llm_provider=surface.provider,
                                   deadline=config.guard_deadline_s)
             outcome = classify_response(raw)
         except BaseException as exc:
@@ -462,6 +473,8 @@ async def dispatch_async(surface, wrapped, instance, args, kwargs, config, guard
             raw = await executor.submit_awaitable(
                 guard.check_raw,
                 guard_input=pre.guard_input,
+                model=str(call.kwargs.get("model", "")),
+                llm_provider=surface.provider,
                 deadline=config.guard_deadline_s)
             outcome = classify_response(raw)
         except asyncio.CancelledError:
