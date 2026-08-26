@@ -119,10 +119,10 @@ class TidewallInstrumentor(BaseInstrumentor):
     3. ``gen_ai.*`` OpenTelemetry spans are emitted regardless of mode,
        so observability works even when the guard is in monitor mode.
 
-    The unqualified form of (1) -- "every prompt is sent to the guard" -- was
-    false in three separate ways while it was written here, and the state
-    object exists precisely so the qualifications are reported rather than
-    assumed. :attr:`state` is the authority on which surfaces are ``covered``.
+    The unqualified form of (1) -- "every prompt is sent to the guard" -- is
+    not true, and the qualifications above are why. The state object exists so
+    they are reported rather than assumed: :attr:`state` is the authority on
+    which surfaces are ``covered``.
     """
 
     _guard: TidewallGuard | None = None
@@ -183,15 +183,14 @@ class TidewallInstrumentor(BaseInstrumentor):
     def _instrument(self, **kwargs: Any) -> None:
         """Install the guard wrappers, transactionally and fully wired.
 
-        EVERY collaborator dispatch needs is constructed here and passed to
-        the factories. An earlier version built the components correctly and
-        then handed the factories only (guard, config): dispatch dereferenced
-        a None executor, the broad handler filed the AttributeError as
-        `invariant_violated`, and every enforce call was refused without the
-        guard ever being contacted -- while the state reported active. In
-        monitor the same fault proceeded UNGUARDED. Nothing caught it because
-        every dispatch test called dispatch_sync directly, so they proved the
-        component worked and never that activation wires it.
+        EVERY collaborator dispatch needs is constructed here AND passed to
+        the factories. Building them correctly but handing the factories only
+        (guard, config) leaves dispatch dereferencing a None executor; the
+        broad handler files the AttributeError as `invariant_violated`, so
+        every enforce call is refused without the guard ever being contacted
+        while state reports active, and monitor proceeds UNGUARDED. Tests that
+        call `dispatch_sync` directly cannot see this -- they prove the
+        component works, never that activation wires it.
 
         Installation goes through the PatchManager so a failure part-way
         rolls back: patching four boundaries one at a time can otherwise leave
@@ -237,12 +236,10 @@ class TidewallInstrumentor(BaseInstrumentor):
                 # still patched; a surface in a not-yet-imported module is
                 # otherwise uncovered forever.
                 #
-                # `PatchManager` implements this and its unit tests pass, but
-                # nothing here called it -- the requirement was built, tested
-                # in isolation, and left unreachable. The plan records that v1
-                # dropped this same requirement and then reported it covered;
-                # leaving the manager's implementation unwired drops it again
-                # one layer along, with a green suite over it.
+                # `PatchManager` implements the finder; this is where it gets
+                # wired. A manager whose finder is implemented and unit-tested
+                # but never installed from here drops the requirement one layer
+                # along, with a green suite over it.
                 self._manager.register_surface(surface.module, surface.attribute,
                                                wrapper)
                 deferred.setdefault(surface.module, []).append(surface.attribute)
@@ -409,14 +406,13 @@ class TidewallInstrumentor(BaseInstrumentor):
             executor.shutdown()
             self._executor = None
 
-        # NO second removal loop here. There used to be one that walked a
-        # parallel `self._patched` list and unwrapped anything that was a
+        # NO second removal loop here, and specifically not one that walks a
+        # parallel `_patched` list unwrapping anything that is a
         # `wrapt.FunctionWrapper` with `__wrapped__`. That is a TYPE test, not
         # an ownership test: a wrapper another agent installed AFTER us
-        # satisfies it exactly as well as ours does, so deactivation deleted
-        # the foreign wrapper and restored the Tidewall layer underneath --
-        # the precise inverse of the intent, while the adjacent comment
-        # claimed "ONLY unwrap OUR wrapper".
+        # satisfies it exactly as well as ours does, so deactivation would
+        # delete the foreign wrapper and restore the Tidewall layer underneath
+        # -- the precise inverse of the intent.
         #
         # PatchManager.remove() compares the CURRENT attribute against the
         # exact object it installed and reports `not_ours` instead of writing.

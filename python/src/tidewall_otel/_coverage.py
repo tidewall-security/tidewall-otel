@@ -5,8 +5,8 @@ only that we are on the call path; whether the *particular* arguments can be
 faithfully represented to the guard is a separate question, and answering it
 wrongly is how an agent reports enforcement while sending uninspected content.
 
-CANONICALISATION (spec section 3)
----------------------------------
+CANONICALISATION
+----------------
 
 The structural equivalence between what the provider was asked to do and what
 the guard was shown needs one definition of "the same node", stated exhaustively

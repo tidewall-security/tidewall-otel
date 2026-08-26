@@ -1,14 +1,14 @@
-"""The patch manager: transactional installation, and safe removal (O-6, O-7).
+"""The patch manager: transactional installation, and safe removal.
 
 Two defects motivate this module.
 
-O-6 -- PARTIAL INSTALLATION. Patching several boundaries one at a time can
+PARTIAL INSTALLATION. Patching several boundaries one at a time can
 fail halfway, leaving some guarded and some not while the agent reports
 success. Installation is therefore transactional: every patch is journalled
 with the attribute's pre-install identity, and a failure rolls back in reverse
 order.
 
-O-7 -- UNSAFE REMOVAL. Restoring a saved original unconditionally deletes
+UNSAFE REMOVAL. Restoring a saved original unconditionally deletes
 whatever replaced our wrapper in the meantime, which may be another agent's
 instrumentation. Removal compares first and reports one of three outcomes:
 ``removed`` when the attribute is still ours, ``not-ours`` when something else
@@ -71,10 +71,10 @@ class JournalEntry:
     pre_install_identity: Any = None
     installed: Any = None
     finder: Any = None
-    #: A WEAK reference to the object we patched. Removal used to re-resolve
-    #: it from `module`/`attribute`, which imports the module if it has left
-    #: `sys.modules` and can yield a DIFFERENT instance whose attribute can
-    #: never match `installed` -- so the entry looked foreign forever.
+    #: A WEAK reference to the object we patched. Removal must NOT re-resolve
+    #: it from `module`/`attribute`: that imports the module if it has left
+    #: `sys.modules` and can yield a DIFFERENT instance, whose attribute never
+    #: matches `installed` -- so the entry looks foreign forever.
     #:
     #: Weak, not strong: a strong reference would keep the class or module
     #: alive for the life of the process, and it is also what makes
@@ -82,18 +82,18 @@ class JournalEntry:
     #: missing one proves nothing; an owner that has been collected can never
     #: carry anything again, and nobody else can reach it either.
     owner_ref: Any = None
-    #: Which install transaction created this entry. Rollback was scoped by
-    #: POSITION -- a mark into the journal, then a slice from it -- and Python
-    #: serialises imports per module, not across them, so a second provider
-    #: module importing on another thread appended into that window and one
-    #: module's failure restored ANOTHER module's attributes. Identity, not
-    #: position, decides what a transaction may undo.
+    #: Which install transaction created this entry. Identity, not position,
+    #: decides what a transaction may undo: Python serialises imports per
+    #: module, not across them, so a second provider module importing on
+    #: another thread appends into the window between a positional mark and
+    #: its slice -- and one module's failure then restores ANOTHER module's
+    #: attributes.
     txn: int = 0
     #: Stable identity, assigned once at append. Discharge is by THIS, never
     #: by position: resolving or writing an attribute can run arbitrary
     #: import, descriptor or metaclass code that re-enters the manager and
     #: appends an entry mid-undo. A positional commit computed before that
-    #: append then deleted the newcomer -- while its wrapper was installed --
+    #: append deletes the newcomer -- while its wrapper is installed --
     #: making it unremovable. Positions are valid only under a no-reentrancy
     #: invariant these operations do not satisfy.
     seq: int = -1
@@ -211,14 +211,14 @@ class PatchManager:
             passed, because the tests called the wrapper directly with
             already-correct arguments.
             """
-            # `owner_ref`, not `owner`. Capturing the owner STRONGLY here kept
-            # the patched class or module alive for the life of the process --
-            # and, worse, made the journal's weak reference immortal, so
-            # `UNRECOVERABLE` could never fire and the classification that
-            # bounds the residual list had no reachable trigger. The closure
-            # only ever needed the owner as the `instance` argument, which it
-            # can dereference at call time; if the owner really has been
-            # collected, nothing can be calling this wrapper anyway.
+            # `owner_ref`, not `owner`. Capturing the owner STRONGLY keeps the
+            # patched class or module alive for the life of the process -- and,
+            # worse, makes the journal's weak reference immortal, so
+            # `UNRECOVERABLE` can never fire and the classification that bounds
+            # the residual list has no reachable trigger. The closure needs the
+            # owner only as the `instance` argument, which it can dereference at
+            # call time; if the owner really has been collected, nothing can be
+            # calling this wrapper anyway.
             live_owner = owner_ref() if isinstance(owner_ref, weakref.ref) else owner_ref
             if args and hasattr(original, "__get__") and live_owner is not None:
                 receiver, rest = args[0], args[1:]
@@ -252,10 +252,10 @@ class PatchManager:
 
         `rollback()` is NON-RAISING by construction (see its docstring), so
         the `raise` below always re-raises the ORIGINAL installation failure.
-        When rollback could raise, its exception REPLACED the original here:
-        the caller debugged "rollback boom" while the actual install failure
-        went unreported -- and the journal was never committed, so state
-        claimed nothing was wrong while a wrapper stayed installed.
+        A rollback that could raise would REPLACE it: the caller debugs
+        "rollback boom" while the actual install failure goes unreported, and
+        the journal is never committed -- so state claims nothing is wrong
+        while a wrapper stays installed.
         """
         try:
             for module, attribute, wrapper in specs:
@@ -310,8 +310,8 @@ class PatchManager:
                 # call's entries, so an earlier successful install for the
                 # same module -- a reload, or a second pass over a module
                 # already patched -- is still live and still guarding. Writing
-                # "uncovered" unconditionally reported a boundary as unguarded
-                # while it was demonstrably patched and working, which is the
+                # "uncovered" unconditionally would report a boundary as
+                # unguarded while it is demonstrably patched and working: the
                 # state-lying-about-reality defect this agent exists to avoid,
                 # merely pointing the other way.
                 #
@@ -366,12 +366,12 @@ class PatchManager:
         Every branch -- patch or finder, removal or
         rollback -- contains its own exceptions, records ERRORED, and leaves
         the entry journalled for retry. Four consecutive review rounds each
-        found one undo branch left outside the protection the previous round
-        added to another (round 7: retention; round 12: the patch branch;
-        round 13: the finder branch, `rollback`, and `install_for_module`).
-        One shared loop is the fix for the PATTERN, not the instance: a new
-        entry kind or a new caller inherits the discipline instead of
-        re-implementing it bare.
+        Every branch -- patch or finder, removal or rollback -- must contain
+        its own exceptions, record ERRORED, and leave the entry journalled for
+        retry. One shared loop is the fix for the PATTERN rather than for each
+        instance: a new entry kind or a new caller inherits the discipline
+        instead of re-implementing it bare, which is how branches end up
+        outside the protection their neighbours have.
 
         `discharged` is an out-parameter collecting the indices successfully
         undone, filled AS THE LOOP RUNS, so the caller's `finally` can drop
@@ -384,10 +384,10 @@ class PatchManager:
         for index in range(len(entries) - 1, -1, -1):
             entry = entries[index]
             if entry.kind == "finder":
-                # Same protection as patches. When this branch was bare, a
-                # raising `sys.meta_path.remove()` escaped to the caller's
-                # `finally`, which erased the journal and `_finder` while the
-                # finder was still installed: not retryable, stranded forever.
+                # Same protection as patches. Bare, a raising
+                # `sys.meta_path.remove()` escapes to the caller's `finally`,
+                # which erases the journal and `_finder` while the finder is
+                # still installed: not retryable, stranded forever.
                 try:
                     if entry.finder in sys.meta_path:
                         sys.meta_path.remove(entry.finder)
@@ -399,29 +399,28 @@ class PatchManager:
                 discharged.add(entry.seq)
                 continue
 
-            # PER-ENTRY. `_restore` can raise -- the module was removed
-            # from sys.modules, the owner will not resolve, the write
-            # fails. Letting that escape the loop meant the journal
-            # commit never ran, so entries ALREADY restored stayed
-            # journalled; on retry their attribute no longer held
-            # `entry.installed`, they were classified `not-ours`, and they
-            # were retained forever. The retry guarantee defeated itself
-            # on the first exception.
-            # ALWAYS COMPARE, including rollback. The old rollback branch
-            # wrote `pre_install_identity` back unconditionally, justified by
-            # "these are patches WE just made, in a window where nothing else
-            # has run". That window is not enforced and does not exist:
-            # another thread can replace the attribute, and resolving or
-            # writing one can execute arbitrary import, descriptor or
-            # metaclass code that patches it. Rollback then silently deleted
-            # a wrapper installed after ours -- the exact corruption the
-            # ownership comparison exists to prevent, committed by the path
-            # that skipped it.
+            # PER-ENTRY. `_restore` can raise -- the module removed from
+            # sys.modules, an owner that will not resolve, a write that fails.
+            # Letting that escape the loop skips the journal commit, so entries
+            # ALREADY restored stay journalled; on retry their attribute no
+            # longer holds `entry.installed`, they classify as `not-ours`, and
+            # they are retained forever. The retry guarantee would defeat
+            # itself on the first exception.
             #
-            # Sharing the loop was right; the `compare` parameter was not.
-            # Transactional rollback still has to prove the current value is
-            # the object this transaction installed, so there is only one
-            # policy and `_restore` is it.
+            # ALWAYS COMPARE, INCLUDING ROLLBACK. Restoring
+            # `pre_install_identity` unconditionally is tempting on the
+            # rollback path -- "these are patches we just made, in a window
+            # where nothing else has run" -- but that window is not enforced
+            # and does not exist: another thread can replace the attribute, and
+            # resolving or writing one can execute arbitrary import, descriptor
+            # or metaclass code that patches it. An unconditional rollback
+            # silently deletes a wrapper installed after ours, which is the
+            # corruption the ownership comparison exists to prevent, committed
+            # by the one path that skipped it.
+            #
+            # So there is one policy and `_restore` is it: transactional
+            # rollback must also prove the current value is the object this
+            # transaction installed.
             try:
                 outcome = self._restore(entry)
             except Exception:
@@ -458,9 +457,9 @@ class PatchManager:
         or a later retry mistakes our own restored attribute for a foreign
         one. Only entries actually undone leave the journal, so install order
         is preserved and a retry still undoes in reverse. `_finder` survives
-        exactly as long as a finder entry does -- clearing it while the
-        finder was still in `sys.meta_path` made a stuck finder invisible as
-        well as stuck.
+        exactly as long as a finder entry does: clearing it while the finder is
+        still in `sys.meta_path` would make a stuck finder invisible as well as
+        stuck.
         """
         discharged: set[int] = set()
         # Iterate a SNAPSHOT: a late import on another thread appends while
@@ -473,8 +472,8 @@ class PatchManager:
             return self._undo_entries(snapshot, discharged)
         finally:
             # Filter the LIVE journal by seq. Slicing it against positions
-            # computed before the undo deleted any entry appended
-            # re-entrantly during it -- while that entry's wrapper was
+            # computed before the undo would delete any entry appended
+            # re-entrantly during it -- while that entry's wrapper is
             # installed, so nothing could ever remove it.
             with self._lock:
                 self.journal[:] = [entry for entry in self.journal
@@ -503,8 +502,9 @@ class PatchManager:
         return self._discharge()
 
     def rollback(self) -> None:
-        """Reverse order, unconditionally: these are patches WE just made, in
-        a window where nothing else has run.
+        """Reverse order, comparing before every write -- exactly as `remove()`
+        does. This path gets no exemption: see `_undo_entries` for why the
+        "nothing else has run yet" window does not exist.
 
         NEVER RAISES (short of a BaseException). `install_all()` calls this
         from its `except` and re-raises the ORIGINAL installation failure; a

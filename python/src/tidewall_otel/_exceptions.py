@@ -52,10 +52,9 @@ class TidewallConfigError(TidewallError):
     so invalid configuration stops the process rather than letting it continue
     believing it is guarded. The other policies are ``disable`` (run unguarded,
     with `state()` saying so) and ``block`` (install refusers, so calls fail
-    rather than pass unchecked).
-
-    This docstring previously said the default "logs config errors and fails
-    open instead" -- describing the exact behaviour this programme removed.
+    rather than pass unchecked). There is no fail-open default: a process that
+    logs a configuration error and continues is unguarded while believing
+    otherwise.
     """
 
     outcome_kind = "config_invalid"

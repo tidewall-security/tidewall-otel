@@ -251,21 +251,19 @@ _OPENAI_PATH_MAP = {
     "messages[*]":                                  "guard_input.messages[*]",
     "messages[*].role":                             "guard_input.messages[*].role",
     "messages[*].content":                          "guard_input.messages[*].content",
-    # NO `messages[*].tool_calls` ENTRIES. They claimed the agent carries
-    # tool-call names and arguments to the guard; `normalize_openai_messages`
-    # emits only `role` and `content`, so it never did. The map was asserting
-    # a coverage nothing provided.
+    # NO `messages[*].tool_calls` ENTRIES, deliberately.
     #
-    # Removed rather than implemented, because the guard server reads only
-    # `content` (`app/routes/guard.py` joins `m.get("content", "")`). Sending
-    # tool calls it ignores would MOVE the defect: the path would look
-    # mapped, the payload would look inspected, and nothing would examine it.
+    # `normalize_openai_messages` emits only `role` and `content`, and the
+    # guard server reads only `content` (`app/routes/guard.py` joins
+    # `m.get("content", "")`). Mapping tool calls it ignores would MOVE the
+    # defect rather than fix it: the path would look mapped, the payload
+    # would look inspected, and nothing would examine it.
     #
-    # The consequence is deliberate and fail-closed. An unmapped path is
-    # LOSSY, so a message carrying `tool_calls` is refused in `enforce`
-    # before either the guard or the provider is contacted, and in `monitor`
-    # it proceeds with a recorded `lossy` skip and `is_active()` False. The
-    # agent declines to certify what it cannot show the guard.
+    # The consequence is fail-closed. An unmapped path is LOSSY, so a message
+    # carrying `tool_calls` is refused in `enforce` before either the guard or
+    # the provider is contacted, and in `monitor` it proceeds with a recorded
+    # `lossy` skip and `is_active()` False. The agent declines to certify what
+    # it cannot show the guard.
     "tools":                                        "guard_input.tools",
     "tools[*]":                                     "guard_input.tools[*]",
     "tools[*].function":                            "guard_input.tools[*].function",
@@ -296,7 +294,7 @@ _OPENAI_SHAPES = {
     "messages[*].content": _is_str,
     "response_format":     _is_schemaless_response_format,
     "tool_choice":         _is_toolless_tool_choice,
-    "extra_body":          _is_empty_extra_body,          # O-11
+    "extra_body":          _is_empty_extra_body,
     "extra_query":         _extra_query_cannot_carry_a_prompt,
 }
 
@@ -376,7 +374,7 @@ ANTHROPIC_MESSAGES_SYNC = Surface(
         "messages[*].content": _is_str,
         "system":              _is_str,
         "output_config":       _is_schemaless_output_config,
-        "extra_body":          _is_empty_extra_body,      # O-11
+        "extra_body":          _is_empty_extra_body,
         "extra_query":         _extra_query_cannot_carry_a_prompt,
     },
     opaque_subtrees=("tools[*].input_schema",),
@@ -445,12 +443,12 @@ _EXACT_SCALARS = (str, int, float, bool)
 
 _MEMBER_DESCRIPTOR = type(type("_S", (), {"__slots__": ("x",)}).x)
 
-# The walk is bounded. Recursion was unbounded, so a deeply nested tool
-# schema raised `RecursionError` and a self-referencing container did the
-# same -- and `content_fingerprint` is called OUTSIDE dispatch's try block,
-# so it escaped as a crash attributable to this agent rather than as a
-# verdict. Exhausting a budget is not a licence to wave the value through:
-# it snapshots as unvouchable, which is what the agent actually knows.
+# The walk is bounded, because it is recursive. A deeply nested tool schema
+# or a self-referencing container would otherwise raise `RecursionError`, and
+# `content_fingerprint` is called OUTSIDE dispatch's try block -- so it would
+# escape as a crash attributable to this agent rather than as a verdict.
+# Exhausting a budget is not a licence to wave the value through: it
+# snapshots as unvouchable, which is what the agent actually knows.
 #
 # Sized from measurement, not guesswork. A 100-message conversation is ~500
 # nodes and 0.2ms; tool schemas dominate, and 100 tools of 100 fields each is
@@ -502,12 +500,10 @@ def _trusted(value: Any, depth: int = 0, path: frozenset = frozenset(),
              budget: list | None = None) -> Any:
     """A snapshot comparable with BUILT-IN operations only.
 
-    The divergence check first compared readings with `!=`, which calls the
-    value's own `__eq__`. A `str` subclass storing an attack and reporting
-    itself equal to a benign string therefore passed: the guard saw the
-    benign reading, the provider serialised the attack, and enforce approved
-    it. Equality supplied by the thing under inspection cannot be the
-    boundary.
+    Never `!=`, which calls the value's own `__eq__`: a `str` subclass can
+    store an attack and report itself equal to a benign string, so the guard
+    sees the benign reading while the provider serialises the attack.
+    Equality supplied by the thing under inspection cannot be the boundary.
 
     Types are tagged and exact, so `LyingStr("attack")` snapshots as
     `("?", "LyingStr")` rather than as a string, and nothing it overrides can
@@ -547,22 +543,22 @@ def _trusted(value: Any, depth: int = 0, path: frozenset = frozenset(),
 
     if isinstance(value, dict):
         # SUBCLASSES INCLUDED, read through `dict.items` rather than the
-        # instance's own method. Snapshotting a subclass as just its type name
-        # made in-place mutation invisible: the type does not change, so the
-        # before/after fingerprints matched and content swapped during the
-        # guard call reached the provider uninspected. Reading the stored
-        # items is also what makes the snapshot immune to an overridden
-        # `items()` or `get()`.
+        # instance's own method. Snapshotting a subclass by type name alone
+        # leaves in-place mutation invisible -- the type does not change, so
+        # before and after match and content swapped during the guard call
+        # reaches the provider uninspected. Reading the stored items is also
+        # what makes the snapshot immune to an overridden `items()` or
+        # `get()`.
         return ("dict", type(value).__name__, tuple(sorted(
             (str(key), _trusted(item, depth + 1, inner, budget))
             for key, item in dict.items(value))))
 
     # SCALAR SUBCLASSES ARE NEVER TRUSTED, and this must come before the
-    # object branch below: a `str` subclass has a `__dict__` like any other
-    # object, so snapshotting instance state turned `LyingStr("MALICIOUS")`
-    # into ("obj", "LyingStr", ()) -- a stable, comparable, entirely
-    # content-free snapshot that re-opened the very bypass the exact-type
-    # rule closed. A value that serialises as text must be exactly text.
+    # object branch below. A `str` subclass has a `__dict__` like any other
+    # object, so the object branch would snapshot `LyingStr("MALICIOUS")` as
+    # ("obj", "LyingStr", ()) -- stable, comparable and entirely content-free,
+    # which re-opens the bypass the exact-type rule closes. A value that
+    # serialises as text must be exactly text.
     if isinstance(value, (str, bytes, int, float, bool)):
         return ("?", type(value).__name__)
 
@@ -626,24 +622,20 @@ def content_fingerprint(surface: "Surface", kwargs: dict,
     the caller's data, which this agent does not own, but by refusing to
     proceed when what it inspected is no longer what it would send.
 
-    EVERY argument, not just the guarded fields. Snapshotting only
-    `provider_fields` left `extra_body` outside the comparison -- and a
-    non-empty `extra_body` REPLACES the provider's wire body, which is the
-    defect this whole programme opened with. A call could start with a shared
-    empty `extra_body={}`, pass classification as lossless precisely because
-    it was empty, and then have it filled with an entire replacement
-    conversation before the provider was invoked. Both fingerprints matched,
-    because neither looked.
+    EVERY argument, not just the guarded fields. Anything able to change what
+    the provider sends must be inside the comparison -- including arguments
+    whose CLASSIFICATION changes when they are mutated. A non-empty
+    `extra_body` REPLACES the provider's wire body, so a shared empty
+    `extra_body={}` passes classification as lossless precisely because it is
+    empty, and can then be filled with an entire replacement conversation
+    before the provider is invoked. Narrowing this to `provider_fields` puts
+    it outside the comparison and both fingerprints match, because neither
+    looked.
 
-    The rule that generalises is not "fingerprint extra_body too": it is that
-    anything able to change what the provider sends must be inside the
-    comparison, including arguments whose CLASSIFICATION changes when they
-    are mutated. That is every argument, so this takes every argument.
-
-    Positional arguments too. Every declared surface is keyword-only today,
-    so `args` is empty in practice -- but that is a property of the SDK
-    versions in front of us, not a guarantee, and a parameter that became
-    positional later would have been silently outside the comparison.
+    Positional arguments too. Every declared surface is keyword-only in the
+    SDK versions in front of us, so `args` is empty in practice -- but that is
+    an observation, not a guarantee, and a parameter that became positional
+    would otherwise sit silently outside the comparison.
     `test_every_declared_surface_is_KEYWORD_ONLY` says so if that changes.
     """
     return (tuple(_trusted(value) for value in args),
@@ -705,8 +697,8 @@ def lossy_paths(surface: Surface, nodes: dict[str, Any]) -> tuple[str, ...]:
     # another -- `items()`/`vars()` here, `get()`/`getattr()` there. A dict
     # SUBCLASS that overrides `get("content")` therefore showed the guard
     # "benign text" while the provider serialised the stored value, and the
-    # call proceeded in enforce. That is the P0-11 shape exactly: one payload
-    # inspected, a different one sent, with nothing in between noticing.
+    # call proceeded in enforce: one payload inspected, a different one sent,
+    # with nothing in between noticing.
     #
     # Fail-closed rather than clever: if the two readings of a container
     # disagree, the agent cannot say which one the provider will use, so the

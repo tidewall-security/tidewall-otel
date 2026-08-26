@@ -1,4 +1,4 @@
-"""Agent state as INDEPENDENT dimensions (spec section 4).
+"""Agent state as INDEPENDENT dimensions.
 
 Four separate facts, deliberately not collapsed into one boolean:
 
@@ -77,13 +77,13 @@ class State:
     guard_health: str = "unknown"
     events: list[StateEvent] = field(default_factory=list)
     #: Condition -> its event. An operator needs to know WHICH conditions
-    #: occurred, not how many times: a process using a custom httpx client
-    #: recorded one `client_escapes` event per LLM call, and monitor did the
-    #: same with one `skip` per lossy call, in the mode designed to be left
-    #: running. Keyed WITHOUT the detail, because the detail is the caller's
-    #: own payload -- an agent loop appending turns reported
+    #: occurred, not how many times: a custom httpx client is one
+    #: `client_escapes` per LLM call and a lossy shape is one `skip` per call,
+    #: so an un-deduplicated log grows without bound in the mode designed to be
+    #: left running. Keyed WITHOUT the detail, because the detail is the
+    #: caller's own payload -- an agent loop appending turns reports
     #: `messages[1..N].content`, a longer tuple every call, so keying on it
-    #: grew the log quadratically.
+    #: grows the log quadratically.
     _recorded: dict = field(default_factory=dict, repr=False, compare=False)
     #: The last observation published to `guard_health`, so a stalled call
     #: finishing late cannot republish an outage that has already recovered.
@@ -138,10 +138,10 @@ class State:
     def record_guard_health(self, outcome_kind: str, sequence: int = 0) -> None:
         """What the last guard call says about the guard.
 
-        The dimension existed, was documented, and was tested by direct
-        construction -- and no production code ever wrote to it. An operator
-        polling `state()` through a total guard outage saw `unknown` from
-        activation onwards while every enforce-mode call failed.
+        Written on every guard call, from both dispatch arms. Unwritten, this
+        dimension reports `unknown` from activation onwards while every
+        enforce-mode call fails -- and it is where an operator looks to tell a
+        guard outage from a wiring problem.
 
         A SCALAR, deliberately: recording an event per failed call would grow
         without bound during exactly the outage an operator most needs to
@@ -217,10 +217,9 @@ class State:
             known = list(existing.samples)
 
         # CALLER CODE MUST NOT RUN UNDER THE LOCK. `detail` is `Any`, so this
-        # `==` is the caller's own `__eq__`; running it inside the critical
-        # section deadlocked the thread outright when that method recorded
-        # anything, and serialised all state publication when it was merely
-        # slow. Reproduced before the fix with a re-entrant `__eq__`.
+        # `==` is the caller's own `__eq__`. Inside the critical section it
+        # deadlocks the thread outright if that method records anything, and
+        # serialises all state publication whenever it is merely slow.
         if any(sample == event.detail for sample in known):
             return
 
@@ -235,10 +234,10 @@ class State:
     def snapshot(self) -> "State":
         """A read-only copy, which is what `state()` hands out.
 
-        Returning the live object made the agent's own account of itself
-        writable by anyone holding it: setting `lifecycle` and adding a
-        surface to the returned mapping made `is_active()` report True with
-        no instrumentation installed at all. An operator wiring `is_active()`
+        Returning the live object would make the agent's own account of itself
+        writable by anyone holding it: setting `lifecycle` and adding a surface
+        to the returned mapping makes `is_active()` report True with no
+        instrumentation installed at all. An operator wiring `is_active()`
         into a health check is trusting exactly that value, and a security
         agent whose state can be edited through its public API is the
         state-lying-about-reality defect it exists to prevent, arriving

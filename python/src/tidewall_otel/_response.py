@@ -1,4 +1,4 @@
-"""The guard response schema, and a TOTAL classifier (spec section 11).
+"""The guard response schema, and a TOTAL classifier.
 
 Total means every well-formed input produces exactly one verdict. A classifier
 with gaps returns nothing for some combination, and dispatch's catch-all then
@@ -88,12 +88,12 @@ def classify_response(payload: Any) -> Outcome:
     # Type-check required fields and any PRESENT optional one. Unknown fields
     # are accepted at both levels: both server models declare extra="allow",
     # so refusing them would break on a server minor release.
-    # NOTE: no separate "bool masquerading as int" guard. bool subclasses int,
-    # so one would be needed if any field were typed int or float -- none is,
-    # every expected type here is bool, str, list or dict, and isinstance(True,
-    # str) is already False. Mutation-testing showed such a guard could never
-    # execute: dead code implying a protection that is not operating. Add it
-    # back together with the first numeric field, and with a test.
+    # NOTE: no separate "bool masquerading as int" guard. `bool` subclasses
+    # `int`, so one is needed only if a field is typed int or float. None is:
+    # every expected type here is bool, str, list or dict, and
+    # `isinstance(True, str)` is already False -- so such a guard could never
+    # execute, and dead code implies a protection that is not operating. Add
+    # it with the first numeric field, and with a test.
     for name, expected in _TYPES.items():
         if name in result and not isinstance(result[name], expected):
             return _invalid(f"field {name!r} has type {type(result[name]).__name__}")

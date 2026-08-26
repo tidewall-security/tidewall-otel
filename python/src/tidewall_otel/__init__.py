@@ -54,12 +54,10 @@ __all__ = [
     "is_active",
     "state",
     "TidewallConfig",
-    # The exception surface. Documented in the README as
-    # `tidewall_otel.TidewallBlockedError`, and reachable at no public name at
-    # all until 2026-08-25: an application following the README got an
-    # AttributeError, and the only way to catch a block was to import from a
-    # PRIVATE module. A library whose primary exception has no public name has
-    # no usable error contract.
+    # The exception surface, exported because the README tells applications to
+    # catch `tidewall_otel.TidewallBlockedError`. A library whose primary
+    # exception has no public name has no usable error contract: the only way
+    # to catch a block would be to import from a PRIVATE module.
     "TidewallError",
     "TidewallBlockedError",
     "TidewallRefusedError",
@@ -156,10 +154,10 @@ def activate(config: TidewallConfig | None = None) -> None:
     _instrumentor_instance.instrument(config=config)
 
     # ADOPT the instrumentor's state; do NOT build a second one. The wrappers
-    # were handed that object, so downgrades they record (`record_unverified`
-    # on a construction-time escape) are only visible to `state()` if it is
-    # the SAME object. Two State instances is how a rewritten wire body
-    # coexisted with `surfaces={...: "covered"}` and `is_active() is True`.
+    # are handed that object, so downgrades they record (`record_unverified` on
+    # a construction-time escape) reach `state()` only if it is the SAME
+    # object. Two State instances let a rewritten wire body coexist with
+    # `surfaces={...: "covered"}` and `is_active() is True`.
     #
     # No `or {attribute: "covered"}` fallback: if the instrumentor installed
     # nothing, that is a wiring failure, and fabricating full coverage would

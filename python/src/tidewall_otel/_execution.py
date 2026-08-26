@@ -73,14 +73,13 @@ class BoundedExecutor:
         exactly as a cancelled dispatch abandons them.
 
         The flag and the pool are retired TOGETHER under the admission lock.
-        Previously `_shutdown = True` was published first and the pool torn
-        down after, with neither under the lock, while `submit_nowait` gated
-        only on `_pool is None` -- which `shutdown()` never set. So a submit
-        beginning after `is_shutdown()` already read True was admitted and
-        ran. `is_shutdown()` is what the fork hook consults to decide not to
-        revive the pool, and what `_uninstrument` relies on to stop guard
-        work, so a window where it says "stopped" while accepting new work is
-        the contract inverted.
+        Publishing `_shutdown = True` first and tearing the pool down after --
+        with admission gating on something `shutdown()` does not set -- admits
+        and runs a submit that began after `is_shutdown()` already read True.
+        `is_shutdown()` is what the fork hook consults to decide not to revive
+        the pool, and what `_uninstrument` relies on to stop guard work, so a
+        window where it says "stopped" while accepting new work is the
+        contract inverted.
         """
         with self._lock:
             pool, self._pool = self._pool, None
@@ -127,11 +126,11 @@ class BoundedExecutor:
         Reads `_inflight`, NOT the admitted set. `_inflight` is incremented
         inside `_acquire`'s lock BEFORE the job is submitted and decremented by
         the future's done-callback, so it is exactly "admitted and not
-        finished" at every instant. The admitted set was populated AFTER
-        `pool.submit()` returned, leaving a window in which a job was holding
-        capacity and already running while `outstanding()` reported zero --
-        a false drain, in the one observable used to prove that cancelled and
-        timed-out work stays bounded.
+        finished" at every instant. A set populated AFTER `pool.submit()`
+        returns leaves a window in which a job holds capacity and is already
+        running while `outstanding()` reports zero -- a false drain, in the one
+        observable used to prove that cancelled and timed-out work stays
+        bounded.
         """
         with self._lock:
             return self._inflight

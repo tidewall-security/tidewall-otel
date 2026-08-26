@@ -147,9 +147,9 @@ class TidewallConfig:
     #: locals -- Sentry does this by default. The default dataclass repr
     #: printed it in cleartext.
     #:
-    #: P0-3 protected this token in transit (https enforced, redirects
-    #: refused). Nothing protected its REPRESENTATION, and the two are the
-    #: same asset. `__post_init__` still validates it, and `_http.post_guard`
+    #: The token is protected in transit (https enforced, redirects
+    #: refused). This protects its REPRESENTATION, which is the same asset:
+    #: a token in a traceback or a log line has leaked just as completely. `__post_init__` still validates it, and `_http.post_guard`
     #: still reads it -- only the repr is redacted.
     token: Secret = field(
         default_factory=lambda: Secret(os.environ.get("TIDEWALL_TOKEN", ""))
@@ -162,9 +162,9 @@ class TidewallConfig:
             "TIDEWALL_APP_NAME", "Tidewall OTel Instrumentation"
         )
     )
-    # NO $USER FALLBACK. The OS account name is not ours to disclose, and it
-    # was previously sent twice by default -- as user_id and again as
-    # extra_info.user_name. Sending an identity must be an explicit choice.
+    # NO $USER FALLBACK. The OS account name is not ours to disclose, and a
+    # fallback here sends it by default -- as `user_id`, and again as
+    # `extra_info.user_name`. Sending an identity must be an explicit choice.
     user_id: str = field(
         default_factory=lambda: os.environ.get("TIDEWALL_USER_ID", "")
     )

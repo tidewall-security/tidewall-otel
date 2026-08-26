@@ -32,10 +32,10 @@ def normalize_openai_messages(
       proceed with a recorded skip. This function is reached in those modes
       and for the string case.
 
-      Declaring the block paths was tried and reverted. Three provider paths
+      The block paths are deliberately not declared. Three provider paths
       (``content``, ``content[*].text``, ``content[*]``) would collapse onto
-      one guard path, breaking the map's bijection -- an invariant that
-      exists so a value cannot be inspected under another's name -- and the
+      one guard path, breaking the map's bijection -- an invariant that exists
+      so a value cannot be inspected under another's name -- and the
       write-back cannot rebuild a block list from a redacted string, so a
       transform verdict would silently change the request's shape.
 

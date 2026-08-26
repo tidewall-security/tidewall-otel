@@ -83,14 +83,14 @@ def gen_ai_span(
         yield None
         return
 
-    # THE WHOLE LIFECYCLE IS BEST-EFFORT. Every dispatch now opens a span
-    # before contacting the guard, which made the tracing pipeline a runtime
-    # dependency of the security path: a processor that raised in
-    # `start_as_current_span` or `on_start` prevented the guarded call
-    # entirely, and one that raised on `on_end` could replace the
-    # application's own exception while unwinding. Observability breaking the
-    # thing it observes is the failure mode this agent exists to avoid,
-    # arriving from the telemetry side.
+    # THE WHOLE LIFECYCLE IS BEST-EFFORT. Every dispatch opens a span before
+    # contacting the guard, which makes the tracing pipeline a runtime
+    # dependency of the security path: unguarded, a processor raising in
+    # `start_as_current_span` or `on_start` prevents the guarded call
+    # entirely, and one raising on `on_end` replaces the application's own
+    # exception while unwinding. Observability breaking the thing it observes
+    # is the failure mode this agent exists to avoid, arriving from the
+    # telemetry side.
     try:
         manager = tracer.start_as_current_span(
             "gen_ai.chat", record_exception=False, set_status_on_exception=False

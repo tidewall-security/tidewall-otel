@@ -127,22 +127,19 @@ class Refuse:
 Decision = Proceed | Transform | Refuse
 
 #: Outcomes that are guard FAILURES rather than verdicts.
-#: NO "incomplete". Nothing in this package ever constructs an Outcome with
-#: that kind -- the producible set is blocked/clean/degraded/transformed/lossy
-#: /schema_invalid/invariant_violated plus unreachable/timeout/saturated from
-#: `_EXCEPTION_OUTCOMES`. A member that cannot occur implies a protection that
-#: is not operating, which is the same reasoning that removed the dead
-#: bool-masquerading-as-int guard from `_response.py`.
 #:
-#: Its presence was invisible because the dispatch tests retyped this set by
-#: hand and omitted it. Deriving the test cases from here surfaced it
-#: immediately: four tests failed on a kind no code can emit.
-# Refusals that are about TIME rather than shape: the guard was asked about a
+#: NO "incomplete", and no other kind nothing constructs. The producible set is
+#: blocked/clean/degraded/transformed/lossy/schema_invalid/invariant_violated,
+#: plus unreachable/timeout/saturated from `_EXCEPTION_OUTCOMES`. A member that
+#: cannot occur implies a protection that is not operating. Dispatch's tests
+#: derive their cases from this set rather than retyping it, so a kind no code
+#: can emit fails them.
+# Refusals that are about TIME rather than shape: the guard is asked about a
 # snapshot, and these say the snapshot cannot be trusted to describe what will
 # actually be sent. Named rather than inline so the README drift test can read
-# them -- it previously scanned for `outcome_kind="..."` literals and found
-# none, because both are raised through a variable, so it passed vacuously on
-# exactly the two kinds it was written to cover.
+# them: both are raised through a VARIABLE, so a scan for `outcome_kind="..."`
+# literals matches neither and passes vacuously on exactly the two kinds it
+# polices.
 TIME_REFUSALS = frozenset({"mutated_during_guard", "unverifiable_payload"})
 
 #: Stamped BEFORE guard I/O, published after. Guard health is one shared
@@ -320,8 +317,8 @@ def _handle_mutation(surface, call, before, span, config, state) -> None:
     The guard is asked about a snapshot; the provider is invoked with the
     caller's own mutable kwargs afterwards. Anything running in between can
     swap the content, and enforce would then approve one prompt and send
-    another -- the P0-11 shape again, arriving through time rather than
-    through a parameter.
+    another: one payload inspected and a different one sent, arriving through
+    time rather than through a parameter.
 
     Comparing fingerprints is only sound while the fingerprint is COMPLETE.
     Bounding the walk introduced constant sentinels for exhausted depth and
@@ -373,15 +370,13 @@ def dispatch_sync(surface, wrapped, instance, args, kwargs, config, guard, execu
     pre = decide_input(surface, call, config)
 
     # THE SPAN WRAPS EVERY EXIT, including the ones that never reach the
-    # provider. `gen_ai_span` and `record_response_in_span` were defined,
-    # documented and unit-tested while no production path called either, so a
-    # fully guarded call emitted nothing at all -- in a package named
-    # `tidewall-otel`, whose instrumentor docstring promised spans "regardless
-    # of mode". A refusal or a block is exactly the event an operator opens a
-    # trace to find, so those exits carry spans too.
+    # provider. A refusal or a block is exactly the event an operator opens a
+    # trace to find, so those exits carry spans too -- the instrumentor
+    # promises spans "regardless of mode", and a guarded call that emitted
+    # nothing would be a package named `tidewall-otel` emitting no telemetry.
     #
     # `include_input` is the surface's own flag, never a default: serialising
-    # the conversation is the P0 this programme opened with.
+    # the conversation is what the privacy boundary exists to prevent.
     with gen_ai_span(provider=surface.provider,
                      model=str(call.kwargs.get("model", "")),
                      guard_input=getattr(pre, "guard_input", None),
