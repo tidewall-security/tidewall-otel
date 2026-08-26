@@ -83,7 +83,20 @@ def gen_ai_span(
         yield None
         return
 
-    with tracer.start_as_current_span("gen_ai.chat") as span:
+    # record_exception=False, set_status_on_exception=False.
+    #
+    # OTel records an uncaught exception as an event carrying its MESSAGE and
+    # STACK TRACE. Provider errors echo request bodies, and this agent's own
+    # guard errors carry up to 500 bytes of the guard's response -- so with
+    # the default the conversation reached the exporter through
+    # `exception.message` no matter what `span_input` and `span_output` said.
+    # Wiring spans at all reintroduced P0-1 by this route until it was closed.
+    #
+    # The type is recorded instead: enough to tell a dashboard that the call
+    # failed and roughly how, with nothing that can carry a prompt.
+    with tracer.start_as_current_span(
+        "gen_ai.chat", record_exception=False, set_status_on_exception=False
+    ) as span:
         span.set_attribute(_ATTR_OPERATION, "chat")
         span.set_attribute(_ATTR_SYSTEM, provider)
         span.set_attribute(_ATTR_MODEL, model)
@@ -104,7 +117,16 @@ def gen_ai_span(
                 # Serialisation should never break the span — drop silently.
                 pass
 
-        yield span
+        try:
+            yield span
+        except BaseException as exc:
+            # TYPE ONLY -- never `str(exc)`, which is the leak itself.
+            try:
+                span.set_attribute("tidewall.error.type", type(exc).__name__)
+                span.set_status(StatusCode.ERROR)
+            except Exception:               # pragma: no cover - defensive
+                pass
+            raise
 
 
 def record_response_in_span(

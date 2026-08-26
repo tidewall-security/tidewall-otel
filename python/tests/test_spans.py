@@ -220,3 +220,98 @@ def test_prompt_CONTENT_is_absent_from_the_span_by_default(
         f"the prompt reached the span: {rendered}")
     assert "gen_ai.input.messages" not in span.attributes
     assert "gen_ai.output.messages" not in span.attributes
+
+
+def test_a_PROVIDER_error_message_never_reaches_the_span(
+        monkeypatch, exporter, guard_says):
+    """Wiring spans reintroduced P0-1 by a route the content flags do not see.
+
+    OTel records an uncaught exception as an event carrying its MESSAGE and
+    STACK TRACE. Provider errors echo request bodies, so the conversation
+    reached the exporter through `exception.message` no matter what
+    `span_input` and `span_output` said.
+    """
+    _env(monkeypatch)
+    guard_says(_CLEAN)
+
+    def boom(request):
+        raise RuntimeError("provider echoed the prompt: sk-SUPERSECRET-leak")
+
+    client = openai.OpenAI(api_key="t", max_retries=0, http_client=httpx.Client(
+        transport=httpx.MockTransport(boom)))
+
+    tidewall_otel.activate()
+    with pytest.raises(Exception):
+        client.chat.completions.create(
+            model="gpt-4o", messages=[{"role": "user", "content": "hi"}])
+
+    span = exporter.get_finished_spans()[0]
+    rendered = json.dumps(
+        {"attributes": dict(span.attributes),
+         "events": [(e.name, dict(e.attributes)) for e in span.events],
+         "status": str(span.status.description)}, default=str)
+
+    assert "SUPERSECRET" not in rendered, f"the provider error leaked: {rendered}"
+    # Still useful: a dashboard can see it failed and roughly how.
+    assert span.attributes["tidewall.error.type"]
+    assert span.status.status_code.name == "ERROR"
+
+
+def test_a_GUARD_error_body_never_reaches_the_span(monkeypatch, exporter):
+    """The agent's own errors carry up to 500 bytes of the guard's response,
+    which is a second route to the same leak."""
+    _env(monkeypatch)
+
+    from tidewall_otel._http import GuardSchemaInvalid
+
+    def leaky_guard(**kwargs):
+        raise GuardSchemaInvalid(
+            "guard said: {'echo': 'sk-SUPERSECRET-from-the-guard'}")
+
+    monkeypatch.setattr(guard_module, "post_guard", leaky_guard)
+
+    tidewall_otel.activate()
+    with pytest.raises(tidewall_otel.TidewallError):
+        _client().chat.completions.create(
+            model="gpt-4o", messages=[{"role": "user", "content": "hi"}])
+
+    span = exporter.get_finished_spans()[0]
+    rendered = json.dumps(
+        {"attributes": dict(span.attributes),
+         "events": [(e.name, dict(e.attributes)) for e in span.events],
+         "status": str(span.status.description)}, default=str)
+
+    assert "SUPERSECRET" not in rendered, f"the guard error leaked: {rendered}"
+
+
+def test_the_ASYNC_path_sanitises_exceptions_the_same_way(
+        monkeypatch, exporter, guard_says):
+    """The async span block is duplicated code, so it is asserted separately
+    rather than assumed equivalent."""
+    import asyncio
+
+    _env(monkeypatch)
+    guard_says(_CLEAN)
+
+    def boom(request):
+        raise RuntimeError("async provider echoed: sk-SUPERSECRET-async")
+
+    tidewall_otel.activate()
+
+    async def drive():
+        client = openai.AsyncOpenAI(
+            api_key="t", max_retries=0,
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(boom)))
+        return await client.chat.completions.create(
+            model="gpt-4o", messages=[{"role": "user", "content": "hi"}])
+
+    with pytest.raises(Exception):
+        asyncio.run(drive())
+
+    span = exporter.get_finished_spans()[0]
+    rendered = json.dumps(
+        {"attributes": dict(span.attributes),
+         "events": [(e.name, dict(e.attributes)) for e in span.events]},
+        default=str)
+    assert "SUPERSECRET" not in rendered, f"the async path leaked: {rendered}"
+    assert span.attributes["tidewall.error.type"]
