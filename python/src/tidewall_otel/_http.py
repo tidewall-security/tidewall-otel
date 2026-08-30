@@ -11,6 +11,7 @@ match the Tidewall API contract.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import urllib.error
@@ -43,6 +44,49 @@ class GuardTimeout(GuardAPIError):
 
 class GuardSchemaInvalid(GuardAPIError):
     """The response was not JSON, or not the expected shape."""
+
+
+#: Named here only for the refusal message. The VALUE comes from
+#: `TidewallConfig.allow_insecure_loopback` and is passed in: reading the
+#: environment here as well would be a second source of truth, and the suite
+#: asserts the README documents config fields rather than loose variables.
+#:
+#: Defaults to False in `post_guard`'s signature, so calling it directly --
+#: which the transport tests do -- refuses plaintext without any setup.
+_ALLOW_INSECURE_LOOPBACK = "TIDEWALL_ALLOW_INSECURE_LOOPBACK"
+
+
+def _is_literal_loopback(hostname: str | None) -> bool:
+    """Literal text only. Never resolve a name to answer this.
+
+    Resolving opens a window between the check and the connection in which the
+    name can answer differently, and the caller cannot see which address the
+    request finally used. `localhost.attacker.example` and anything merely
+    starting with "127." as a string must both fail.
+
+    `ipaddress` does the work the browser's URL parser does on the other side:
+    it accepts 127.0.0.1 and rejects 127.0.0.1.attacker.example, and its
+    is_loopback covers the whole 127.0.0.0/8 range and ::1.
+
+    THE TWO CLIENTS DIVERGE ON SHORTHAND, and it is not worth forcing them
+    together. A browser's URL parser normalises `127.1`, `2130706433` and
+    `0x7f.1` to 127.0.0.1 before the extension's check ever sees them, so it
+    accepts those spellings. `ipaddress` refuses them, deliberately: they are
+    ambiguous, and CVEs have come from parsers disagreeing about them. The
+    result is that this client is the stricter of the two, and a person typing
+    `127.1` here gets a refusal rather than a silent difference in meaning.
+    """
+    if hostname is None:
+        return False
+    host = hostname.strip("[]")
+    if host.endswith("."):  # the root label; `localhost.` is `localhost`
+        host = host[:-1]
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
@@ -80,6 +124,7 @@ def post_guard(
     token: str,
     payload: dict[str, Any],
     socket_timeout: float = 10.0,
+    allow_insecure_loopback: bool = False,
     opener: urllib.request.OpenerDirector | None = None,
 ) -> dict[str, Any]:
     """POST a request to ``/v1/guard_chat_completions`` and return the parsed JSON.
@@ -105,12 +150,19 @@ def post_guard(
     # Scheme validation happens HERE, before any connection is attempted, and
     # in this function rather than in config: the tests call post_guard
     # directly and expect it to refuse.
-    scheme = urllib.parse.urlparse(url).scheme
-    if scheme != "https":
-        raise GuardAPIError(
-            f"refusing to send the bearer token and prompt over {scheme!r}; "
-            f"the guard URL must use https"
-        )
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "https":
+        if not (parsed.scheme == "http" and _is_literal_loopback(parsed.hostname) and allow_insecure_loopback):
+            raise GuardAPIError(
+                f"refusing to send the bearer token and prompt over {parsed.scheme!r}; "
+                f"the guard URL must use https"
+                + (
+                    ". This is a loopback address: set "
+                    f"{_ALLOW_INSECURE_LOOPBACK}=1 to permit plain http to it during development"
+                    if parsed.scheme == "http" and _is_literal_loopback(parsed.hostname)
+                    else ""
+                )
+            )
 
     body = json.dumps(payload).encode("utf-8")
 

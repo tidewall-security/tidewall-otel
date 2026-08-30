@@ -185,3 +185,104 @@ def test_an_empty_body_is_an_empty_dict_not_an_error():
     opener = RecordingOpener(response=_response(200, body=b""))
     assert post_guard(base_url="https://guard.example", token="t",
                       payload={}, opener=opener) == {}
+
+
+# ---------------------------------------------------------------------------
+# Plain http to a loopback address: an opt-in, never a default
+#
+# The rule was "https, no loopback exception", which made `make demo`'s agent
+# paths impossible without a self-signed certificate -- and the alternative to
+# that ceremony is not a blanket exemption. Loopback protects the bytes in
+# transit and nothing else: plain http does not authenticate the endpoint, so a
+# local process that binds the port first receives the bearer token and the
+# prompt.
+#
+# So it is switched on deliberately, per deployment, and the same rule is a
+# checkbox in the browser extension's registration form.
+
+
+def _post(url: str, *, allow: bool = False):
+    """The flag is a PARAMETER now, not an environment read.
+
+    `post_guard` defaults it to False, so calling it directly refuses
+    plaintext without any setup -- which is what the older scheme test relies
+    on, and why the default is not the permissive one.
+    """
+    return post_guard(
+        base_url=url, token="secret", payload={}, socket_timeout=1.0, allow_insecure_loopback=allow
+    )
+
+
+def test_loopback_over_http_is_still_refused_without_the_opt_in():
+    with pytest.raises(GuardAPIError, match="https"):
+        _post("http://localhost:8080")
+
+
+def test_the_refusal_names_the_opt_in_when_that_is_all_that_is_missing():
+    """A refusal a person can act on. The generic https message would leave
+    someone running the demo with no idea what to do next."""
+    with pytest.raises(GuardAPIError, match="TIDEWALL_ALLOW_INSECURE_LOOPBACK"):
+        _post("http://127.0.0.1:8080")
+
+
+def test_a_non_loopback_http_url_is_refused_even_with_the_opt_in():
+    """The opt-in permits loopback, not plaintext.
+
+    Without this the setting would read as "turn the transport rule off",
+    which is what it must never mean.
+    """
+    with pytest.raises(GuardAPIError, match="https"):
+        _post("http://guard.example.com", allow=True)
+    # And the message must NOT invite the opt-in here: it would not help.
+    with pytest.raises(GuardAPIError) as exc:
+        _post("http://guard.example.com", allow=True)
+    assert "TIDEWALL_ALLOW_INSECURE_LOOPBACK" not in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "localhost.attacker.example",  # starts with the name
+        "127.0.0.1.attacker.example",  # starts with the address
+        "notlocalhost",
+        "foo.localhost",  # resolves to loopback in some resolvers; not literal
+        "128.0.0.1",  # the adjacent /8
+        "127.1",  # shorthand: ambiguous, and refused here on purpose
+    ],
+)
+def test_near_misses_are_refused_even_with_the_opt_in(host):
+    """The cases that decide whether this check is worth having.
+
+    A string test would accept most of these -- `startswith("127.")` accepts
+    the second, and any "contains localhost" test accepts the first.
+    """
+    with pytest.raises(GuardAPIError, match="https"):
+        _post(f"http://{host}:8080", allow=True)
+
+
+@pytest.mark.parametrize("host", ["localhost", "127.0.0.1", "127.0.0.5", "[::1]", "localhost."])
+def test_loopback_over_http_is_permitted_once_opted_in(host):
+    """Reaching the connection is the pass condition.
+
+    Nothing is listening, so this raises a transport error rather than the
+    scheme refusal -- and that distinction IS the assertion: the scheme check
+    let it through. A test asserting "no exception" would need a live server
+    and would prove less.
+    """
+    with pytest.raises(GuardAPIError) as exc:
+        _post(f"http://{host}:9", allow=True)  # discard port; nothing listens
+
+    assert "must use https" not in str(exc.value), str(exc.value)
+
+
+def test_the_signature_default_is_the_refusing_one():
+    """Called with no flag at all, which the helper above never does.
+
+    Flipping `allow_insecure_loopback: bool = False` to `True` left every other
+    test in this file green: they all pass the argument explicitly, so nothing
+    exercised the default. The default IS the safety property -- any caller
+    that has not thought about this must get the refusal -- so it needs a test
+    that omits the argument, not one that sets it.
+    """
+    with pytest.raises(GuardAPIError, match="https"):
+        post_guard(base_url="http://localhost:8080", token="secret", payload={}, socket_timeout=1.0)

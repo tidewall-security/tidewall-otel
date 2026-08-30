@@ -42,7 +42,8 @@ Configure via environment variables (recommended) or by passing a
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `TIDEWALL_BASE_URL` | (required) | Tidewall guard API base URL. **Must be `https://`** — the bearer token and the prompt travel in this request, so plaintext is refused before a connection is opened, with no loopback exception. |
+| `TIDEWALL_BASE_URL` | (required) | Tidewall guard API base URL. **Must be `https://`** — the bearer token and the prompt travel in this request, so plaintext is refused before a connection is opened. A loopback address may use plain `http` only with `TIDEWALL_ALLOW_INSECURE_LOOPBACK` set. |
+| `TIDEWALL_ALLOW_INSECURE_LOOPBACK` | `False` | Permit plain `http` to `localhost`, `127.0.0.0/8` or `::1` — for local development only. Loopback keeps the bytes off the network but does **not** authenticate the endpoint: a local process that binds the port first receives the bearer token and the prompt. Literal addresses only; a hostname that merely resolves to loopback is refused. |
 | `TIDEWALL_TOKEN` | (required) | API token for the guard server |
 | `TIDEWALL_MODE` | `enforce` | `enforce`, `monitor`, or `dry-run` |
 | `TIDEWALL_APP_ID` | `tidewall-otel` | App identifier recorded with each guard event |
