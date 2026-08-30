@@ -201,39 +201,41 @@ def test_an_empty_body_is_an_empty_dict_not_an_error():
 # checkbox in the browser extension's registration form.
 
 
-def _post(url: str):
-    return post_guard(base_url=url, token="secret", payload={}, socket_timeout=1.0)
+def _post(url: str, *, allow: bool = False):
+    """The flag is a PARAMETER now, not an environment read.
+
+    `post_guard` defaults it to False, so calling it directly refuses
+    plaintext without any setup -- which is what the older scheme test relies
+    on, and why the default is not the permissive one.
+    """
+    return post_guard(
+        base_url=url, token="secret", payload={}, socket_timeout=1.0, allow_insecure_loopback=allow
+    )
 
 
-def test_loopback_over_http_is_still_refused_without_the_opt_in(monkeypatch):
-    monkeypatch.delenv("TIDEWALL_ALLOW_INSECURE_LOOPBACK", raising=False)
-
+def test_loopback_over_http_is_still_refused_without_the_opt_in():
     with pytest.raises(GuardAPIError, match="https"):
         _post("http://localhost:8080")
 
 
-def test_the_refusal_names_the_opt_in_when_that_is_all_that_is_missing(monkeypatch):
+def test_the_refusal_names_the_opt_in_when_that_is_all_that_is_missing():
     """A refusal a person can act on. The generic https message would leave
     someone running the demo with no idea what to do next."""
-    monkeypatch.delenv("TIDEWALL_ALLOW_INSECURE_LOOPBACK", raising=False)
-
     with pytest.raises(GuardAPIError, match="TIDEWALL_ALLOW_INSECURE_LOOPBACK"):
         _post("http://127.0.0.1:8080")
 
 
-def test_a_non_loopback_http_url_is_refused_even_with_the_opt_in(monkeypatch):
+def test_a_non_loopback_http_url_is_refused_even_with_the_opt_in():
     """The opt-in permits loopback, not plaintext.
 
     Without this the setting would read as "turn the transport rule off",
     which is what it must never mean.
     """
-    monkeypatch.setenv("TIDEWALL_ALLOW_INSECURE_LOOPBACK", "1")
-
     with pytest.raises(GuardAPIError, match="https"):
-        _post("http://guard.example.com")
+        _post("http://guard.example.com", allow=True)
     # And the message must NOT invite the opt-in here: it would not help.
     with pytest.raises(GuardAPIError) as exc:
-        _post("http://guard.example.com")
+        _post("http://guard.example.com", allow=True)
     assert "TIDEWALL_ALLOW_INSECURE_LOOPBACK" not in str(exc.value)
 
 
@@ -248,20 +250,18 @@ def test_a_non_loopback_http_url_is_refused_even_with_the_opt_in(monkeypatch):
         "127.1",  # shorthand: ambiguous, and refused here on purpose
     ],
 )
-def test_near_misses_are_refused_even_with_the_opt_in(monkeypatch, host):
+def test_near_misses_are_refused_even_with_the_opt_in(host):
     """The cases that decide whether this check is worth having.
 
     A string test would accept most of these -- `startswith("127.")` accepts
     the second, and any "contains localhost" test accepts the first.
     """
-    monkeypatch.setenv("TIDEWALL_ALLOW_INSECURE_LOOPBACK", "1")
-
     with pytest.raises(GuardAPIError, match="https"):
-        _post(f"http://{host}:8080")
+        _post(f"http://{host}:8080", allow=True)
 
 
 @pytest.mark.parametrize("host", ["localhost", "127.0.0.1", "127.0.0.5", "[::1]", "localhost."])
-def test_loopback_over_http_is_permitted_once_opted_in(monkeypatch, host):
+def test_loopback_over_http_is_permitted_once_opted_in(host):
     """Reaching the connection is the pass condition.
 
     Nothing is listening, so this raises a transport error rather than the
@@ -269,9 +269,7 @@ def test_loopback_over_http_is_permitted_once_opted_in(monkeypatch, host):
     let it through. A test asserting "no exception" would need a live server
     and would prove less.
     """
-    monkeypatch.setenv("TIDEWALL_ALLOW_INSECURE_LOOPBACK", "1")
-
     with pytest.raises(GuardAPIError) as exc:
-        _post(f"http://{host}:9")  # discard port; nothing listens
+        _post(f"http://{host}:9", allow=True)  # discard port; nothing listens
 
     assert "must use https" not in str(exc.value), str(exc.value)

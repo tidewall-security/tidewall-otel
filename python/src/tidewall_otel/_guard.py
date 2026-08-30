@@ -115,5 +115,6 @@ class TidewallGuard:
             payload=self._payload_for(guard_input, event_type=event_type,
                                       model=model, llm_provider=llm_provider),
             socket_timeout=self._config.socket_timeout,
+            allow_insecure_loopback=self._config.allow_insecure_loopback,
         )
 

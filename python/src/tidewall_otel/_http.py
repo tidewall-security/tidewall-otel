@@ -14,7 +14,6 @@ from __future__ import annotations
 import ipaddress
 import json
 import logging
-import os
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -47,16 +46,14 @@ class GuardSchemaInvalid(GuardAPIError):
     """The response was not JSON, or not the expected shape."""
 
 
-#: Opt-in, never a default. Plain http does not authenticate the endpoint, so a
-#: local process that binds the port first receives the bearer token and the
-#: prompt -- loopback protects the bytes in transit and nothing else. The
-#: browser extension carries the same rule as a checkbox in its registration
-#: form, off by default; this is that checkbox.
+#: Named here only for the refusal message. The VALUE comes from
+#: `TidewallConfig.allow_insecure_loopback` and is passed in: reading the
+#: environment here as well would be a second source of truth, and the suite
+#: asserts the README documents config fields rather than loose variables.
+#:
+#: Defaults to False in `post_guard`'s signature, so calling it directly --
+#: which the transport tests do -- refuses plaintext without any setup.
 _ALLOW_INSECURE_LOOPBACK = "TIDEWALL_ALLOW_INSECURE_LOOPBACK"
-
-
-def _insecure_loopback_allowed() -> bool:
-    return os.environ.get(_ALLOW_INSECURE_LOOPBACK, "").strip().lower() in {"1", "true", "yes"}
 
 
 def _is_literal_loopback(hostname: str | None) -> bool:
@@ -127,6 +124,7 @@ def post_guard(
     token: str,
     payload: dict[str, Any],
     socket_timeout: float = 10.0,
+    allow_insecure_loopback: bool = False,
     opener: urllib.request.OpenerDirector | None = None,
 ) -> dict[str, Any]:
     """POST a request to ``/v1/guard_chat_completions`` and return the parsed JSON.
@@ -154,7 +152,7 @@ def post_guard(
     # directly and expect it to refuse.
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme != "https":
-        if not (parsed.scheme == "http" and _is_literal_loopback(parsed.hostname) and _insecure_loopback_allowed()):
+        if not (parsed.scheme == "http" and _is_literal_loopback(parsed.hostname) and allow_insecure_loopback):
             raise GuardAPIError(
                 f"refusing to send the bearer token and prompt over {parsed.scheme!r}; "
                 f"the guard URL must use https"

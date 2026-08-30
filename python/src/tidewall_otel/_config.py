@@ -189,6 +189,16 @@ class TidewallConfig:
     on_activation_failure: str = field(
         default_factory=lambda: os.environ.get("TIDEWALL_ON_ACTIVATION_FAILURE", "exit")
     )
+    #: Permit plain http to a LITERAL loopback address. Off unless set.
+    #:
+    #: Loopback keeps the bytes off the network and does nothing else: http
+    #: does not authenticate the endpoint, so a local process that binds the
+    #: port first receives the bearer token and the prompt. It is a development
+    #: convenience, and it is spelled as one.
+    allow_insecure_loopback: bool = field(
+        default_factory=lambda: os.environ.get("TIDEWALL_ALLOW_INSECURE_LOOPBACK", "").strip().lower()
+        in {"1", "true", "yes"}
+    )
 
     def __post_init__(self) -> None:
         # Accept a plain string: `TidewallConfig(token="...")` is the obvious
