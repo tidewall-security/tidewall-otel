@@ -115,7 +115,11 @@ class TidewallConfig:
                               (e.g. ``https://guard.example.com``). Plaintext
                               is refused before any connection is opened --
                               this request carries the bearer token and the
-                              prompt -- and there is no loopback exception.
+                              prompt. A loopback address may use plain http
+                              ONLY when TIDEWALL_ALLOW_INSECURE_LOOPBACK is
+                              set: http does not authenticate the endpoint, so
+                              a local process that binds the port first
+                              receives both.
         TIDEWALL_TOKEN      - API token for authenticating with the guard server
         TIDEWALL_APP_ID     - Application identifier recorded in guard events
         TIDEWALL_APP_NAME   - Human-readable application name for dashboards
