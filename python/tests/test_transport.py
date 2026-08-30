@@ -273,3 +273,16 @@ def test_loopback_over_http_is_permitted_once_opted_in(host):
         _post(f"http://{host}:9", allow=True)  # discard port; nothing listens
 
     assert "must use https" not in str(exc.value), str(exc.value)
+
+
+def test_the_signature_default_is_the_refusing_one():
+    """Called with no flag at all, which the helper above never does.
+
+    Flipping `allow_insecure_loopback: bool = False` to `True` left every other
+    test in this file green: they all pass the argument explicitly, so nothing
+    exercised the default. The default IS the safety property -- any caller
+    that has not thought about this must get the refusal -- so it needs a test
+    that omits the argument, not one that sets it.
+    """
+    with pytest.raises(GuardAPIError, match="https"):
+        post_guard(base_url="http://localhost:8080", token="secret", payload={}, socket_timeout=1.0)
